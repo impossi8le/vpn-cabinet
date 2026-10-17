@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Линт + тесты
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Линт
+        run: ruff check .
+
+      - name: Форматирование
+        run: ruff format --check .
+
+      # Сбор тестов в машинном виде: список «файл: сколько тестов». Нужен
+      # дважды — чтобы посчитать общее число и чтобы убедиться, что тесты
+      # безопасности никуда не делись. Из -q прогона это не вычитать: он
+      # печатает только точки.
+      - name: Собрать список тестов
+        run: python -m pytest --collect-only -q > collected.txt 2>&1 || true
+
+      # Вывод заворачивается в аннотацию: скачать лог джобы может только
+      # администратор репозитория, а аннотации доступны через check-runs API
+      # любому, у кого есть доступ на чтение. Без этого отладка вслепую —
+      # тот же приём уже работает в CI Android-клиента.
+      - name: Тесты
+        run: |
+          set +e
+          python -m pytest 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E '^(FAILED|ERROR)|assert|Error|error:' pytest.log \
+              | head -25 > err.txt
+            if [ ! -s err.txt ]; then
+              tail -25 pytest.log > err.txt
+            fi
+            msg=$(sed 's/"/\x27/g' err.txt | tr '\n' '|' | cut -c1-4000)
+            echo "::error title=Тесты упали::$msg"
+          fi
+          exit "$status"
+
+      # Зелёная сборка без единого выполненного теста — худший отказ: инварианты
+      # связывания считались бы проверенными, не будучи запущенными ни разу.
+      # Молчаливый пропуск здесь особенно вероятен: сбор тестов задаётся
+      # конфигом, а не флагами, и опечатка в пути даёт «0 тестов» без ошибки.
+      - name: Проверка, что тесты действительно собрались
+        run: |
+          set -euo pipefail
+          total=$(awk -F': ' '/^tests\//{s+=$2} END{print s+0}' collected.txt)
+          echo "Собрано тестов: ${total:-0}"
+          echo "::notice title=Собрано тестов::${total:-0}"
+          if [ "${total:-0}" -eq 0 ]; then
+            echo "::error::Ни один тест не собрался. Прогон зелёный, но ничего не проверено."
+            exit 1
+          fi
+
+      # Отдельно от количества: именно этот файл защищает от угона аккаунта.
+      # Его исчезновение — не «меньше тестов», а снятая защита, и пройти
+      # незамеченным оно не должно.
+      - name: Проверка, что тесты безопасности на месте
+        run: |
+          set -euo pipefail
+          if ! grep -qE '^tests/test_linking_security\.py' collected.txt; then
+            echo "::error::Тесты связывания аккаунтов не собрались — это защита от угона, они обязательны."
+            exit 1
+          fi
+          echo "::notice title=Тесты безопасности::на месте"
