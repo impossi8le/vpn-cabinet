@@ -71,7 +71,7 @@
 
 `400` с `code: mail_not_verified` — `mail` без `mail_verified_at`.
 
-### `POST /internal/accounts/{id}/link-chat-id`
+### `POST /internal/accounts/{id}/link-telegram`
 
 Привязать Telegram к аккаунту.
 
@@ -99,7 +99,7 @@ UPDATE accounts SET chat_id = ? WHERE id = ? AND chat_id IS NULL
 Поведение симметрично: `AND mail IS NULL`, `409 code: mail_taken`.
 `mail_verified_at` обязателен, `400 code: mail_not_verified` без него.
 
-### `POST /internal/accounts/{id}/unlink-chat-id` и `/unlink-mail`
+### `POST /internal/accounts/{id}/unlink-telegram` и `/unlink-mail`
 
 Отвязать способ входа.
 
