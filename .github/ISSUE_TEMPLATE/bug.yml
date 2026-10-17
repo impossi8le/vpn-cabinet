@@ -1,0 +1,33 @@
+name: Баг
+description: Что-то работает не так
+title: '[bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Проверь перед отправкой:** в публичный issue не попадают IP-адреса
+        серверов, имена хостов, ключи, токены, содержимое `.ovpn`, пароли и
+        данные клиентов. Если деталь нельзя положить в коммит публичного
+        репозитория — её нельзя и сюда.
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что ожидалось и что вышло вместо этого.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить
+      description: Шаги по порядку. Если повторяется не всегда — напиши, когда именно.
+    validations:
+      required: false
+  - type: input
+    id: where
+    attributes:
+      label: Где
+      description: Браузер и версия, страница кабинета.
+    validations:
+      required: false

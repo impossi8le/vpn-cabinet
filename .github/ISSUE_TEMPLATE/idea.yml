@@ -1,0 +1,30 @@
+name: Идея
+description: Что хочется сделать или улучшить
+title: '[idea] '
+labels: ['idea']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Проверь перед отправкой:** в публичный issue не попадают IP-адреса
+        серверов, имена хостов, ключи, токены, содержимое `.ovpn`, пароли и
+        данные клиентов.
+  - type: textarea
+    id: what
+    attributes:
+      label: Что хочется и зачем
+      description: Сначала зачем — это важнее, чем как.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      description: Необязательно — разметка может подождать разбора.
+      options:
+        - web (страницы кабинета)
+        - backend (сервис, API, бот)
+        - docs
+        - infra (CI, развёртывание)
+    validations:
+      required: false
