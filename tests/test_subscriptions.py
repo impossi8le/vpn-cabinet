@@ -15,7 +15,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from fakes import STATUS_ACTIVE, STATUS_BLOCKED, STATUS_EXPIRED, STATUS_TRIAL, Subscription
+from fakes import (
+    STATUS_ACTIVE,
+    STATUS_BLOCKED,
+    STATUS_EXPIRED,
+    STATUS_TRIAL,
+    FakeApi,
+    FakeSubscription,
+)
 
 from cabinet.bot_client import Subscription as ClientSubscription
 from cabinet.subscriptions import (
@@ -43,24 +50,28 @@ def make(
     return ClientSubscription(id=id, name=name, status=status, end_date=end_date, location=location)
 
 
-def from_fixture(raw: Subscription) -> ClientSubscription:
-    """Мост от мок-фикстуры (`expires_at`) к объекту клиента (`end_date`).
+def from_fixture(raw: FakeSubscription) -> ClientSubscription:
+    """Мост от строки хранилища мока (`expires_at`, `name`) к объекту клиента
+    (`end_date`).
 
-    Мок отдаёт строку `/me` с именем поля `expires_at`, клиент — с `end_date`.
-    Переводим здесь, чтобы тесты на фикстурах не заводили второй модели
-    подписки.
+    Строка хранилища называет срок `expires_at`, клиент — `end_date`. Перевод
+    здесь: тесты на фикстурах получают объект клиента, не заводя второй модели
+    подписки. Тем же путём идёт и сам мок (`FakeSubscription.to_api`), поэтому
+    связка «мок → клиент → представление» проверяется на настоящей форме.
     """
     return make(
         id=str(raw.id),
+        name=raw.name or "Подписка",
         status=raw.status,
         end_date=raw.expires_at,
+        location=raw.location,
     )
 
 
 # --- статусы: все состояния из `/me` --------------------------------------
 
 
-def test_active_subscription_with_future_date_is_usable(subscription_active: Subscription):
+def test_active_subscription_with_future_date_is_usable(subscription_active: FakeSubscription):
     """Главный случай: активна, срок впереди — доступ есть."""
     view = subscription_view(from_fixture(subscription_active), now=NOW)
     assert view.status == STATUS_ACTIVE
@@ -75,14 +86,14 @@ def test_trial_is_usable():
     assert view.is_usable is True
 
 
-def test_expired_subscription_is_not_usable(subscription_expired: Subscription):
+def test_expired_subscription_is_not_usable(subscription_expired: FakeSubscription):
     """Истёкшая: срок прошёл, доступа нет."""
     view = subscription_view(from_fixture(subscription_expired), now=NOW)
     assert view.status == STATUS_EXPIRED
     assert view.is_usable is False
 
 
-def test_blocked_subscription_is_not_usable(subscription_blocked: Subscription):
+def test_blocked_subscription_is_not_usable(subscription_blocked: FakeSubscription):
     """Заблокированная: срок ещё не истёк, но доступа нет — это разные причины,
     и на экране они должны читаться по-разному."""
     view = subscription_view(from_fixture(subscription_blocked), now=NOW)
@@ -358,3 +369,31 @@ def test_status_domain_constants_match_the_mock_contract():
     assert subscriptions.STATUS_TRIAL == STATUS_TRIAL
     assert subscriptions.STATUS_EXPIRED == STATUS_EXPIRED
     assert subscriptions.STATUS_BLOCKED == STATUS_BLOCKED
+
+
+def test_fake_api_subscription_feeds_the_view_directly(fake_api: FakeApi, now: datetime):
+    """Главный стык дефекта #30: подписка из `FakeApi` без перевода идёт в
+    `subscription_view` и не падает.
+
+    Раньше мок отдавал `expires_at`, а представление читает `end_date` — связка
+    падала с `AttributeError`, хотя тесты были зелёными: они строили форму сами
+    через `make`, а через `FakeApi` не шли. Здесь `subscriptions_for` возвращает
+    ту же форму, что настоящий `BotClient`, поэтому мост «фейк → представление»
+    проверяется напрямую.
+    """
+    account = fake_api.create_account(chat_id=1)
+    fake_api.add_subscription(
+        account.id,
+        status=STATUS_ACTIVE,
+        expires_at=now + timedelta(days=30),
+        name="Basic",
+        location="nl",
+    )
+
+    (subscription,) = fake_api.subscriptions_for(account.id)
+    view = subscription_view(subscription, now=now)
+
+    assert view.name == "Basic"
+    assert view.location == "nl"
+    assert view.status == STATUS_ACTIVE
+    assert view.days_left == 30

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from cabinet.accounts import Account
+from cabinet.bot_client import Subscription as ClientSubscription
 
 # Статус подписки. Контракт `/me` ещё не зафиксирован — это набор мока, который
 # закрепит W4.1. Пока он один на весь проект, чтобы тесты и фикстуры не
@@ -49,21 +50,47 @@ class CollisionError(FakeApiError):
 
 
 @dataclass
-class Subscription:
-    """Строка ответа `/me`. Одна подписка одного аккаунта."""
+class FakeSubscription:
+    """Строка хранилища подставного бота: одна подписка одного аккаунта.
+
+    Это **не** форма ответа бота. Бот отдаёт подписку полями `id`, `name`,
+    `status`, `end_date`, `location` (см. `cabinet.bot_client.Subscription`) —
+    именно её, а не эту строку, возвращает `subscriptions_for`. Здесь же
+    лежат служебные для мока поля: `account_id` для поиска и `config_id`
+    как ссылка на конфиг. Подписка живёт дольше конфига, который могли уже
+    отозвать, поэтому это отдельное поле, а не один объект.
+    """
 
     account_id: int
     id: int
     status: str = STATUS_ACTIVE
     expires_at: datetime | None = None
-    # Ссылка на конфиг. Отдельна от подписки: подписка живёт дольше, чем
-    # конфиг, который могли уже отозвать.
     config_id: int | None = None
+    # Поля формы ответа бота, которых у хранилища мока нет по умолчанию:
+    # имя подписки и локация сервера — их показывает экран (W4.1).
+    name: str = ""
+    location: str | None = None
 
     def is_active(self) -> bool:
         """Даёт ли подписка доступ прямо сейчас. Истёкшая и заблокированная —
         нет; это разные состояния, но оба закрывают конфиг (W4.2)."""
         return self.status in (STATUS_ACTIVE, STATUS_TRIAL)
+
+    def to_api(self) -> dict:
+        """Строка хранилища в форму ответа бота — та же, что разбирает
+        `cabinet.bot_client.Subscription.from_api`.
+
+        Перевод живёт здесь, у мока: это его дело — отдавать то, что умеет
+        разобрать клиент. Держать рядом вторую копию формы для тестов значило
+        бы оставить стык «мок → клиент» непроверенным.
+        """
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status,
+            "end_date": self.expires_at.isoformat() if self.expires_at else None,
+            "location": self.location,
+        }
 
 
 @dataclass
@@ -78,7 +105,7 @@ class VpnConfig:
     account_id: int
     body: str
 
-    def is_downloadable_by(self, subscription: Subscription | None) -> bool:
+    def is_downloadable_by(self, subscription: FakeSubscription | None) -> bool:
         """Можно ли отдать этот конфиг по этой подписке."""
         return (
             subscription is not None
@@ -96,7 +123,7 @@ class FakeApi:
     """
 
     accounts: list[Account] = field(default_factory=list)
-    subscriptions: list[Subscription] = field(default_factory=list)
+    subscriptions: list[FakeSubscription] = field(default_factory=list)
     configs: list[VpnConfig] = field(default_factory=list)
     # Журнал вызовов: тест может утверждать, что кабинет ходил ровно туда,
     # куда должен, и не ходил лишний раз.
@@ -234,15 +261,34 @@ class FakeApi:
 
     # --- подписки и конфиги (W4) -----------------------------------------
 
-    def subscriptions_for(self, account_id: int) -> list[Subscription]:
-        """Список подписок аккаунта. Пустой список — не ошибка (W4.3)."""
-        self._log("subscriptions_for", account_id=account_id)
-        return [s for s in self.subscriptions if s.account_id == account_id]
+    def subscriptions_for(self, account_id: int) -> list[ClientSubscription]:
+        """Список подписок аккаунта в форме ответа бота. Пустой список — не
+        ошибка (W4.3).
 
-    def add_subscription(self, account_id: int, **kwargs: object) -> Subscription:
+        Возвращается то же, что отдаёт живой `/internal/.../subscriptions`:
+        подписку собирает `cabinet.bot_client.Subscription.from_api`. Иначе
+        потребитель (`cabinet.subscriptions`) получал бы от мока форму, которую
+        настоящий клиент не строит, и связка «мок → представление» падала бы,
+        а тесты этого не видели. Строка хранилища (`FakeSubscription`) наружу
+        не выходит — её служебные поля (`account_id`, `config_id`) делу не
+        нужны.
+        """
+        self._log("subscriptions_for", account_id=account_id)
+        return [
+            ClientSubscription.from_api(s.to_api())
+            for s in self.subscriptions
+            if s.account_id == account_id
+        ]
+
+    def add_subscription(self, account_id: int, **kwargs: object) -> FakeSubscription:
+        """Добавить подписку в хранилище мока. Возвращается строка хранилища, а
+        не форма ответа: тесту и фикстурам нужны `config_id` и `account_id`,
+        которых в ответе бота нет."""
         self._log("add_subscription", account_id=account_id)
         self._by_id(account_id)
-        subscription = Subscription(account_id=account_id, id=self._next_subscription_id, **kwargs)
+        subscription = FakeSubscription(
+            account_id=account_id, id=self._next_subscription_id, **kwargs
+        )
         self._next_subscription_id += 1
         self.subscriptions.append(subscription)
         return subscription

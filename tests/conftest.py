@@ -20,7 +20,7 @@ from fakes import (
     STATUS_EXPIRED,
     FakeApi,
     FakeMailSender,
-    Subscription,
+    FakeSubscription,
 )
 
 from cabinet.accounts import Account
@@ -87,7 +87,7 @@ def account_empty(fake_api: FakeApi) -> Account:
 @pytest.fixture
 def subscription_active(
     fake_api: FakeApi, account_email_only: Account, now: datetime
-) -> Subscription:
+) -> FakeSubscription:
     """Активная подписка со свежим конфигом: всё, что нужно для W4.1–W4.2."""
     config = fake_api.add_config(account_email_only.id, body="# fake .ovpn")
     return fake_api.add_subscription(
@@ -101,7 +101,7 @@ def subscription_active(
 @pytest.fixture
 def subscription_expired(
     fake_api: FakeApi, account_email_only: Account, now: datetime
-) -> Subscription:
+) -> FakeSubscription:
     """Истёкшая подписка. Конфиг по ней отдавать нельзя (W4.2)."""
     config = fake_api.add_config(account_email_only.id, body="# fake .ovpn")
     return fake_api.add_subscription(
@@ -115,7 +115,7 @@ def subscription_expired(
 @pytest.fixture
 def subscription_blocked(
     fake_api: FakeApi, account_email_only: Account, now: datetime
-) -> Subscription:
+) -> FakeSubscription:
     """Подписка при заблокированном аккаунте: срок не истёк, доступа нет."""
     config = fake_api.add_config(account_email_only.id, body="# fake .ovpn")
     return fake_api.add_subscription(
