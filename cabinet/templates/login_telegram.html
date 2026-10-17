@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Проверяем вход{% endblock %}
+{% block content %}
+<div class="mid">
+  {# Янтарный щит: идёт проверка кода из бота. Янтарный — только идущий процесс,
+     и здесь он ровно об этом — ожидание, а не опасность и не защита. #}
+  <div class="mark">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3l7 4v5c0 4.2-2.9 7.6-7 8.6-4.1-1-7-4.4-7-8.6V7l7-4z"
+            stroke="{{ colors.amber }}" stroke-width="1.7" stroke-linejoin="round"/>
+    </svg>
+  </div>
+
+  {# Заголовок и тело — дословно из клиента (`LoginWaitingScreen.kt`). Текст
+     называет, откуда придёт код: из бота, а не из письма, — иначе человек
+     ждал бы письма, которого не будет. #}
+  <h1>Проверяем вход</h1>
+  <p class="lead">Откройте Telegram — бот пришлёт <b>код подтверждения</b>. Введите его здесь.</p>
+
+  {# Ссылка ещё не готова: говорим прямо, а не показываем пустую кнопку.
+     Кнопка в никуда обещала бы переход, которого нет; честный текст
+     отправляет начать вход заново. Это то же состояние, что называет клиент. #}
+  {% if not link_ready %}
+    <div class="disc">
+      <p>{{ link_not_ready }}</p>
+    </div>
+  {% endif %}
+
+  {# Отсчёт: полоса и жирный текст янтарные — то же ожидание, что и выше.
+     Отсчёт ведёт страница, а не сервер: окно тикает, и живая строка честнее
+     замороженной метки, снятой при рендере. Формулировка — из клиента. #}
+  <div class="disc tone-process">
+    <p>Подтверждение действует 5 минут. Осталось <b class="mono" data-countdown>5:00</b></p>
+  </div>
+
+  <form method="post" action="{{ form_action }}">
+    <label class="field-label" for="code">Код из бота</label>
+    {# Допускаются только цифры, максимум 6 — как в поле кода из письма и как
+       в клиенте (`it.filter(Char::isDigit).take(6)`). Ограничение задано и в
+       разметке, и скриптом: с одной разметкой вставка из буфера протащила бы
+       буквы. #}
+    <input class="field" id="code" name="code" type="text" inputmode="numeric"
+           autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"
+           autofocus required>
+    {# Ошибка ввода — янтарная: код не подошёл, истёк или попытки исчерпаны —
+       это осечка входа, а не опасность. Красный зарезервирован под реальную
+       опасность (§7) и на обычный ввод не тратится. #}
+    <p class="error" role="alert">{{ error or '' }}</p>
+    <button class="btn btn-p" type="submit" {{ 'disabled' if busy else '' }}>
+      {{ 'Проверяем…' if busy else 'Подтвердить' }}
+    </button>
+  </form>
+
+  {# «Открыть Telegram ещё раз» ведёт в бот входа по ссылке челленджа
+     (`deep_link` из `/auth/link`), а не в почту и не в бота поддержки:
+     там нет кнопки «Подтвердить вход», и вход там завершить нельзя. Пока
+     ссылки нет — кнопки нет: обещание перехода без перехода было бы ложью. #}
+  {% if link_ready %}
+    <a class="btn btn-g" href="{{ telegram_url }}">Открыть Telegram ещё раз</a>
+    <form method="post" action="{{ restart_url }}">
+      <button class="btn btn-g btn-sm" type="submit">Войти заново</button>
+    </form>
+  {% else %}
+    <form method="post" action="{{ restart_url }}">
+      <button class="btn btn-p btn-sm" type="submit">Войти заново</button>
+    </form>
+  {% endif %}
+</div>
+
+<script>
+  // Только цифры, не больше шести: метка поля обещает код, и поле обязано
+  // выполнять обещанное, а не принимать «12ab34» и молча отклонять на сервере.
+  const field = document.getElementById('code');
+  field.addEventListener('input', () => {
+    field.value = field.value.replace(/\D/g, '').slice(0, 6);
+  });
+
+  // Живой отсчёт от 5:00. Останавливается на 0:00, а не уходит в минус:
+  // «-0:41» читалось бы как сбой страницы.
+  let seconds = 300;
+  const label = document.querySelector('[data-countdown]');
+  const tick = setInterval(() => {
+    seconds = Math.max(0, seconds - 1);
+    label.textContent = Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+    if (seconds === 0) clearInterval(tick);
+  }, 1000);
+</script>
+{% endblock %}

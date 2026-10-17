@@ -41,13 +41,19 @@ __all__ = [
     "LINK_MAIL_ACTION",
     "LINK_TELEGRAM_ACTION",
     "STATIC_DIR",
+    "TELEGRAM_ATTEMPTS_EXCEEDED",
+    "TELEGRAM_CODE_EXPIRED",
     "TELEGRAM_ENTRY_URL",
+    "TELEGRAM_LINK_NOT_READY",
+    "TELEGRAM_RESTART_URL",
+    "TELEGRAM_STATES",
+    "TELEGRAM_VERIFY_ACTION",
     "TEMPLATES_DIR",
     "UNLINK_MAIL_ACTION",
     "UNLINK_TELEGRAM_ACTION",
-    "render_config_unavailable",
     "render_linking",
     "render_login",
+    "render_login_telegram",
     "render_login_waiting",
     "render_subscriptions",
 ]
@@ -76,6 +82,36 @@ TERMS_URL = "/terms"
 # подставляет роутер, назвав `telegram_url`; умолчание нужно только чтобы
 # экран рендерился без роутера — в тестах.
 TELEGRAM_ENTRY_URL = "/login/telegram"
+
+# Куда уходит код из бота на проверку и куда ведёт «Заново» при исчерпанных
+# попытках. Оба адреса подставляет роутер; умолчания нужны, чтобы экран
+# рендерился в тестах без него.
+TELEGRAM_VERIFY_ACTION = "/login/telegram/verify"
+TELEGRAM_RESTART_URL = TELEGRAM_ENTRY_URL
+
+# Тексты неготовых состояний. Вынесены в константы, а не вписаны по месту в
+# разметке: их сверяет тест по имени, и так строка живёт в одном месте.
+#
+# «Ссылка ещё не готова» — не украшение, а честность: клиент показывает ровно
+# то же («Ссылка на вход ещё не готова. Нажмите «Войти» заново.»), потому что
+# нарисованная кнопка, ведущая в никуда, обещает то, чего сервис не сделал.
+TELEGRAM_LINK_NOT_READY = "Ссылка на вход ещё не готова. Нажмите «Войти» заново."
+# Истёкший код — это не ошибка ввода человека, а истёкшее окно, и подсказка у
+# него своя: начать заново, а не «исправить код».
+TELEGRAM_CODE_EXPIRED = "Время входа истекло. Начните вход заново."
+# Исчерпанные попытки — то же действие («заново»), но причина другая: не срок,
+# а перебор. Свести их в один текст значило бы спрятать, что случилось.
+TELEGRAM_ATTEMPTS_EXCEEDED = "Слишком много попыток. Начните вход заново."
+
+# Разметка состояний кода: во что разворачивается отказ бота. Список закрытый и
+# назван причинами из клиента (`AuthViewModel`), а не текстом: экран выбирает
+# состояние по имени, а текст состояния — уже из этого словаря. Незнакомое
+# значение сюда не попадает и трактуется как истёкшее окно: без этого новый
+# код ошибки бота показал бы пустой экран.
+TELEGRAM_STATES: dict[str, str] = {
+    "expired": TELEGRAM_CODE_EXPIRED,
+    "attempt_limit_exceeded": TELEGRAM_ATTEMPTS_EXCEEDED,
+}
 
 _ENV = Environment(
     loader=FileSystemLoader(str(TEMPLATES_DIR)),
@@ -151,6 +187,52 @@ def render_login_waiting(
     )
 
 
+def render_login_telegram(
+    *,
+    telegram_url: str | None = None,
+    error: str | None = None,
+    error_state: str | None = None,
+    busy: bool = False,
+    form_action: str = TELEGRAM_VERIFY_ACTION,
+    restart_url: str = TELEGRAM_RESTART_URL,
+) -> str:
+    """Экран входа через Telegram: открыть бота, ввести код оттуда, дождаться.
+
+    Отдельный шаблон, а не `login_waiting.html` с другим текстом. Разница не
+    только в подписях: здесь код приходит из бота, а не из письма, поэтому есть
+    кнопка «Открыть Telegram ещё раз» (клиент, `LoginWaitingScreen.kt`, ведёт ею
+    в **бот входа**, а не в почту) и честное состояние «ссылка ещё не готова».
+    Ветвление одного шаблона по строкам дало бы ему два лица и разъехалось бы
+    при первой правке — так же, как разошлись бы две копии палитры.
+
+    `telegram_url` — ссылка челленджа из `/auth/link` (`deep_link`), куда ведёт
+    «Открыть Telegram ещё раз». Пока бот её не вернул, она `None`, и экран
+    говорит прямо, что ссылки нет, вместо кнопки в никуда. Это то же честное
+    состояние, что в клиенте: «Ссылка на вход ещё не готова.»
+
+    `error_state` — причина отказа по имени из `TELEGRAM_STATES`; текст берётся
+    отсюда, а не сочиняется на экране. Незнакомая причина (новый код бота)
+    трактуется как истёкшее окно — начать заново, — а пустая страница не
+    показывается. Свободный `error` остаётся для прочих отказов входа.
+
+    `busy` — «Проверяем…» и заблокированная кнопка: второй тап не должен слать
+    второй запрос тем же кодом (та же ошибка, что уже ловили в клиенте).
+    """
+    if error is None and error_state is not None:
+        error = TELEGRAM_STATES.get(error_state, TELEGRAM_CODE_EXPIRED)
+    template = _ENV.get_template("login_telegram.html")
+    return template.render(
+        **_base_context(),
+        telegram_url=telegram_url,
+        link_ready=bool(telegram_url),
+        link_not_ready=TELEGRAM_LINK_NOT_READY,
+        error=error,
+        busy=busy,
+        form_action=form_action,
+        restart_url=restart_url,
+    )
+
+
 # Адреса действий связывания. Собирает их роутер, а не шаблон, — здесь только
 # значения по умолчанию, чтобы экран можно было отрендерить без роутера (тесты).
 LINK_TELEGRAM_ACTION = "/account/link/telegram"
@@ -206,13 +288,26 @@ def _end_date_text(view: SubscriptionView) -> str | None:
     return view.end_date.strftime("%d.%m.%Y")
 
 
-def _subscription_context(views: list[SubscriptionView]) -> dict[str, object]:
+def _subscription_context(
+    views: list[SubscriptionView],
+    *,
+    config_error: ConfigError | None = None,
+    config_error_id: str | None = None,
+) -> dict[str, object]:
     """Подписки, какими их видит разметка: состояние, тон, пояснение, срок.
 
     Тон берётся у `theme` по причине `subscription_<status>` — не задаётся
     здесь. Именно поэтому «активна» приходит нейтральной: зелёный в теме
     закреплён за подтверждённой защитой, а срок о защите не говорит ничего.
+
+    `config_error` с `config_error_id` кладут отказ в скачивании на карточку
+    ровно той подписки, по которой его нажали. Экран у нас один — карточки, а
+    не отдельная страница: человек нажал «Скачать» здесь, и ответ читает здесь
+    же, не теряя, к чему он относился.
     """
+    refusal = (
+        _config_refusal(config_error) if config_error is not None and config_error_id else None
+    )
     rows = []
     for view in views:
         days = view.days_left
@@ -230,6 +325,8 @@ def _subscription_context(views: list[SubscriptionView]) -> dict[str, object]:
                 "expires_soon": view.expires_soon,
                 "usable": view.is_usable,
                 "download_url": f"{CONFIG_DOWNLOAD_BASE}/{view.id}/config",
+                # Отказ виден только на своей карточке; у остальных — None.
+                "refusal": refusal if view.id == config_error_id else None,
             }
         )
     return {"rows": rows, "has_subscriptions": bool(rows)}
@@ -239,6 +336,8 @@ def render_subscriptions(
     views: list[SubscriptionView],
     *,
     error: str | None = None,
+    config_error: ConfigError | None = None,
+    config_error_id: str | None = None,
     notices: str | None = None,
     notices_tone: str = "neutral",
 ) -> str:
@@ -246,6 +345,11 @@ def render_subscriptions(
 
     Пустой список — состояние экрана, а не ошибка (W4.3): человек без подписки
     должен увидеть, что подписок нет, а не пустую страницу или сбой.
+
+    Отказ в конфиге приходит сюда, а не на отдельный экран: `config_error` с
+    `config_error_id` показывают причину на карточке нажатой подписки, и человек
+    остаётся там, откуда скачивал (W5.4). `error` — про другое: сбой самого
+    списка, у которого своей подписки нет.
 
     `notices_tone` — тон сообщения о действии, уже названный причиной из
     `theme`. Значение по умолчанию нейтральное: незачем подсвечивать то, о чём
@@ -257,7 +361,11 @@ def render_subscriptions(
         error=error,
         notices=notices,
         notices_tone=notices_tone,
-        **_subscription_context(views),
+        **_subscription_context(
+            views,
+            config_error=config_error,
+            config_error_id=config_error_id,
+        ),
     )
 
 
@@ -371,17 +479,17 @@ def _config_error_text(error: ConfigError) -> tuple[str, str]:
     return CONFIG_ERROR_FALLBACK
 
 
-def render_config_unavailable(error: ConfigError) -> str:
-    """Экран неудачной выдачи профиля.
+def _config_refusal(error: ConfigError) -> dict[str, object]:
+    """Отказ в конфиге, каким его кладут на карточку подписки.
 
-    Тип исключения — часть поведения, а не деталь: вызывающий код отдаёт сюда
-    сам объект отказа, и экран сам решает, что сказать. `DownloadRateLimited`
-    несёт срок ожидания, поэтому у него отдельная ветка."""
+    Тип исключения — часть поведения, а не деталь: вызывающий код отдаёт сам
+    объект отказа, и разметка получает готовые текст и заголовок. У
+    `DownloadRateLimited` есть срок ожидания, поэтому он несёт ещё и
+    `retry_after`: «попробуйте позже» без числа не подсказывает, сколько ждать.
+    """
     title, note = _config_error_text(error)
-    retry_after = getattr(error, "retry_after_seconds", None)
-    return _ENV.get_template("config_unavailable.html").render(
-        **_base_context(),
-        title=title,
-        note=note,
-        retry_after=retry_after,
-    )
+    return {
+        "title": title,
+        "note": note,
+        "retry_after": getattr(error, "retry_after_seconds", None),
+    }

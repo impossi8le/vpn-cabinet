@@ -1,4 +1,4 @@
-"""W5.2–W5.4: экраны подписок, связывания и отказа в конфиге.
+"""W5.2–W5.4: экраны подписок и связывания, отказ в конфиге на карточке.
 
 Каждый экран проверяется по тому, ради чего он существует, а не по наличию
 HTML.
@@ -14,11 +14,12 @@ HTML.
 ничего не делает. И Telegram ID показан маской: экран уходит в поддержку
 скриншотом.
 
-**Отказ в конфиге (`render_config_unavailable`)** говорит разное про истёкшую
-подписку и про «нет такого конфига»: подсказка «обновите список» и «попробуйте
-позже» — разные действия.
+**Отказ в конфиге** показывается на карточке подписки, по которой нажали
+скачать, а не на отдельном экране: уехав на другую страницу, человек теряет из
+виду, к чему относилась ошибка. При этом отказы остаются различимыми —
+«истекла», «отозван», «лимит» требуют разного действия и разных текстов.
 
-Общее для всех трёх экранов — правило §7: **зелёного нет нигде.** Здесь нечего
+Общее для всех экранов — правило §7: **зелёного нет нигде.** Здесь нечего
 подтверждать: ни туннеля, ни защиты. Проверка буквальная, по HEX, и смотрит на
 применение цвета, а не на объявление палитры, — как это уже сделано для экранов
 входа (`test_login_screens.py`).
@@ -27,6 +28,7 @@ HTML.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -41,7 +43,7 @@ from cabinet.configs import (
     DownloadRateLimited,
     SubscriptionInactive,
 )
-from cabinet.subscriptions import STATUS_ACTIVE, subscription_views
+from cabinet.subscriptions import STATUS_ACTIVE, SubscriptionView, subscription_views
 from cabinet.theme import COLORS, Tone
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
@@ -300,36 +302,90 @@ def test_linking_notice_tone_comes_from_caller() -> None:
     assert "tone-process" in html
 
 
-# --- отказ в выдаче конфига ----------------------------------------------
+# --- отказ в выдаче конфига: на карточке подписки ------------------------
+
+
+def _usable_view(id_: str = "sub-1", name: str = "Домашний") -> SubscriptionView:
+    return SubscriptionView(
+        id=id_,
+        name=name,
+        status=STATUS_ACTIVE,
+        reported_status=STATUS_ACTIVE,
+        end_date=NOW + timedelta(days=30),
+        days_left=30,
+    )
+
+
+def test_refusal_appears_on_the_card_of_the_pressed_subscription() -> None:
+    """Отказ виден на карточке той подписки, по которой нажали скачать.
+
+    Это и есть замена отдельному экрану: человек нажал здесь — здесь и читает
+    ответ, не теряя из виду, к какой подписке он относился.
+    """
+    views = [_usable_view("sub-1", "Домашний"), _usable_view("sub-2", "Телефон")]
+    html = render.render_subscriptions(
+        views,
+        config_error=ConfigRevoked("x"),
+        config_error_id="sub-2",
+    )
+
+    title = "Доступ к подключению отозван"
+    assert title in html
+    # Отказ стоит на карточке sub-2, а не sub-1: разбираем HTML по границе второй
+    # карточки — её открывает имя подписки «Телефон».
+    first, second = html.split("Телефон", 1)
+    assert title in second
+    assert title not in first
+
+
+def test_refusal_without_id_lands_on_no_card() -> None:
+    """Без указания подписки отказ не приписывается ни одной карточке.
+
+    Приписать его первой попавшейся — значит сказать человеку, что сломан доступ
+    к подписке, которая в порядке.
+    """
+    html = render.render_subscriptions([_usable_view("sub-1")], config_error=ConfigRevoked("x"))
+    assert "Конфиг отозван" not in html
 
 
 def test_config_refusals_read_differently() -> None:
     """У каждого отказа свой текст и своё действие.
 
     «Обновите список» и «попробуйте позже» — не одно и то же; свалить их в
-    «ошибка» значило бы лишить человека единственной подсказки.
+    «ошибка» значило бы лишить человека единственной подсказки. Различение
+    держится на `isinstance` в `_config_error_text` (W5.4).
     """
-    inactive = render.render_config_unavailable(SubscriptionInactive("x"))
-    not_found = render.render_config_unavailable(ConfigNotFound("x"))
-    revoked = render.render_config_unavailable(ConfigRevoked("x"))
-    retired = render.render_config_unavailable(ConfigRetired("x"))
 
-    titles = {
-        inactive.split("<h1>")[1].split("</h1>")[0],
-        not_found.split("<h1>")[1].split("</h1>")[0],
-        revoked.split("<h1>")[1].split("</h1>")[0],
-        retired.split("<h1>")[1].split("</h1>")[0],
+    def card(error: ConfigError) -> str:
+        return render.render_subscriptions(
+            [_usable_view()], config_error=error, config_error_id="sub-1"
+        )
+
+    inactive = card(SubscriptionInactive("x"))
+    not_found = card(ConfigNotFound("x"))
+    revoked = card(ConfigRevoked("x"))
+    retired = card(ConfigRetired("x"))
+
+    notes = {
+        inactive.split("refusal-s", 1)[1],
+        not_found.split("refusal-s", 1)[1],
+        revoked.split("refusal-s", 1)[1],
+        retired.split("refusal-s", 1)[1],
     }
-    assert len(titles) == 4
+    assert len(notes) == 4
 
 
 def test_rate_limit_shows_how_long_to_wait() -> None:
     """У «слишком много скачиваний» показан срок ожидания.
 
     Без него «попробуйте позже» не подсказывает, сколько именно ждать, и человек
-    либо бросает, либо долбит кнопку.
+    либо бросает, либо долбит кнопку (`DownloadRateLimited.retry_after_seconds`).
     """
-    html = render.render_config_unavailable(DownloadRateLimited("x", retry_after_seconds=120))
+    html = render.render_subscriptions(
+        [_usable_view()],
+        config_error=DownloadRateLimited("x", retry_after_seconds=120),
+        config_error_id="sub-1",
+    )
     assert "Повторить можно" in html
     assert "120" in html
 
@@ -340,7 +396,9 @@ def test_unknown_config_error_gets_a_neutral_fallback() -> None:
     Иначе расхождение версий с ботом выглядело бы как «конфига нет», и причина
     не всплыла бы никогда.
     """
-    html = render.render_config_unavailable(ConfigError("что-то новое"))
+    html = render.render_subscriptions(
+        [_usable_view()], config_error=ConfigError("что-то новое"), config_error_id="sub-1"
+    )
     title, note = render.CONFIG_ERROR_FALLBACK
     assert title in html
     assert note in html
@@ -356,4 +414,24 @@ def test_config_refusals_have_no_green_and_no_red() -> None:
         DownloadRateLimited("x", retry_after_seconds=60),
         ConfigError("x"),
     ):
-        _assert_no_green(render.render_config_unavailable(error))
+        html = render.render_subscriptions(
+            [_usable_view()], config_error=error, config_error_id="sub-1"
+        )
+        body = _markup_without_palette(html)
+        _assert_no_green(html)
+        # Красное объявлено в палитре для необратимого удаления аккаунта, но на
+        # отказе не применяется: отказ в конфиге — состояние, а не опасность (§7).
+        assert COLORS.red.upper() not in body.upper()
+
+
+def test_the_standalone_refusal_screen_is_gone() -> None:
+    """Отдельного экрана отказа больше нет — ни функции, ни шаблона.
+
+    Экран 6 снят: ошибка живёт на карточке, и воскрешать страницу нечем. Проверка
+    держит это удаление, чтобы функция не вернулась «на всякий случай».
+    """
+    assert not hasattr(render, "render_config_unavailable")
+    assert "render_config_unavailable" not in render.__all__
+
+    templates = Path(render.__file__).parent / "templates"
+    assert not (templates / "config_unavailable.html").exists()

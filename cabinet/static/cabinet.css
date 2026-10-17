@@ -171,6 +171,16 @@ a.btn { text-decoration: none; }
    объяснение, чтобы человек не искал кнопку, которой тут быть не должно. */
 .sub-unusable { margin-top: 12px; color: var(--ash); font-size: 12.5px; line-height: 1.55; }
 
+/* Отказ в выдаче конфига — на карточке подписки, рядом с кнопкой. Полоса слева
+   несёт состояние, а не заливка: тот же приём, что у .notice и .disc, — красного
+   здесь нет, отказ это состояние, а не опасность (§7). Тон границы нейтральный:
+   причина отказа названа текстом, и подсвечивать её цветом нужды нет. */
+.refusal { border-left: 2px solid var(--edge); padding: 2px 0 2px 12px; margin-top: 14px; }
+.refusal-t { font-size: 13px; font-weight: 590; color: var(--mist); }
+.refusal-s { font-size: 12.5px; line-height: 1.55; color: var(--text-secondary); margin-top: 4px; }
+.refusal-w { font-size: 12.5px; line-height: 1.55; color: var(--ash); margin-top: 6px; }
+.refusal-w b { color: var(--mist); font-weight: 590; }
+
 /* Карточка подписки держит разметку блоками: без этого ссылка-кнопка внутри
    карточки слипалась бы с подписью выше. */
 .sub-card { margin-bottom: 12px; }
