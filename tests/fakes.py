@@ -192,6 +192,21 @@ class FakeApi:
                 return self._copy(account)
         return None
 
+    def find_by_id(self, account_id: int) -> Account | None:
+        """Прочитать один аккаунт по `id` — как `GET /internal/accounts/{id}`.
+
+        Отдельный метод, а не `_by_id`: связыванию нужно **прочитать** аккаунт
+        (что уже привязано, пусто ли место), и на «не найден» оно отвечает
+        отказом, а не исключением мока. `_by_id` для этого не годится — он
+        бросает `FakeApiError`, то есть падение теста вместо проверяемого
+        состояния.
+        """
+        self._log("find_by_id", account_id=account_id)
+        for account in self.accounts:
+            if account.id == account_id:
+                return self._copy(account)
+        return None
+
     # --- связывание (W3.2, W3.3, W3.5) -----------------------------------
 
     def link_chat_id(self, account_id: int, chat_id: int) -> int:
