@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Мои подключения{% endblock %}
+{% block content %}
+<div class="nav">
+  <a class="back" href="/">‹ Назад</a>
+  <span class="t">Подключения</span>
+  <span class="side"></span>
+</div>
+
+{% if notices %}
+  {# Сообщение после действия (привязка, отвязка, повторный вход). Тон ему
+     задаёт вызывающий код причиной из `theme`, а не разметка: цвет приходит
+     сюда значением, и «зелёный где попало» так не появляется. #}
+  <div class="notice tone-{{ notices_tone or 'neutral' }}">{{ notices }}</div>
+{% endif %}
+
+{% if error %}
+  {# Отказ показать список — состояние, а не опасность: красного здесь нет (§7). #}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+{% if has_subscriptions %}
+  <div class="stack">
+    {%- for row in rows %}
+    <div class="card sub-card">
+      <div class="sub-head">
+        <span class="sub-name">{{ row.name }}</span>
+        {# Значок состояния нейтральный либо янтарный — по тону причины.
+           Зелёного здесь быть не может: активная подписка говорит о сроке, а
+           не о том, что трафик защищён (§7). #}
+        <span class="badge tone-{{ row.tone }}">{{ row.status_label }}</span>
+      </div>
+      <p class="sub-note">{{ row.note }}</p>
+      <dl class="rows">
+        <div class="row">
+          <dt>Срок</dt>
+          <dd>{% if row.end_date %}<span class="mono">{{ row.end_date }}</span>{% else %}неизвестен{% endif %}</dd>
+        </div>
+        {%- if row.days_left %}
+        <div class="row">
+          <dt>Осталось</dt>
+          <dd>{% if row.expires_soon %}<span class="soon">{{ row.days_left }}</span>{% else %}{{ row.days_left }}{% endif %}</dd>
+        </div>
+        {%- endif %}
+      </dl>
+      {# Предупреждение о близком сроке — отдельная строка, без смены тона:
+         «скоро истечёт» — это срок, а не опасность. #}
+      {%- if row.expires_soon %}
+      <p class="sub-soon">Подписка скоро закончится — продлите заранее, чтобы не потерять доступ.</p>
+      {%- endif %}
+      {# Кнопка скачивания есть только у работающей подписки: у истёкшей и
+         заблокированной конфиг всё равно не отдаётся, и предлагать её значило
+         бы обещать то, что сервис отвергнет. #}
+      {%- if row.usable %}
+      <a class="btn btn-g btn-sm" href="{{ row.download_url }}">Скачать конфиг</a>
+      {%- else %}
+      <p class="sub-unusable">Скачивание недоступно, пока подписка не действует.</p>
+      {%- endif %}
+    </div>
+    {%- endfor %}
+  </div>
+{% else %}
+  {# Пустой список — состояние экрана, а не ошибка (W4.3): честно говорим, что
+     подписок нет, вместо пустой страницы. #}
+  <div class="card empty">
+    <p class="empty-t">Подписок нет</p>
+    <p class="empty-s">Если вы только что оформили подписку — подождите пару минут и обновите. Подписка оформляется в боте сервиса.</p>
+  </div>
+{% endif %}
+{% endblock %}

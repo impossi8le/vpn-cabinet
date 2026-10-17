@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Способы входа{% endblock %}
+{% block content %}
+<div class="nav">
+  <a class="back" href="/">‹ Назад</a>
+  <span class="t">Способы входа</span>
+  <span class="side"></span>
+</div>
+
+<h1>Вход в аккаунт</h1>
+<p class="lead">Почта и Telegram — два независимых способа входа. Достаточно одного: второй пригодится, если один окажется недоступен.</p>
+
+{% if notice %}
+  <div class="notice tone-{{ notice_tone or 'neutral' }}">{{ notice }}</div>
+{% endif %}
+
+{% if error %}
+  {# Отказ привязки. Тексты разных причин сведены в один намеренно (§5): по
+     разнице между «занято другим аккаунтом» и «уже привязано» перебором
+     адресов выяснялось бы, кто где зарегистрирован. #}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<div class="card">
+  <div class="sub-head">
+    <span class="sub-name">Почта</span>
+    <span class="badge tone-neutral">{{ 'Привязана' if mail_linked else 'Не привязана' }}</span>
+  </div>
+  {% if mail_linked %}
+    <p class="sub-note">На этот адрес приходит код для входа.</p>
+    <dl class="rows">
+      <div class="row">
+        <dt>Адрес</dt>
+        <dd><span class="mono">{{ mail }}</span></dd>
+      </div>
+    </dl>
+    {%- if can_unlink_mail %}
+    <form method="post" action="{{ unlink_mail_action }}">
+      <button class="btn btn-g btn-sm" type="submit">Отвязать почту</button>
+    </form>
+    {%- else %}
+    {# Единственный способ входа отвязывать нельзя: аккаунт без способов
+       входа недоступен навсегда (§8). Кнопку не показываем — она вела бы к
+       заведомому отказу. #}
+    <p class="sub-unusable">Это единственный способ входа. Сначала привяжите Telegram — без него отвязывать почту нельзя.</p>
+    {%- endif %}
+  {% else %}
+    <p class="sub-note">Привяжите почту — на неё придёт код подтверждения. Без него адрес не считается вашим.</p>
+    <form method="post" action="{{ link_mail_action }}">
+      <label class="field-label" for="link-mail">Почта</label>
+      <input class="field" id="link-mail" name="mail" type="email" inputmode="email"
+             autocomplete="email" required>
+      <button class="btn btn-p btn-sm" type="submit">Получить код</button>
+    </form>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="sub-head">
+    <span class="sub-name">Telegram</span>
+    <span class="badge tone-neutral">{{ 'Привязан' if telegram_linked else 'Не привязан' }}</span>
+  </div>
+  {% if telegram_linked %}
+    <p class="sub-note">Вход через бота сервиса уже работает.</p>
+    <dl class="rows">
+      <div class="row">
+        <dt>Telegram ID</dt>
+        {# ID показан маской: скриншот экрана уходит в поддержку, и полный
+           профиль по нему отдавать незачем. #}
+        <dd><span class="mono">{{ telegram_id }}</span></dd>
+      </div>
+    </dl>
+    {%- if can_unlink_telegram %}
+    <form method="post" action="{{ unlink_telegram_action }}">
+      <button class="btn btn-g btn-sm" type="submit">Отвязать Telegram</button>
+    </form>
+    {%- else %}
+    <p class="sub-unusable">Это единственный способ входа. Сначала привяжите почту — без неё отвязывать Telegram нельзя.</p>
+    {%- endif %}
+  {% else %}
+    <p class="sub-note">Привязка идёт через бота сервиса: он подтвердит, что Telegram действительно ваш.</p>
+    <form method="post" action="{{ link_telegram_action }}">
+      <button class="btn btn-p btn-sm" type="submit">Привязать Telegram</button>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

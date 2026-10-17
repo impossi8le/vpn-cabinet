@@ -117,3 +117,59 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.022em; line-height: 1
 
 .mono { font-family: "JetBrains Mono", Consolas, ui-monospace, monospace; letter-spacing: -0.013em; }
 .stack { display: flex; flex-direction: column; gap: 9px; }
+
+/* Сообщение о действии (привязка, отвязка, повтор входа). Полоса слева несёт
+   тон, а не заливка: тот же приём, что у .disc — иначе цвет залил бы полэкрана
+   и читался бы как тревога. */
+.notice {
+  border-left: 2px solid var(--edge); padding: 2px 0 2px 12px;
+  margin-bottom: 18px; font-size: 13px; line-height: 1.5; color: var(--mist);
+}
+.notice.tone-process { border-left-color: var(--amber); }
+.notice.tone-danger { border-left-color: var(--red); }
+
+/* Строка раздела: имя слева, состояние справа. Разъезжаются по краям, чтобы
+   значок состояния стоял на одном месте во всех карточках. */
+.sub-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.sub-name { font-size: 15.5px; font-weight: 590; letter-spacing: -0.012em; }
+.sub-note { color: var(--text-secondary); font-size: 12.5px; line-height: 1.55; margin-top: 6px; }
+
+/* Значок состояния. Нейтральный — граница Edge и текст Mist: состояние
+   показано, но ничем не выделено. Янтарный значок — идущий процесс. Зелёного
+   здесь нет: «активна» говорит о сроке, а не о защите (§7). */
+.badge {
+  flex: 0 0 auto; font-size: 11px; font-weight: 590; letter-spacing: 0.01em;
+  padding: 3px 8px; border-radius: var(--radius-small);
+  border: 0.5px solid var(--edge); color: var(--mist);
+}
+.badge.tone-process { border-color: var(--amber); color: var(--amber); }
+.badge.tone-danger { border-color: var(--red); color: var(--red); }
+
+/* Пары «ключ — значение» внутри карточки: подпись тише значения, значения
+   выровнены вправо, как в клиенте. */
+.rows { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.rows .row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.rows dt { color: var(--text-secondary); font-size: 13px; }
+.rows dd { color: var(--bone); font-size: 13.5px; text-align: right; }
+
+/* Предупреждение о близком сроке — текст в тоне «скоро», но не красный и без
+   значка тревоги: срок не опасность (§7). Основной текст, не акцент. */
+.sub-soon { margin-top: 10px; font-size: 12.5px; line-height: 1.55; color: var(--mist); }
+
+/* Почему скачивание недоступно. Тихо и без кнопки: вместо действия —
+   объяснение, чтобы человек не искал кнопку, которой тут быть не должно. */
+.sub-unusable { margin-top: 12px; color: var(--ash); font-size: 12.5px; line-height: 1.55; }
+
+/* Карточка подписки держит разметку блоками: без этого ссылка-кнопка внутри
+   карточки слипалась бы с подписью выше. */
+.sub-card { margin-bottom: 12px; }
+.sub-card .btn { margin-top: 14px; text-decoration: none; }
+
+/* Пустой список — не ошибка: спокойный блок с заголовком и пояснением. */
+.empty { text-align: center; padding: 26px 18px; }
+.empty-t { font-size: 15.5px; font-weight: 590; }
+.empty-s { margin-top: 8px; color: var(--text-secondary); font-size: 12.5px; line-height: 1.6; }
+
+/* Карточки на экране связывания: вторая не должна прилипать к первой. */
+.card + .card { margin-top: 12px; }
+.card .field { margin-bottom: 12px; font-size: 16px; letter-spacing: normal; text-align: left; }
