@@ -41,6 +41,7 @@ __all__ = [
     "LINK_MAIL_ACTION",
     "LINK_TELEGRAM_ACTION",
     "STATIC_DIR",
+    "TELEGRAM_ENTRY_URL",
     "TEMPLATES_DIR",
     "UNLINK_MAIL_ACTION",
     "UNLINK_TELEGRAM_ACTION",
@@ -65,6 +66,16 @@ CSS_URL = "/static/cabinet.css"
 # условий, а не украшение.
 PRIVACY_URL = "/privacy"
 TERMS_URL = "/terms"
+
+# Куда ведёт кнопка «Войти через Telegram» на экране входа.
+#
+# Это НЕ адрес бота. Репозиторий публичный, и настоящий `https://t.me/<bot>`
+# здесь стоять не может — как и любого реального домена. Значение ведёт на
+# собственный путь входа кабинета, который в бою отвечает переходом на бота
+# (флоу `/auth/link` — §2.1 контракта, защита от login-CSRF). Ссылку
+# подставляет роутер, назвав `telegram_url`; умолчание нужно только чтобы
+# экран рендерился без роутера — в тестах.
+TELEGRAM_ENTRY_URL = "/login/telegram"
 
 _ENV = Environment(
     loader=FileSystemLoader(str(TEMPLATES_DIR)),
@@ -93,16 +104,27 @@ def render_login(
     mail: str | None = None,
     error: str | None = None,
     form_action: str = "/login",
+    telegram_url: str = TELEGRAM_ENTRY_URL,
 ) -> str:
-    """Экран ввода почты.
+    """Экран входа: выбор из двух равноправных путей — почта или Telegram.
 
     `error` сюда попадает, когда адрес отвергнут (пустой или занят другим
     аккаунтом). Это не опасность — форма просто вернётся с подсказкой, и
     янтарный текст здесь уместнее красного: красный зарезервирован под
     реальную опасность (§7).
+
+    `telegram_url` — куда ведёт кнопка входа через Telegram. Оба способа —
+    выбор, а не один путь с оговоркой: у человека может не быть доступа к
+    любому из двух, и тогда спасает второй (§1, §5 спеки).
     """
     template = _ENV.get_template("login.html")
-    return template.render(**_base_context(), mail=mail, error=error, form_action=form_action)
+    return template.render(
+        **_base_context(),
+        mail=mail,
+        error=error,
+        form_action=form_action,
+        telegram_url=telegram_url,
+    )
 
 
 def render_login_waiting(
