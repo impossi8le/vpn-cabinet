@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+{# Тёмная тема единственная (решение UX-ревью, §7). Переменные палитры приходят
+   из `theme.css_variables()` через контекст `css_vars` — не пишутся здесь,
+   чтобы вторая копия не разошлась с `VpnColors`. #}
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>{% block title %}Кабинет{% endblock %}</title>
+<style>
+:root {
+{%- for name, value in css_vars.items() %}
+  {{ name }}: {{ value }};
+{%- endfor %}
+}
+</style>
+<link rel="stylesheet" href="{{ css_url }}">
+</head>
+<body>
+<div class="page">
+{% block content %}{% endblock %}
+</div>
+</body>
+</html>

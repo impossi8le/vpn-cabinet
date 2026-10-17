@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Проверяем вход{% endblock %}
+{% block content %}
+<div class="mid">
+  {# Янтарный щит: идёт проверка кода. Янтарный — только идущий процесс,
+     и здесь он ровно об этом — ожидание, а не опасность и не защита. #}
+  <div class="mark">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3l7 4v5c0 4.2-2.9 7.6-7 8.6-4.1-1-7-4.4-7-8.6V7l7-4z"
+            stroke="{{ colors.amber }}" stroke-width="1.7" stroke-linejoin="round"/>
+    </svg>
+  </div>
+
+  <h1>Проверяем вход</h1>
+  <p class="lead">Мы отправили код на <b class="mono" style="color:var(--bone)">{{ mail }}</b>. Введите его здесь.</p>
+
+  {# Отсчёт: полоса и жирный текст янтарные — то же ожидание, что и выше.
+     Отсчёт ведёт страница, а не сервер: письмо уже ушло, и тикающая строка
+     честнее замороженной метки, снятой при рендере. #}
+  <div class="disc tone-process">
+    <p>Код действует 5 минут. Осталось <b class="mono" data-countdown>5:00</b></p>
+  </div>
+
+  <form method="post" action="{{ form_action }}">
+    <label class="field-label" for="code">Код из письма</label>
+    {# Допускаются только цифры, максимум 6. Ограничение задано и в разметке,
+       и скриптом: с одной разметкой вставка из буфера протащила бы буквы. #}
+    <input class="field" id="code" name="code" type="text" inputmode="numeric"
+           autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"
+           autofocus required>
+    <p class="error" role="alert">{{ error or '' }}</p>
+    <button class="btn btn-p" type="submit" {{ 'disabled' if busy else '' }}>
+      {{ 'Проверяем…' if busy else 'Подтвердить' }}
+    </button>
+  </form>
+
+  <form method="post" action="{{ resend_action }}">
+    <button class="btn btn-g btn-sm" type="submit">Отправить код ещё раз</button>
+  </form>
+</div>
+
+<script>
+  // Только цифры, не больше шести: метка поля обещает цифры, и поле обязано
+  // выполнять обещанное, а не принимать «12ab34» и молча отклонять на сервере.
+  const field = document.getElementById('code');
+  field.addEventListener('input', () => {
+    field.value = field.value.replace(/\D/g, '').slice(0, 6);
+  });
+
+  // Живой отсчёт от 5:00. Останавливается на 0:00, а не уходит в минус:
+  // «-0:41» читалось бы как сбой страницы.
+  let seconds = 300;
+  const label = document.querySelector('[data-countdown]');
+  const tick = setInterval(() => {
+    seconds = Math.max(0, seconds - 1);
+    label.textContent = Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+    if (seconds === 0) clearInterval(tick);
+  }, 1000);
+</script>
+{% endblock %}

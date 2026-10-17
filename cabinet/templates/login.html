@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Вход{% endblock %}
+{% block content %}
+<div class="mid">
+  {# Щит: контур Bone. Зелёного здесь нет намеренно — экран ничего не измерял,
+     и зелёный обещал бы защиту, которой никто не подтверждал (§7). #}
+  <div class="mark">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3l7 4v5c0 4.2-2.9 7.6-7 8.6-4.1-1-7-4.4-7-8.6V7l7-4z"
+            stroke="{{ colors.bone }}" stroke-width="1.7" stroke-linejoin="round"/>
+    </svg>
+  </div>
+
+  {# Заголовок в кабинете — про вход, а не про подключение: подключения живут
+     в приложении, а кабинет пускает к аккаунту, когда Telegram недоступен. #}
+  <h1>Вход в кабинет</h1>
+  <p class="lead">Войдите по почте — код придёт письмом. Telegram привяжете позже, если захотите: он не обязателен.</p>
+
+  <div class="steps">
+    <div class="st-row"><span class="st-n">1</span><span class="st-t">Укажите почту</span></div>
+    <div class="st-row"><span class="st-n">2</span><span class="st-t">Введите код из письма</span></div>
+    <div class="st-row"><span class="st-n">3</span><span class="st-t">Смотрите подписки и качайте конфиги</span></div>
+  </div>
+
+  <div class="disc">
+    <p>Почта — самостоятельный способ входа: почтовый ящик не должен быть доступен только через Telegram.</p>
+  </div>
+
+  <form method="post" action="{{ form_action }}">
+    <label class="field-label" for="mail">Почта</label>
+    <input class="field" id="mail" name="mail" type="email" inputmode="email"
+           autocomplete="email" required value="{{ mail or '' }}">
+    {# Адрес отвергнут (пустой, или занят другим аккаунтом). Тон — общий для
+       ошибок ввода, а не красный: см. login_waiting.html про смысл цвета. #}
+    <p class="error" role="alert">{{ error or '' }}</p>
+
+    {# Ссылки на документы стоят ДО кнопки — как в реализации клиента (§2
+       implemented-ui-spec): условие видно, прежде чем нажать, а не после. #}
+    <p class="legal">Нажимая «Получить код», вы соглашаетесь с <a href="{{ privacy_url }}">политикой конфиденциальности</a> и <a href="{{ terms_url }}">условиями</a>.</p>
+
+    <button class="btn btn-p" type="submit">Получить код</button>
+  </form>
+</div>
+{% endblock %}

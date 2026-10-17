@@ -1,0 +1,119 @@
+/* Стили кабинета. Тёмная тема — единственная, как в клиенте (§7).
+   Переменные приходят из Python (`theme.css_variables`) и вставляются в
+   base.html: вторая копия палитры здесь разошлась бы с `VpnColors` молча.
+   Компоненты повторяют макет (`mockup.html`): .card, .btn, .hint, .disc. */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--void);
+  color: var(--bone);
+  font-family: Inter, "Segoe UI", -apple-system, system-ui, sans-serif;
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 40px 20px 64px;
+}
+
+.page { width: 100%; max-width: 420px; }
+
+/* Шапка: «‹ Назад» слева, заголовок по центру, пустая правая колонка —
+   чтобы заголовок не уезжал от «Назад» на разных экранах (как в клиенте). */
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 18px;
+}
+.nav .t { font-size: 16.5px; font-weight: 590; letter-spacing: -0.015em; }
+.nav .back { color: var(--ice); font-size: 14.5px; text-decoration: none; }
+.nav .side { width: 48px; }
+
+.mid {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding-bottom: 26px;
+}
+
+.mark {
+  width: 54px; height: 54px; border-radius: 15px; margin-bottom: 24px;
+  background: linear-gradient(160deg, #1d2331, #141a24);
+  border: 0.5px solid var(--hairline);
+  display: flex; align-items: center; justify-content: center;
+}
+.mark svg { width: 25px; height: 25px; }
+
+h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.022em; line-height: 1.18; margin-bottom: 11px; }
+.lead { color: var(--text-secondary); font-size: 14px; line-height: 1.6; margin-bottom: 20px; }
+
+/* Нумерованные шаги. Номер — в кружке с границей Edge, текст Mist:
+   граница заметная, но не акцентная — это пояснение, а не статус. */
+.steps { display: flex; flex-direction: column; gap: 8px; margin-bottom: 18px; }
+.steps .st-row { display: flex; align-items: baseline; gap: 10px; }
+.steps .st-n {
+  width: 17px; height: 17px; border-radius: 50%; flex: 0 0 auto;
+  border: 0.5px solid var(--edge); color: var(--text-secondary);
+  font-size: 10.5px; font-weight: 590;
+  display: flex; align-items: center; justify-content: center;
+  position: relative; top: 1px;
+}
+.steps .st-t { font-size: 13px; color: var(--mist); line-height: 1.45; }
+
+/* Раскрытие с левой акцентной полосой. Полоса — Edge, а не Ice:
+   это пояснение, а не фокус и не статус. */
+.disc { border-left: 2px solid var(--edge); padding: 2px 0 2px 12px; margin-bottom: 18px; }
+.disc p { font-size: 12.5px; line-height: 1.6; color: var(--text-secondary); }
+.disc b { color: var(--mist); font-weight: 590; }
+
+/* Отсчёт. Полоса слева янтарная: ожидание подтверждения — идущий процесс,
+   и это единственный смысл, который янтарный здесь несёт. */
+.disc.tone-process { border-left-color: var(--amber); }
+.disc.tone-process b { color: var(--amber); }
+
+.legal { margin-top: 14px; text-align: center; color: var(--ash); font-size: 11.5px; line-height: 1.6; }
+.legal a { color: var(--ice); text-decoration: none; }
+
+.card {
+  background: var(--carbon);
+  border: 0.5px solid var(--hairline);
+  border-radius: var(--radius-card);
+  padding: 15px;
+}
+
+.btn {
+  height: 50px; border-radius: var(--radius-button);
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  font-size: 16.5px; font-weight: 590; letter-spacing: -0.01em;
+  cursor: pointer; border: none; width: 100%; font-family: inherit;
+}
+/* Главная кнопка белая: своего брендового цвета у продукта нет (§7). */
+.btn-p { background: var(--bone); color: var(--void); }
+.btn-p[disabled] { opacity: 0.5; cursor: default; }
+/* Ghost — прозрачная с границей Edge: заметная граница, читаемая на тёмном. */
+.btn-g { background: transparent; border: 0.5px solid var(--edge); color: var(--bone); }
+.btn-sm { height: 46px; font-size: 15px; }
+.btn + .btn { margin-top: 9px; }
+
+/* Поле кода. Цвета заданы явно — без этого браузер рисует ввод почти чёрным
+   на тёмном, и код не виден. */
+.field-label { display: block; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 7px; }
+.field {
+  width: 100%; height: 50px; font-size: 22px; letter-spacing: 0.35em;
+  font-family: "JetBrains Mono", Consolas, ui-monospace, monospace;
+  background: var(--obsidian); color: var(--bone);
+  border: 0.5px solid var(--edge); border-radius: var(--radius-button);
+  padding: 0 14px; text-align: center;
+}
+.field:focus { outline: none; border-color: var(--ice); }
+.field.is-busy { border-color: var(--amber); }
+
+/* Ошибка под полем — янтарная: не введён код, истёк срок, слишком много
+   попыток. Это идущий процесс с осечкой, а не опасность: красный здесь
+   зарезервирован под реальную опасность и не тратится на «исправьте ввод». */
+.error { color: var(--amber); font-size: 12.5px; line-height: 1.5; margin-top: 8px; min-height: 17px; }
+
+.mono { font-family: "JetBrains Mono", Consolas, ui-monospace, monospace; letter-spacing: -0.013em; }
+.stack { display: flex; flex-direction: column; gap: 9px; }
