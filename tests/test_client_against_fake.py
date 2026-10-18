@@ -28,12 +28,16 @@ BASE = "http://127.0.0.1:9"
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 
 
-def _transport_for(api: FakeApi) -> httpx.MockTransport:
+def _transport_for(api: FakeApi, paths: list[str] | None = None) -> httpx.MockTransport:
     """Мост: HTTP-запросы клиента → вызовы подставного бота.
 
     Маршруты и форма ответа повторяют внутренний роутер бота. Совпадение имён
     здесь и есть предмет проверки: разойдётся — этот тест покраснеет раньше,
     чем это заметит боевой кабинет.
+
+    `paths` — необязательный журнал путей: тест, которому нужно утверждать
+    **точное** имя маршрута (а не только «запрос дошёл»), передаёт сюда список,
+    и обработчик складывает в него пришедшие пути. Без него поведение прежнее.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -42,11 +46,23 @@ def _transport_for(api: FakeApi) -> httpx.MockTransport:
         if request.headers.get("X-Internal-Secret") != SECRET:
             return httpx.Response(401, json={"error": {"code": "unauthorized"}})
 
+        if paths is not None:
+            paths.append(request.url.path)
+
         path = request.url.path
         if request.method == "GET" and path == "/internal/accounts/by-chat-id":
             acc = api.find_by_chat_id(int(request.url.params["chat_id"]))
         elif request.method == "GET" and path == "/internal/accounts/by-mail":
             acc = api.find_by_mail(request.url.params["mail"])
+        elif request.method == "POST":
+            # `/internal/accounts/{id}/unlink-telegram|unlink-mail`. Разбор по
+            # сегментам, а не сравнение строк: `{id}` меняется от аккаунта к
+            # аккаунту, но имя последнего сегмента — часть контракта (§1) и
+            # именно его проверяет тест.
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[0] == "internal" and parts[1] == "accounts":
+                return _unlink_response(api, int(parts[2]), parts[3])
+            return httpx.Response(404, json={"error": {"code": "not_found"}})
         else:
             return httpx.Response(404, json={"error": {"code": "not_found"}})
 
@@ -57,6 +73,23 @@ def _transport_for(api: FakeApi) -> httpx.MockTransport:
         return httpx.Response(200, json={"account": _account_json(acc)})
 
     return httpx.MockTransport(handler)
+
+
+def _unlink_response(api: FakeApi, account_id: int, action: str) -> httpx.Response:
+    """Ответ подставного роутера на отвязку — как его отдаёт живой бот.
+
+    `rowcount = 0` — отвязка оставила бы аккаунт без способа входа, и это
+    отказ `409 code: last_login_method` (§1 контракта), а не сетевой сбой.
+    """
+    if api.find_by_id(account_id) is None:
+        return httpx.Response(
+            404, json={"error": {"code": "account_not_found", "retryable": False}}
+        )
+
+    unlink = api.unlink_chat_id if action == "unlink-telegram" else api.unlink_mail
+    if unlink(account_id) != 1:
+        return httpx.Response(409, json={"error": {"code": "last_login_method"}})
+    return httpx.Response(200, json={"account": _account_json(api.find_by_id(account_id))})
 
 
 def _account_json(acc) -> dict:
@@ -128,3 +161,68 @@ async def test_telegram_only_account_round_trips():
 
     assert found.chat_id == 777_000_111
     assert found.mail is None
+
+
+async def test_unlink_telegram_hits_the_contract_path_and_parses_the_account():
+    """Отвязка Telegram идёт на **точный** путь из §1 и разбирает ответ.
+
+    Проверяется именно имя маршрута: `unlink-telegram` должно совпасть буква в
+    букву с контрактом бота. Расхождение имён путей в этом проекте уже
+    случалось, поэтому путь ловится журналом, а не только фактом «дошли».
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=555_000_111, mail="user@example.com", mail_verified_at=NOW)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        result = await client.unlink_telegram(account.id)
+
+    assert paths == [f"/internal/accounts/{account.id}/unlink-telegram"]
+    assert result.chat_id is None
+    # Почта осталась — второй способ входа не тронут.
+    assert api.find_by_id(account.id).mail == "user@example.com"
+
+
+async def test_unlink_mail_hits_the_contract_path_and_parses_the_account():
+    """Симметрично: у отвязки почты свой путь — `unlink-mail`."""
+    api = FakeApi()
+    account = api.create_account(chat_id=555_000_111, mail="user@example.com", mail_verified_at=NOW)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        result = await client.unlink_mail(account.id)
+
+    assert paths == [f"/internal/accounts/{account.id}/unlink-mail"]
+    assert result.mail is None
+    assert result.chat_id == 555_000_111
+
+
+async def test_unlinking_last_login_method_is_a_bot_error_not_a_network_failure():
+    """Отказ `last_login_method` — `BotError` с этим кодом, не сбой связи.
+
+    Разница для вызывающего принципиальна: по коду он решает «показать отказ,
+    объяснить последствие», а по `BotUnreachable` — «повторить запрос». Если бы
+    отказ протекал как сетевая ошибка, кабинет молча предлагал бы повторить
+    запрещённое действие.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=123_456_789)  # единственный способ входа
+
+    client = _client_for(api)
+    async with client:
+        with pytest.raises(BotError) as exc:
+            await client.unlink_telegram(account.id)
+
+    assert exc.value.code == "last_login_method"
+    # Аккаунт не тронут: отказ на стороне бота ничего не меняет.
+    assert api.find_by_id(account.id).chat_id == 123_456_789

@@ -276,6 +276,29 @@ class BotClient:
         )
         return _account_from_api(data["account"])
 
+    async def unlink_telegram(self, account_id: int) -> Account:
+        """Отвязать Telegram от аккаунта.
+
+        Отвязка последнего способа входа запрещена (W3.5): после неё аккаунт
+        стал бы недоступен навсегда. Бот отвечает на это `409` с
+        `code: last_login_method` (§1 контракта). Это **осмысленный отказ**, а
+        не сбой связи: он приходит сюда как `BotError` с этим кодом, и
+        вызывающий ветвится по нему, а не по тексту сообщения.
+        """
+        data = await self._request("POST", f"{BOT_PATH}/accounts/{account_id}/unlink-telegram")
+        return _account_from_api(data["account"])
+
+    async def unlink_mail(self, account_id: int) -> Account:
+        """Отвязать почту от аккаунта. Симметрично отвязке Telegram.
+
+        Тот же запрет и тот же код отказа: отвязка последней почты приходит
+        `409 code: last_login_method`. Разбор ошибок общий для всех методов
+        (`_error_from_response`), поэтому отказ не превращается в сетевую
+        ошибку и не теряет код.
+        """
+        data = await self._request("POST", f"{BOT_PATH}/accounts/{account_id}/unlink-mail")
+        return _account_from_api(data["account"])
+
     # ---------- Подписки и конфиги ----------
 
     async def list_subscriptions(self, account_id: int) -> list[Subscription]:
