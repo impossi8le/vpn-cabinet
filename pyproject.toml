@@ -8,6 +8,11 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "jinja2>=3.1",
     "httpx>=0.27",
+    # FastAPI разбирает формы (`POST /login` с полями почты и кода) только
+    # через python-multipart. Без него эндпоинт отвечает ошибкой, а не
+    # отказом, — и это выяснилось на чистом раннере: локально пакет был в
+    # окружении случайно, в зависимостях его не было.
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
