@@ -194,3 +194,26 @@ a.btn { text-decoration: none; }
 /* Карточки на экране связывания: вторая не должна прилипать к первой. */
 .card + .card { margin-top: 12px; }
 .card .field { margin-bottom: 12px; font-size: 16px; letter-spacing: normal; text-align: left; }
+
+/* Последствие отвязки: сколько конфигов затронуто и что с ними станет.
+   Полоса слева несёт состояние, а не заливка — тот же приём, что у .notice и
+   .refusal. Красного и зелёного здесь нет намеренно: потеря доступа к конфигам
+   это состояние, о котором надо честно сказать, а не опасность и уж точно не
+   подтверждённая защита (§7). Тон задаётся из Python, значение по умолчанию —
+   нейтральный Mist. */
+.consequence {
+  border-left: 2px solid var(--edge); padding: 2px 0 2px 12px; margin-bottom: 12px;
+}
+.consequence-t { font-size: 13px; font-weight: 590; color: var(--mist); }
+.consequence-s { font-size: 12.5px; line-height: 1.6; color: var(--text-secondary); margin-top: 4px; }
+.consequence.tone-process { border-left-color: var(--amber); }
+
+/* Шаг подтверждения: галочка над кнопкой, без неё форма не отправляется
+   (`required`). Отдельный блок, а не строка текста у кнопки: слитая строка
+   проскакивается взглядом, а здесь человек обязан остановиться. Работает без
+   JavaScript — принцип проекта, тот же, что у формы входа. */
+.confirm-row {
+  display: flex; align-items: flex-start; gap: 9px;
+  font-size: 12.5px; line-height: 1.5; color: var(--mist); margin-bottom: 12px;
+}
+.confirm-row input { margin: 1px 0 0; flex: 0 0 auto; accent-color: var(--ice); }

@@ -45,6 +45,7 @@ __all__ = [
     "CurrentSession",
     "IssuedSession",
     "Subscription",
+    "UnlinkPreview",
 ]
 
 # Плейсхолдер: внутренний роутер бота живёт на loopback, но конкретный порт —
@@ -215,6 +216,36 @@ class CurrentSession:
         )
 
 
+@dataclass(frozen=True)
+class UnlinkPreview:
+    """Последствие отвязки — ответ `GET /internal/accounts/{id}/unlink-preview`.
+
+    Показать это надо **до** отвязки, а не после: конфиги живут на `chat_id`,
+    не на аккаунте, поэтому судьба доступа у двух способов разная. Число
+    конфигов знает только бот — кабинет их не считает, — и без этого числа
+    экран не может честно сказать, затронута ли потеря. Поэтому же ноль здесь
+    значит «про конфиги говорить нечего», а не «ноль конфигов» в тексте.
+    """
+
+    configs_affected: int
+    remaining_method: str | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> UnlinkPreview:
+        """Собрать из ответа бота, не доверяя его форме.
+
+        Ответ приходит из другого репозитория, и `configs_affected` там не
+        гарантирован числом: приведение через `int(..., 0)` не даёт пропавшему
+        полю уронить экран `TypeError`-ом. Незнакомый `remaining_method`
+        сохраняется как есть — трактовка его значения дело рендера, а не
+        разбора: молча превращать «unknown» в «осталось что-то» здесь нельзя.
+        """
+        return cls(
+            configs_affected=int(raw.get("configs_affected", 0)),
+            remaining_method=raw.get("remaining_method"),
+        )
+
+
 def _bearer(token: str) -> dict[str, str]:
     """Заголовок с токеном сессии.
 
@@ -360,6 +391,25 @@ class BotClient:
         """
         data = await self._request("POST", f"{BOT_PATH}/accounts/{account_id}/unlink-mail")
         return _account_from_api(data["account"])
+
+    async def unlink_preview(self, account_id: int, method: str) -> UnlinkPreview:
+        """Что будет с конфигами, если отвязать `method` (`mail` | `telegram`).
+
+        Число затронутых конфигов знает только бот (§4а): они живут в `users`
+        на `chat_id`, и кабинет их не считает. Без этого числа экран не мог бы
+        честно сказать, затронет ли отвязка доступ, — а он обязан сказать это
+        **до** нажатия, а не после.
+
+        Это чтение, а не действие: ничего не меняет и ничего не решает за
+        человека. Незнакомый `method` бот отвергает `400 bad_request` — сюда
+        это придёт как `BotError` и не превратится в сбой связи.
+        """
+        data = await self._request(
+            "GET",
+            f"{BOT_PATH}/accounts/{account_id}/unlink-preview",
+            params={"method": method},
+        )
+        return UnlinkPreview.from_api(data)
 
     # ---------- Подписки и конфиги ----------
 

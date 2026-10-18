@@ -34,7 +34,7 @@ import pytest
 
 from cabinet import render
 from cabinet.accounts import Account
-from cabinet.bot_client import Subscription
+from cabinet.bot_client import Subscription, UnlinkPreview
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -300,6 +300,138 @@ def test_linking_notice_tone_comes_from_caller() -> None:
     )
     assert "Привязываем Telegram…" in html
     assert "tone-process" in html
+
+
+# --- отвязка: последствие показывается ДО нажатия (issue #37) -------------
+#
+# Конфиги живут на `chat_id`, а не на аккаунте, поэтому два способа отвязки
+# кончаются по-разному. Экран обязан сказать это до кнопки, а не после. Тексты
+# проверяются дословно: наличие блока ещё не значит, что в нём сказано верное —
+# блок с нейтральной фразой прошёл бы проверку «блок есть», но человека не
+# предупредил бы.
+
+
+def _preview(configs: int, remaining: str | None) -> UnlinkPreview:
+    return UnlinkPreview(configs_affected=configs, remaining_method=remaining)
+
+
+def _linked() -> Account:
+    return Account(id=1, chat_id=123456789, mail="user@example.com", mail_verified_at=NOW)
+
+
+def test_unlink_telegram_says_configs_will_be_out_of_reach() -> None:
+    """Отвязка Telegram с конфигами: сказано, что доступ ПОТЕРЯЕТСЯ.
+
+    Это главный случай задачи. Проверяется именно текст, а не факт блока:
+    «конфиги останутся» без слова о потере доступа читалось бы как обещание,
+    что их можно будет достать, — а достать их будет нечем.
+    """
+    html = render.render_linking(
+        _linked(),
+        unlink_previews={"telegram": _preview(3, "mail")},
+    )
+    assert "доступ к ним потеряется" in html
+    # И не обещаем доступности, которую потеряем: слов «останутся доступны»
+    # в блоке про Telegram нет.
+    assert "останутся доступны" not in html
+
+
+def test_unlink_mail_says_configs_stay_reachable() -> None:
+    """Отвязка почты с конфигами: ключ — Telegram, доступ сохраняется.
+
+    Обратный текст, а не тот же самый: почта конфигов не несёт, их держит
+    Telegram, и отвязка почты их не задевает. Одинаковый текст на оба случая
+    был бы ложью в одном из них.
+    """
+    html = render.render_linking(
+        _linked(),
+        unlink_previews={"mail": _preview(3, "telegram")},
+    )
+    assert "останутся доступны" in html
+    assert "доступ к ним потеряется" not in html
+
+
+def test_unlink_note_is_silent_when_no_configs() -> None:
+    """Ноль конфигов — про конфиги не говорим вовсе: это шум, а не предупреждение.
+
+    Тревожить нечем: доступ ничего не держит. Пугать «0 конфигов» значило бы
+    приучать пролистывать предупреждение, которое в другом случае важно.
+    """
+    html = render.render_linking(
+        _linked(),
+        unlink_previews={"telegram": _preview(0, "mail"), "mail": _preview(0, "telegram")},
+    )
+    assert "конфиг" not in html.lower()
+    assert "Затронуто" not in html
+
+
+def test_unlink_without_preview_data_stays_silent() -> None:
+    """Данных о конфигах нет — экран не выдумывает последствие.
+
+    Роутер может не собрать preview (бот недоступен). Тогда честнее молчать,
+    чем показать догадку: неверное число конфигов страшнее их отсутствия.
+    """
+    html = render.render_linking(_linked())
+    assert "конфиг" not in html.lower()
+
+
+def test_unlink_configs_count_uses_russian_plural() -> None:
+    """Число конфигов склоняется: «1 конфиг», «2 конфига», «5 конфигов»."""
+    for configs, phrase in ((1, "1 конфиг"), (2, "2 конфига"), (5, "5 конфигов")):
+        html = render.render_linking(
+            _linked(),
+            unlink_previews={"mail": _preview(configs, "telegram")},
+        )
+        assert phrase in html
+
+
+def test_unlink_telegram_requires_explicit_confirmation() -> None:
+    """Потеря доступа подтверждается галочкой, а не текстом у кнопки.
+
+    Предупреждение в одной строке с кнопкой проскакивается взглядом. Отдельный
+    шаг подтверждения заставляет остановиться. Работает без JavaScript —
+    `required` у checkbox держит отправку на стороне браузера.
+    """
+    html = render.render_linking(
+        _linked(),
+        unlink_previews={"telegram": _preview(2, "mail")},
+    )
+    assert 'name="confirm"' in html
+    assert "required" in html
+
+
+def test_unlink_mail_needs_no_confirmation() -> None:
+    """Отвязка почты подтверждения не требует, хотя блок о конфигах есть.
+
+    Проверка парная к Telegram: тот же блок про конфиги (их 2), но галочки нет.
+    Иначе тест зеленел бы и от кода, который вообще не рисует подтверждение
+    нигде, — разница между двумя способами и есть предмет проверки.
+    """
+    html = render.render_linking(
+        _linked(),
+        unlink_previews={"mail": _preview(2, "telegram")},
+    )
+    assert "Затронуто" in html  # блок последствия на месте
+    assert 'name="confirm"' not in html  # а подтверждения нет
+
+
+def test_unlink_consequence_has_no_green_and_no_red() -> None:
+    """Потеря доступа — состояние, а не опасность (§7): без зелёного и красного.
+
+    Красный в кабинете зарезервирован под необратимое удаление аккаунта.
+    Потратить его на отвязку значило бы приравнять её к угрозе; зелёный тем
+    более неуместен — здесь ничего не подтверждается.
+    """
+    for previews in (
+        {"telegram": _preview(3, "mail")},
+        {"mail": _preview(3, "telegram")},
+        {"telegram": _preview(1, "mail"), "mail": _preview(1, "telegram")},
+    ):
+        html = render.render_linking(_linked(), unlink_previews=previews)
+        body = _markup_without_palette(html)
+        _assert_no_green(html)
+        assert COLORS.red.upper() not in body.upper()
+        assert COLORS.amber.upper() not in body.upper()
 
 
 # --- отказ в выдаче конфига: на карточке подписки ------------------------

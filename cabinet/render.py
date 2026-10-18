@@ -386,12 +386,121 @@ def _mask_telegram(chat_id: int) -> str:
     return f"{_TELEGRAM_MASK} {tail}"
 
 
+# Как способы называются в разметке. Ключи — те же `mail`/`telegram`, что
+# приходят от бота в `remaining_method`: назвать их словами должен экран, а не
+# бот, потому что «Telegram» с большой буквы и «почта» строчными — вопрос
+# русской подписи, а не контракта.
+_UNLINK_METHOD_LABELS = {"telegram": "Telegram", "mail": "почта"}
+
+
+def _pluralize_configs(count: int) -> str:
+    """«1 конфиг», «2 конфига», «5 конфигов».
+
+    Склонение по числу — как у дней подписки: без него «затронуто 1 конфигов»
+    читается как сбой страницы. 11–14 — форма «конфигов», хотя последняя цифра
+    выглядит подходящей.
+    """
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} конфигов"
+    last = count % 10
+    if last == 1:
+        return f"{count} конфиг"
+    if 2 <= last <= 4:
+        return f"{count} конфига"
+    return f"{count} конфигов"
+
+
+def _unlink_note(method: str, preview: object) -> dict[str, object] | None:
+    """Последствие отвязки `method` — или `None`, если говорить нечего.
+
+    Ноль затронутых конфигов — это не «ноль конфигов» на экране, а **тишина**:
+    предупреждение о том, чего не будет, пугает зря и мешает прочитать то, что
+    важно. Поэтому блок про конфиги существует ровно тогда, когда их затронуто
+    больше нуля.
+
+    Судьба доступа у двух способов разная, и это не косметика. Конфиги живут на
+    `chat_id`, а не на аккаунте: при отвязке почты ключом остаётся Telegram, и
+    конфиги достижимы; при отвязке Telegram ключ уходит, а почта его не несёт —
+    конфиги остаются в системе, но достать их нечем. Тексты намеренно разные, и
+    «останутся» в них честное: где доступ сохраняется — так и сказано, где
+    теряется — сказано, что именно потеряется, а не что «конфиги исчезнут».
+    """
+    configs = int(getattr(preview, "configs_affected", 0) or 0)
+    if configs <= 0:
+        return None
+
+    remaining = getattr(preview, "remaining_method", None)
+    remaining_label = _UNLINK_METHOD_LABELS.get(remaining) if remaining else None
+
+    if method == "mail":
+        # Почта конфигов не несёт: их держит Telegram, и его мы не трогаем.
+        # Без имени остающегося ключа фразу не строим: «ключ для них — None»
+        # было бы хуже молчания, а бот в норме ключ называет (конфиги есть
+        # только когда есть `chat_id`, а он и есть остающийся способ).
+        outcome = (
+            f"Ключ для них — {remaining_label}, и вход по нему остаётся. "
+            "Конфиги останутся доступны."
+            if remaining_label
+            else "Конфиги останутся доступны через второй способ входа."
+        )
+        key = f"Основным способом входа останется {remaining_label}." if remaining_label else ""
+    else:
+        # Telegram — держатель конфигов. Уйдёт он — у почты нет `chat_id`,
+        # к которому их перепривязать. Обещать «останутся у вас» здесь нельзя:
+        # они останутся в системе, но доступа к ним не будет.
+        outcome = (
+            "Конфиги привязаны к Telegram. После отвязки достать их будет нечем: "
+            "у почты нет связи с ними. В системе они останутся, но доступ к ним потеряется."
+        )
+        key = (
+            f"Основным способом входа останется {remaining_label}, "
+            "но ключом для конфигов он не станет."
+            if remaining_label
+            else ""
+        )
+
+    return {
+        "count": _pluralize_configs(configs),
+        "outcome": outcome,
+        "key": key,
+        # Идущего процесса здесь нет: отвязка ещё не начата, и подтверждённой
+        # защиты тоже нет — это состояние. Тон берётся у темы (неизвестная
+        # причина не названа, и это её документированное поведение —
+        # приглушить, а не покрасить), а не пишется цветом: отвязка с потерей
+        # доступа это состояние, а не опасность (§7).
+        "tone": theme.tone_for("unlink_consequence").value,
+        # Явное подтверждение нужно там, где теряется доступ, и только там.
+        # При отвязке почты ключ остаётся — галочка была бы трением без
+        # причины; при отвязке Telegram теряется доступ к конфигам, и одного
+        # текста над кнопкой мало: его прочитают не все. Для 0 конфигов блок не
+        # строится вовсе.
+        "needs_confirm": method == "telegram",
+    }
+
+
+def _unlink_notes(previews: dict[str, object] | None) -> dict[str, dict[str, object] | None]:
+    """Заметки о последствиях для обоих способов. Без данных — обе пустые.
+
+    `None` в значении значит «показывать нечего» и читается шаблоном как
+    отсутствие блока. Отсутствие данных (роутер не собрал preview) сводится к
+    тому же: экран не выдумывает последствие, которого не знает.
+    """
+    previews = previews or {}
+    return {
+        method: _unlink_note(method, previews[method])
+        for method in ("mail", "telegram")
+        if method in previews
+    }
+
+
 def render_linking(
     account: Account,
     *,
     error: str | None = None,
     notice: str | None = None,
     notice_tone: str = "neutral",
+    unlink_previews: dict[str, object] | None = None,
     link_telegram_action: str = LINK_TELEGRAM_ACTION,
     link_mail_action: str = LINK_MAIL_ACTION,
     unlink_telegram_action: str = UNLINK_TELEGRAM_ACTION,
@@ -402,9 +511,16 @@ def render_linking(
     Отвязка предлагается только там, где после неё останется второй способ:
     кнопка «отвязать» у единственного входа вела бы к недоступному навсегда
     аккаунту (§8). Экран не даёт нажать то, что всё равно будет отвергнуто.
+
+    `unlink_previews` — по записи на способ (`mail`/`telegram`) с числом
+    затронутых конфигов и остающимся ключом, как их отдаёт бот (§4а). Экран
+    показывает это **до** кнопки: человек должен узнать, что потеряет доступ к
+    конфигам, а не обнаружить это после нажатия. Ноль конфигов и отсутствие
+    данных одинаково не рисуют блок — нечего предупреждать.
     """
     telegram_linked = account.chat_id is not None
     mail_linked = account.mail is not None
+    notes = _unlink_notes(unlink_previews)
     return _ENV.get_template("linking.html").render(
         **_base_context(),
         error=error,
@@ -419,6 +535,8 @@ def render_linking(
         # Отвязка возможна, только если останется другой способ входа.
         can_unlink_telegram=telegram_linked and mail_linked,
         can_unlink_mail=mail_linked and telegram_linked,
+        unlink_mail_note=notes.get("mail"),
+        unlink_telegram_note=notes.get("telegram"),
         link_telegram_action=link_telegram_action,
         link_mail_action=link_mail_action,
         unlink_telegram_action=unlink_telegram_action,

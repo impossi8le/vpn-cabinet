@@ -20,10 +20,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from cabinet.accounts import Account, LinkError
 from cabinet.auth_mail import CODE_LENGTH, AuthMail, AuthMailError
+from cabinet.bot_client import BotClient, BotError
 from cabinet.linking import (
     Linking,
     LinkRefused,
@@ -349,3 +351,82 @@ def test_link_result_requires_an_account_not_a_bool(linking: Linking, fake_api: 
     assert isinstance(result.account, Account)
     assert result.account.id == account.id
     assert result.account.chat_id == 777_666_555
+
+
+# --- предпросмотр отвязки в клиенте к боту (issue #37) -------------------
+#
+# `BotClient.unlink_preview` — чтение, а не действие: он лишь спрашивает у
+# бота, что будет, чтобы экран успел сказать это **до** нажатия. Проверяется
+# стык с контрактом §4а: точное имя пути, параметр `method` и разбор ответа.
+# Транспорт подставной — сеть не открывается.
+
+
+def _preview_client(handler) -> BotClient:
+    return BotClient(
+        base_url="http://127.0.0.1:9",
+        secret="test-secret",
+        client=httpx.AsyncClient(base_url="http://127.0.0.1:9", transport=handler),
+    )
+
+
+async def test_unlink_preview_hits_contract_path_and_parses_the_answer():
+    """Путь — `GET .../unlink-preview?method=`, ответ разобран в `UnlinkPreview`.
+
+    Путь сверяется целиком: подмена `unlink-preview` на `unlink_preview`
+    оставила бы подстроку на месте и прошла бы мимо — этот класс ошибки в
+    проекте уже случался. `method` уходит **параметром**, а не сегментом пути:
+    это часть контракта §4а.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"configs_affected": 3, "remaining_method": "telegram"})
+
+    client = _preview_client(httpx.MockTransport(handler))
+    async with client:
+        preview = await client.unlink_preview(7, "mail")
+
+    assert len(seen) == 1
+    assert seen[0].url.path == "/internal/accounts/7/unlink-preview"
+    assert seen[0].url.params["method"] == "mail"
+    assert preview.configs_affected == 3
+    assert preview.remaining_method == "telegram"
+
+
+async def test_unlink_preview_without_configs_reports_zero_not_error():
+    """Ноль конфигов — валидный ответ, а не ошибка: у аккаунта без Telegram
+    конфигов нет вовсе. Экран по нулю молчит, но само чтение обязано пройти."""
+    client = _preview_client(
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"configs_affected": 0, "remaining_method": None}
+            )
+        )
+    )
+    async with client:
+        preview = await client.unlink_preview(1, "telegram")
+
+    assert preview.configs_affected == 0
+    assert preview.remaining_method is None
+
+
+async def test_unlink_preview_bad_method_is_a_bot_error_not_a_network_failure():
+    """Незнакомый `method` бот отвергает `400` — это `BotError`, не сбой связи.
+
+    Разница для вызывающего та же, что у отвязки: по `code` он показывает
+    отказ, по `BotUnreachable` — повторяет. Молчаливая подстановка метода была
+    бы здесь хуже отказа: экран показал бы последствие не той отвязки.
+    """
+    client = _preview_client(
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                400, json={"error": {"code": "bad_request", "retryable": False}}
+            )
+        )
+    )
+    async with client:
+        with pytest.raises(BotError) as exc:
+            await client.unlink_preview(1, "tel")
+
+    assert exc.value.code == "bad_request"

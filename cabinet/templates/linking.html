@@ -35,9 +35,36 @@
       </div>
     </dl>
     {%- if can_unlink_mail %}
+    {# Последствие показано до кнопки, а не после: человек должен узнать, что
+       будет с конфигами, пока он ещё может не нажимать. Блок появляется,
+       только если бот насчитал затронутые конфиги (ноль — молчание, а не
+       «0 конфигов» на экране). #}
+    {%- if unlink_mail_note %}
+    <div class="consequence tone-{{ unlink_mail_note.tone }}">
+      <p class="consequence-t">Затронуто {{ unlink_mail_note.count }}</p>
+      <p class="consequence-s">{{ unlink_mail_note.outcome }}</p>
+      {%- if unlink_mail_note.key %}
+      <p class="consequence-s">{{ unlink_mail_note.key }}</p>
+      {%- endif %}
+    </div>
+    {%- endif %}
+    {# Та же развилка, что у Telegram, хотя почта подтверждения не требует:
+       правило «галочка только там, где теряется доступ» должно быть в одном
+       месте и проверяться тестом, иначе «подтверждение для почты» проскочит
+       незамеченным — тест на его отсутствие проверял бы только вёрстку. #}
+    {%- if unlink_mail_note and unlink_mail_note.needs_confirm %}
+    <form method="post" action="{{ unlink_mail_action }}" class="confirm">
+      <label class="confirm-row">
+        <input type="checkbox" name="confirm" value="1" required>
+        <span>Понимаю, что доступ к конфигам потеряется</span>
+      </label>
+      <button class="btn btn-g btn-sm" type="submit">Отвязать почту</button>
+    </form>
+    {%- else %}
     <form method="post" action="{{ unlink_mail_action }}">
       <button class="btn btn-g btn-sm" type="submit">Отвязать почту</button>
     </form>
+    {%- endif %}
     {%- else %}
     {# Единственный способ входа отвязывать нельзя: аккаунт без способов
        входа недоступен навсегда (§8). Кнопку не показываем — она вела бы к
@@ -71,9 +98,39 @@
       </div>
     </dl>
     {%- if can_unlink_telegram %}
+    {%- if unlink_telegram_note %}
+    <div class="consequence tone-{{ unlink_telegram_note.tone }}">
+      <p class="consequence-t">Затронуто {{ unlink_telegram_note.count }}</p>
+      <p class="consequence-s">{{ unlink_telegram_note.outcome }}</p>
+      {%- if unlink_telegram_note.key %}
+      <p class="consequence-s">{{ unlink_telegram_note.key }}</p>
+      {%- endif %}
+    </div>
+    {%- endif %}
+    {# Подтверждение — своим шагом, а не текстом над кнопкой.
+
+       Почему так, а не иначе. Предупреждение о потере доступа и кнопка в одной
+       строке читаются как одно целое: глаз проскакивает абзац и жмёт. Отдельная
+       галочка, без которой кнопка не срабатывает, заставляет остановиться —
+       но только у той отвязки, где доступ теряется (Telegram). У отвязки почты
+       ключ остаётся, и лишнее подтверждение было бы трением без причины.
+
+       Работает без JavaScript намеренно: `required` у checkbox держит отправку
+       формы на стороне браузера, как и форма входа. Модального окна здесь быть
+       не может — оно бы потребовало JS и сломало экран там, где он ещё нужен. #}
+    {%- if unlink_telegram_note and unlink_telegram_note.needs_confirm %}
+    <form method="post" action="{{ unlink_telegram_action }}" class="confirm">
+      <label class="confirm-row">
+        <input type="checkbox" name="confirm" value="1" required>
+        <span>Понимаю, что доступ к конфигам потеряется</span>
+      </label>
+      <button class="btn btn-g btn-sm" type="submit">Отвязать Telegram</button>
+    </form>
+    {%- else %}
     <form method="post" action="{{ unlink_telegram_action }}">
       <button class="btn btn-g btn-sm" type="submit">Отвязать Telegram</button>
     </form>
+    {%- endif %}
     {%- else %}
     <p class="sub-unusable">Это единственный способ входа. Сначала привяжите почту — без неё отвязывать Telegram нельзя.</p>
     {%- endif %}
