@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8099", "--directory", ".claude/preview"],
       "port": 8099
+    },
+    {
+      "name": "cabinet-app",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "cabinet"],
+      "port": 8000
     }
   ]
 }
