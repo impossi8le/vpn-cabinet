@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cabinet.accounts import Account
 from cabinet.auth_mail import AuthMail, AuthMailError, RateLimited
+from cabinet.bot_client import Balance, BotError, Referral
 from cabinet.linking import Linking
 from cabinet.mail_sender import MailSender
 from cabinet.render import (
@@ -74,6 +75,39 @@ class AccountStore(Protocol):
     def find_by_id(self, account_id: int) -> Account | None: ...
 
     def subscriptions_for(self, account_id: int) -> list[object]: ...
+
+
+def _account_money(
+    store: AccountStore, account_id: int
+) -> tuple[Balance | None, Referral | None, bool]:
+    """Деньги человека для экрана подписок: баланс, рефералка, признак `telegram_required`.
+
+    Хранилище может не уметь этот раздел: `AccountStore` — это то, что обязан
+    дать любой бот, а баланс и рефералка появились позже (W5б, #40) и на
+    подставном боте их вовсе нет. Поэтому метод ищется на месте, а его
+    отсутствие — не сбой, а «показать нечего»: рушить весь экран подписок из-за
+    необязательного блока значило бы спрятать от человека то, что работает.
+
+    `telegram_required` возвращается отдельно от «данных нет» намеренно. Когда
+    бот говорит, что у аккаунта нет Telegram, в кабинете нельзя рисовать `0 ₽`:
+    ноль читался бы как «вам ничего не начислили», хотя сумма просто неизвестна.
+    Это состояние называется текстом, а не значением.
+    """
+    get_balance = getattr(store, "get_balance", None)
+    get_referral = getattr(store, "get_referral", None)
+    if get_balance is None or get_referral is None:
+        return None, None, False
+    try:
+        balance = get_balance(account_id)
+    except BotError as exc:
+        if exc.code == "telegram_required":
+            return None, None, True
+        return None, None, False
+    try:
+        referral = get_referral(account_id)
+    except BotError:
+        referral = None
+    return balance, referral, False
 
 
 def _default_store() -> AccountStore:
@@ -331,4 +365,12 @@ def _add_subscription_routes(
         except Exception:  # noqa: BLE001 - сбой хранилища переводим в экран
             return HTMLResponse(render_subscriptions([], error=SUBSCRIPTIONS_ERROR))
         views: list[SubscriptionView] = subscription_views(raw, now=clock())
-        return HTMLResponse(render_subscriptions(views))
+        balance, referral, telegram_required = _account_money(store, view.account_id)
+        return HTMLResponse(
+            render_subscriptions(
+                views,
+                balance=balance,
+                referral=referral,
+                telegram_required=telegram_required,
+            )
+        )

@@ -19,6 +19,50 @@
   <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
+{# Баланс. Тон нейтральный: деньги — ни защита, ни опасность (§7), поэтому
+   зелёного и красного здесь нет. `balance_text` равно `None` в двух случаях:
+   блок не запрашивали или аккаунт без Telegram — во втором случае рисуется
+   честный текст вместо суммы, а не ноль. #}
+{% if balance_text %}
+<div class="card money-card">
+  <div class="money-row">
+    <span class="money-k">Баланс</span>
+    <span class="money-v">{{ balance_text }}</span>
+  </div>
+  <p class="money-note">Спишется как скидка при оплате — покажем её при выборе тарифа.</p>
+</div>
+{% elif telegram_required %}
+<div class="card money-card">
+  <div class="money-row">
+    <span class="money-k">Баланс</span>
+    <span class="money-v money-off">недоступен</span>
+  </div>
+  <p class="money-note">Баланс и бонусы живут в боте и видны после привязки Telegram.</p>
+</div>
+{% endif %}
+
+{# Рефералка: свой код и сколько по нему пришло. Тон нейтральный — приглашённые
+   не достижение и не защита (§7). Код показывается как есть: его передают
+   другому человеку. #}
+{% if referral_code %}
+<div class="card money-card">
+  <div class="money-row">
+    <span class="money-k">Ваш код</span>
+    <span class="money-v mono">{{ referral_code }}</span>
+  </div>
+  <dl class="rows">
+    <div class="row">
+      <dt>Приглашено</dt>
+      <dd>{{ referral_invited }}</dd>
+    </div>
+    <div class="row">
+      <dt>Начислено</dt>
+      <dd>{{ referral_earned }}</dd>
+    </div>
+  </dl>
+</div>
+{% endif %}
+
 {% if has_subscriptions %}
   <div class="stack">
     {%- for row in rows %}

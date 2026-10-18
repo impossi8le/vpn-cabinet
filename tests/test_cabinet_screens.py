@@ -31,10 +31,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from cabinet import render
 from cabinet.accounts import Account
-from cabinet.bot_client import Subscription, UnlinkPreview
+from cabinet.auth_mail import CODE_LENGTH
+from cabinet.bot_client import Balance, BotError, Referral, Subscription, UnlinkPreview
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -45,6 +47,7 @@ from cabinet.configs import (
 )
 from cabinet.subscriptions import STATUS_ACTIVE, SubscriptionView, subscription_views
 from cabinet.theme import COLORS, Tone
+from tests.fakes import FakeApi, FakeMailSender
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 
@@ -567,3 +570,217 @@ def test_the_standalone_refusal_screen_is_gone() -> None:
 
     templates = Path(render.__file__).parent / "templates"
     assert not (templates / "config_unavailable.html").exists()
+
+
+# --- деньги человека: баланс и рефералка (W5б, #40) ----------------------
+#
+# Баланс показывается на экране подписок, потому что в боте он списывается как
+# скидка при выборе тарифа: без него человек в кабинете увидит полную цену.
+# Отдельно и жёстко проверяется случай «аккаунт без Telegram»: там нельзя
+# показать `0 ₽`, потому что ноль читается как «вам ничего не начислили», хотя
+# на деле суммы не существует. Проверка — по тексту, а не по факту блока.
+
+
+def test_balance_is_shown_on_the_subscriptions_screen() -> None:
+    """Накопленный кредит виден: сумма числом и с знаком валюты.
+
+    Пробел перед «₽» — неразрывный (`\\u00a0`), и сверяется точная строка:
+    сумма не должна переноситься по строке, оторвав знак от числа.
+    """
+    html = render.render_subscriptions(_views(_subscription()), balance=Balance(credit_rub=450))
+    assert "Баланс" in html
+    assert "450 ₽" in html
+
+
+def test_balance_thousand_grouping_keeps_digits_readable() -> None:
+    """Крупная сумма разбита по разрядам — иначе её не прочесть.
+
+    Проверяется точная строка с разделителями: `1000000 ₽` подстрокой в
+    `1 000 000 ₽` не входит, так что отсутствие разбиения тест краснит.
+    """
+    html = render.render_subscriptions(
+        _views(_subscription()), balance=Balance(credit_rub=1_000_000)
+    )
+    assert "1 000 000 ₽" in html
+
+
+def test_zero_balance_from_the_bot_is_shown_as_zero() -> None:
+    """Честный ноль от бота показывается числом — это состояние, а не «нет данных».
+
+    Пара к случаю без Telegram: там ноль запрещён, здесь обязателен. Без этой
+    пары код, который всегда прячет баланс, был бы зелёным.
+    """
+    html = render.render_subscriptions(_views(_subscription()), balance=Balance(credit_rub=0))
+    assert "0 ₽" in html
+
+
+def test_missing_telegram_hides_the_zero() -> None:
+    """Без Telegram — **не** `0 ₽`, а честный текст о недоступности.
+
+    Главная проверка задачи. Кредит живёт на `chat_id`; у аккаунта без Telegram
+    его нет вовсе. `0 ₽` здесь соврал бы: он читается как «вам ничего не
+    начислили», а правда — «мы этого ещё не знаем». Тест смотрит на текст, а не
+    на отсутствие блока: блок с `0 ₽` прошёл бы проверку «блока нет».
+    """
+    html = render.render_subscriptions(
+        _views(_subscription()),
+        balance=None,
+        telegram_required=True,
+    )
+    assert "0 ₽" not in html
+    assert "привязки Telegram" in html
+
+
+def test_balance_has_no_green_and_no_red() -> None:
+    """Баланс — ни защита, ни опасность (§7): без зелёного и красного.
+
+    Зелёный в кабинете закреплён за подтверждённой защитой, красный — за
+    необратимым удалением. Деньги не то и не другое, и подсветки у них нет.
+    """
+    html = render.render_subscriptions(
+        _views(_subscription()),
+        balance=Balance(credit_rub=450),
+        referral=Referral(referral_code="CAB-9f2a", invited_count=3, rub_earned=150),
+    )
+    _assert_no_green(html)
+    assert COLORS.red.upper() not in _markup_without_palette(html).upper()
+
+
+def test_referral_code_and_stats_are_shown() -> None:
+    """Рефералка: свой код и сколько по нему пришло — всё три числа.
+
+    Код показывается как есть: его называют другому человеку.
+    """
+    html = render.render_subscriptions(
+        _views(_subscription()),
+        referral=Referral(referral_code="CAB-9f2a", invited_count=3, rub_earned=150),
+    )
+    assert "CAB-9f2a" in html
+    assert "3 человека" in html
+    assert "150 ₽" in html
+
+
+def test_referral_invited_count_uses_russian_plural() -> None:
+    """Число приглашённых склоняется: «1 человек», «2 человека», «5 человек»."""
+    for count, phrase in ((1, "1 человек"), (2, "2 человека"), (5, "5 человек")):
+        html = render.render_subscriptions(
+            _views(_subscription()),
+            referral=Referral(referral_code="CAB-1", invited_count=count, rub_earned=50),
+        )
+        assert phrase in html
+
+
+def test_no_money_blocks_when_nothing_is_known() -> None:
+    """Ни баланса, ни рефералки нет — оба блока молчат, а не рисуют пустоту.
+
+    Пустой блок «Баланс: — » обещал бы данные, которых нет. Экран без денег
+    выглядит как раньше: сами подписки.
+    """
+    html = render.render_subscriptions(_views(_subscription()))
+    assert "Баланс" not in html
+    assert "Ваш код" not in html
+
+
+# --- деньги доезжают до экрана через приложение (W5б, #40) ---------------
+#
+# Проверка не разметки, а проводки: баланс должен прийти на страницу **с теми
+# же числами**, что отдал бот, а не нулём по умолчанию. Такие тесты ловят
+# разрыв «модуль готов, а из роута не вызывается» — на этом разрыве деньги
+# человека и пропали в первый раз.
+
+MONEY_MAIL = "money@example.com"
+
+
+class _MoneyApi(FakeApi):
+    """Подставной бот, который к подпискам умеет отдавать ещё и деньги.
+
+    Нужен потому, что `FakeApi` раздела денег не знает: он описывает бота **до**
+    W5б. Роут подписок вызывает `get_balance`/`get_referral`, только если они
+    есть, — так существующие тесты на `FakeApi` остаются валидными, а здесь
+    методы появляются явно.
+    """
+
+    def __init__(self, *, credit_rub: int = 730, referral: Referral | None = None) -> None:
+        super().__init__()
+        self._credit_rub = credit_rub
+        self._referral = referral
+
+    def get_balance(self, account_id: int) -> Balance:
+        account = self.find_by_id(account_id)
+        if account is None or account.chat_id is None:
+            raise BotError("telegram_required", status=409)
+        return Balance(credit_rub=self._credit_rub)
+
+    def get_referral(self, account_id: int) -> Referral:
+        account = self.find_by_id(account_id)
+        if account is None or account.chat_id is None:
+            raise BotError("telegram_required", status=409)
+        if self._referral is None:
+            raise BotError("telegram_required", status=409)
+        return self._referral
+
+
+def _sign_in_client(api: FakeApi) -> TestClient:
+    """Клиент приложения, вошедший по почте через настоящий `/login`.
+
+    Вход идёт через те же роуты, что у человека: тест не подставляет cookie
+    напрямую, иначе он не отличал бы рабочий вход от сломанного.
+    """
+    from cabinet.app import build_app
+    from cabinet.mail_sender import MailSender
+
+    sender = FakeMailSender()
+    app = build_app(
+        store=api,
+        mail_sender=MailSender(sender="cabinet@example.com", transport=sender),
+        now=lambda: NOW,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    client.post("/login", data={"mail": MONEY_MAIL}, follow_redirects=False)
+    body = sender.sent_to(MONEY_MAIL)[-1]["body"]
+    code = "".join(ch for ch in body if ch.isdigit())[:CODE_LENGTH]
+    client.post("/login/waiting", data={"mail": MONEY_MAIL, "code": code}, follow_redirects=False)
+    return client
+
+
+def test_balance_from_the_bot_reaches_the_screen_with_its_number() -> None:
+    """Число бота доезжает до страницы: видно `730 ₽`, а не ноль по умолчанию."""
+    api = _MoneyApi(credit_rub=730)
+    api.create_account(mail=MONEY_MAIL, mail_verified_at=NOW, chat_id=987_654_321)
+    client = _sign_in_client(api)
+
+    html = client.get("/subscriptions").text
+
+    assert "Баланс" in html
+    assert "730\xa0₽" in html
+
+
+def test_telegram_required_from_the_bot_shows_the_text_not_the_zero() -> None:
+    """Аккаунт без Telegram: на странице текст «недоступен», и **нет** `0 ₽`.
+
+    Главная проверка задачи на живом пути: бот отвечает `telegram_required`,
+    роут переводит это в признак, а разметка показывает состояние. Тест смотрит
+    на текст страницы, а не на факт вызова.
+    """
+    api = _MoneyApi()
+    api.create_account(mail=MONEY_MAIL, mail_verified_at=NOW)
+    client = _sign_in_client(api)
+
+    html = client.get("/subscriptions").text
+
+    assert "0\xa0₽" not in html
+    assert "0 ₽" not in html
+    assert "недоступен" in html
+
+
+def test_referral_from_the_bot_reaches_the_screen() -> None:
+    """Рефералка доезжает до страницы: код и статистика видны."""
+    api = _MoneyApi(referral=Referral(referral_code="CAB-7d1c", invited_count=2, rub_earned=90))
+    api.create_account(mail=MONEY_MAIL, mail_verified_at=NOW, chat_id=987_654_321)
+    client = _sign_in_client(api)
+
+    html = client.get("/subscriptions").text
+
+    assert "CAB-7d1c" in html
+    assert "2 человека" in html
+    assert "90\xa0₽" in html

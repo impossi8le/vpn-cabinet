@@ -38,12 +38,15 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "NETWORK_ERROR_CODE",
     "SECRET_HEADER",
+    "Balance",
     "BotClient",
     "BotConfigError",
     "BotError",
     "BotUnreachable",
     "CurrentSession",
     "IssuedSession",
+    "PromoValidation",
+    "Referral",
     "Subscription",
     "UnlinkPreview",
 ]
@@ -246,6 +249,76 @@ class UnlinkPreview:
         )
 
 
+@dataclass(frozen=True)
+class Balance:
+    """Накопленный бонусный кредит — ответ
+    `GET /internal/accounts/{id}/balance`.
+
+    Только `credit_rub`: это деньги, которые бот списывает как скидку при
+    выборе тарифа. Число читается через `.get(..., 0)`, а не индексируется —
+    ответ приходит из другого репозитория, и пропавшее поле должно читаться как
+    «кредита нет», а не ронять экран `KeyError`-ом.
+    """
+
+    credit_rub: int
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> Balance:
+        return cls(credit_rub=int(raw.get("credit_rub", 0)))
+
+
+@dataclass(frozen=True)
+class Referral:
+    """Реферальная программа — ответ
+    `GET /internal/accounts/{id}/referral`.
+
+    `referral_code` — свой код человека; `invited_count` — сколько по нему
+    пришло; `rub_earned` — сколько на этом начислено. Сумма числом, как её
+    считает бот: кабинет её не пересчитывает и не округляет.
+    """
+
+    referral_code: str
+    invited_count: int
+    rub_earned: int
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> Referral:
+        """Собрать из ответа бота, не доверяя его форме: новой версии бота
+        простительно не прислать поле, и это не должно ронять экран."""
+        return cls(
+            referral_code=str(raw.get("referral_code", "")),
+            invited_count=int(raw.get("invited_count", 0)),
+            rub_earned=int(raw.get("rub_earned", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class PromoValidation:
+    """Проверенный промокод — ответ
+    `POST /internal/accounts/{id}/promo/validate`.
+
+    `valid` решает, показывать ли скидку; `discount_percent` имеет смысл только
+    при `valid=True`. `reason` — код причины отказа (`expired`, `not_found`…),
+    по которому ветвится вызывающий код, а не текст сообщения: текст меняется,
+    код — часть контракта.
+    """
+
+    valid: bool
+    discount_percent: int = 0
+    reason: str | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> PromoValidation:
+        """Собрать из ответа бота, не доверяя его форме. Отсутствие `valid`
+        читается как «код не подходит»: обещать скидку, которой бот не
+        подтвердил, опаснее, чем её не показать."""
+        return cls(
+            valid=bool(raw.get("valid", False)),
+            discount_percent=int(raw.get("discount_percent", 0)),
+            reason=raw.get("reason"),
+        )
+
+
 def _bearer(token: str) -> dict[str, str]:
     """Заголовок с токеном сессии.
 
@@ -429,6 +502,47 @@ class BotClient:
         return await self._request_bytes(
             "GET", f"{BOT_PATH}/accounts/{account_id}/configs/{config_id}"
         )
+
+    # ---------- Деньги человека: баланс, рефералка, промокод -----------
+
+    async def get_balance(self, account_id: int) -> Balance:
+        """Накопленный бонусный кредит аккаунта.
+
+        Кредит живёт на `chat_id` у бота, поэтому у аккаунта без Telegram его
+        нет — бот отвечает `409 code: telegram_required`. Это **осмысленный
+        отказ**, а не сбой: он приходит сюда как `BotError` с этим кодом, и
+        вызывающий решает по коду «показать нечего», а не «повторить запрос».
+        Именно поэтому в кабинете при таком коде не рисуется `0 ₽`: ноль и
+        «кредита нет» — разные вещи, и первый читался бы как «вам ничего не
+        начислили».
+        """
+        data = await self._request("GET", f"{BOT_PATH}/accounts/{account_id}/balance")
+        return Balance.from_api(data)
+
+    async def get_referral(self, account_id: int) -> Referral:
+        """Реферальная программа: свой код, сколько приглашено, сколько earned.
+
+        Рефералы тоже живут на `chat_id` у бота, поэтому без Telegram ответ —
+        тот же `409 code: telegram_required`, что у баланса.
+        """
+        data = await self._request("GET", f"{BOT_PATH}/accounts/{account_id}/referral")
+        return Referral.from_api(data)
+
+    async def validate_promo(self, account_id: int, code: str) -> PromoValidation:
+        """Проверить промокод до оплаты.
+
+        Возвращается разобранный ответ, а не исключение на недействительный код:
+        «код не подходит» — это **результат проверки** (`valid=False` с причиной
+        в `reason`), а не сбой запроса. Отказ связи и отказ формата, напротив,
+        приходят исключениями (`BotUnreachable`, `BotError`) — вызывающий их
+        различает, потому что «повторить» и «код истёк» требуют разного.
+        """
+        data = await self._request(
+            "POST",
+            f"{BOT_PATH}/accounts/{account_id}/promo/validate",
+            json={"code": code},
+        )
+        return PromoValidation.from_api(data)
 
     # ---------- Сессии (§4) ----------
 

@@ -181,6 +181,19 @@ a.btn { text-decoration: none; }
 .refusal-w { font-size: 12.5px; line-height: 1.55; color: var(--ash); margin-top: 6px; }
 .refusal-w b { color: var(--mist); font-weight: 590; }
 
+/* Деньги человека: баланс и рефералка. Тон нейтральный, своего цвета у блока
+   нет намеренно — деньги не защита и не опасность, и подсвечивать их нечем
+   (§7). Заголовок тише значения: читают сумму, а не подпись. */
+.money-card { margin-bottom: 12px; }
+.money-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.money-k { color: var(--text-secondary); font-size: 13px; }
+.money-v { color: var(--bone); font-size: 15.5px; font-weight: 590; letter-spacing: -0.012em; }
+/* «Недоступен» — состояние, а не сумма: тише значения и не жирным, чтобы не
+   читалось как деньги, которых нет. */
+.money-off { color: var(--ash); font-weight: 400; font-size: 13.5px; }
+.money-note { margin-top: 8px; color: var(--text-secondary); font-size: 12.5px; line-height: 1.55; }
+.money-card .rows { margin-top: 12px; }
+
 /* Карточка подписки держит разметку блоками: без этого ссылка-кнопка внутри
    карточки слипалась бы с подписью выше. */
 .sub-card { margin-bottom: 12px; }

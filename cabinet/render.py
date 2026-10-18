@@ -15,6 +15,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from cabinet import theme
 from cabinet.accounts import Account
+from cabinet.bot_client import Balance, Referral
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -332,6 +333,77 @@ def _subscription_context(
     return {"rows": rows, "has_subscriptions": bool(rows)}
 
 
+def _money_context(
+    *,
+    balance: Balance | None = None,
+    referral: Referral | None = None,
+    telegram_required: bool = False,
+) -> dict[str, object]:
+    """Деньги человека — баланс и рефералка — какими их видит разметка.
+
+    Правило §7 держится тут: ни баланс, ни приглашённые не «достижение» и не
+    «опасность». Зелёный в кабинете закреплён за подтверждённой защитой, а
+    красный — за необратимым удалением аккаунта; на деньги не годится ни один.
+    Поэтому блокам не назначается цвет вовсе — они читаются нейтральным текстом
+    (`theme.tone_for` без причины даёт `neutral`).
+
+    `telegram_required` — не «баланс равен нулю», а «баланса здесь нет». У
+    аккаунта без Telegram кредит и рефералка живут на стороне бота под `chat_id`,
+    которого у нас ещё нет, и рисовать вместо них `0 ₽` значило бы соврать:
+    ноль читается как «вам ничего не начислили», тогда как на самом деле сумма
+    просто нам неизвестна. Ноль, честно пришедший от бота, показывается — это
+    другое состояние, и оно называется числом.
+    """
+    if telegram_required:
+        return {
+            "balance": None,
+            "balance_text": None,
+            "telegram_required": True,
+            "balance_tone": theme.tone_for("balance").value,
+            "referral": None,
+            "referral_code": None,
+            "referral_invited": None,
+            "referral_earned": None,
+        }
+
+    balance_text = _rubles(balance.credit_rub) if balance is not None else None
+    return {
+        "balance": balance,
+        "balance_text": balance_text,
+        "telegram_required": False,
+        "balance_tone": theme.tone_for("balance").value,
+        "referral": referral,
+        "referral_code": referral.referral_code if referral is not None else None,
+        # Число приглашённых склоняется как «человек»: «приглашено 1 человек»,
+        # но «2 человека». Без склонения строка читается машинной.
+        "referral_invited": _people(referral.invited_count) if referral is not None else None,
+        "referral_earned": _rubles(referral.rub_earned) if referral is not None else None,
+    }
+
+
+def _rubles(amount: int) -> str:
+    """Сумма в рублях с разделителем разрядов и знаком валюты.
+
+    Неразрывный пробел между разрядами — не украшение: «1000000 ₽» глазом не
+    разбить на разряды, и человек читает не ту сумму. Неразрывный он ещё и
+    затем, чтобы сумма не переносилась по строке посередине.
+    """
+    digits = f"{abs(int(amount)):,}".replace(",", " ")
+    sign = "-" if amount < 0 else ""
+    return f"{sign}{digits} ₽"
+
+
+def _people(count: int) -> str:
+    """«1 человек», «2 человека», «5 человек» — склонение по числу."""
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} человек"
+    last = count % 10
+    if last == 1:
+        return f"{count} человек"
+    return f"{count} человека"
+
+
 def render_subscriptions(
     views: list[SubscriptionView],
     *,
@@ -340,6 +412,9 @@ def render_subscriptions(
     config_error_id: str | None = None,
     notices: str | None = None,
     notices_tone: str = "neutral",
+    balance: Balance | None = None,
+    referral: Referral | None = None,
+    telegram_required: bool = False,
 ) -> str:
     """Экран подписок: срок и состояние каждой, либо честное «подписок нет».
 
@@ -354,6 +429,13 @@ def render_subscriptions(
     `notices_tone` — тон сообщения о действии, уже названный причиной из
     `theme`. Значение по умолчанию нейтральное: незачем подсвечивать то, о чём
     зрителя не просили.
+
+    `balance` и `referral` — деньги человека (W5б, #40): накопленный кредит и
+    реферальная программа. Показываются наравне с подписками, потому что в боте
+    баланс списывается как скидка при выборе тарифа, и без него человек в
+    кабинете увидел бы полную цену, которой в боте не платит. `None` в любом из
+    них — «нечего показать», и тогда блок не рисуется; `telegram_required`
+    отделяет это состояние от честного нуля текстом, а не значением.
     """
     template = _ENV.get_template("subscriptions.html")
     return template.render(
@@ -365,6 +447,11 @@ def render_subscriptions(
             views,
             config_error=config_error,
             config_error_id=config_error_id,
+        ),
+        **_money_context(
+            balance=balance,
+            referral=referral,
+            telegram_required=telegram_required,
         ),
     )
 

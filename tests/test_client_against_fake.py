@@ -77,6 +77,12 @@ def _transport_for(
             return _current_session(api, sessions, request)
         elif request.method == "POST" and path == "/internal/sessions/revoke":
             return _revoke_session(sessions, request)
+        elif request.method == "GET" and path.endswith("/balance"):
+            return _balance_response(api, request)
+        elif request.method == "GET" and path.endswith("/referral"):
+            return _referral_response(api, request)
+        elif request.method == "POST" and path.endswith("/promo/validate"):
+            return _promo_response(request)
         elif request.method == "POST":
             # `/internal/accounts/{id}/unlink-telegram|unlink-mail`. Разбор по
             # сегментам, а не сравнение строк: `{id}` меняется от аккаунта к
@@ -167,6 +173,61 @@ def _revoke_session(sessions: dict[str, int], request: httpx.Request) -> httpx.R
     token = body.get("token") or _bearer_token(request)
     sessions.pop(token, None)
     return httpx.Response(200, json={"revoked": True})
+
+
+def _account_id_from(path: str) -> int:
+    """`id` из пути `/internal/accounts/{id}/...`. Берётся по сегментам, а не
+    регуляркой: часть контракта здесь — позиция, и разбор по позиции это и
+    проверяет."""
+    return int(path.strip("/").split("/")[2])
+
+
+def _balance_response(api: FakeApi, request: httpx.Request) -> httpx.Response:
+    """`GET /internal/accounts/{id}/balance`.
+
+    Аккаунт без Telegram получает тот же `409`, что живой бот: кредит живёт на
+    `chat_id`, и без него суммы для аккаунта не существует. Это не «ноль» —
+    именно поэтому тест на кабинет требует **не** рисовать `0 ₽`.
+    """
+    account_id = _account_id_from(request.url.path)
+    account = api.find_by_id(account_id)
+    if account is None:
+        return httpx.Response(
+            404, json={"error": {"code": "account_not_found", "retryable": False}}
+        )
+    if account.chat_id is None:
+        return httpx.Response(409, json={"error": {"code": "telegram_required"}})
+    return httpx.Response(200, json={"credit_rub": 450})
+
+
+def _referral_response(api: FakeApi, request: httpx.Request) -> httpx.Response:
+    """`GET /internal/accounts/{id}/referral`. Без Telegram — тот же `409`."""
+    account_id = _account_id_from(request.url.path)
+    account = api.find_by_id(account_id)
+    if account is None:
+        return httpx.Response(
+            404, json={"error": {"code": "account_not_found", "retryable": False}}
+        )
+    if account.chat_id is None:
+        return httpx.Response(409, json={"error": {"code": "telegram_required"}})
+    return httpx.Response(
+        200,
+        json={"referral_code": "CAB-9f2a", "invited_count": 3, "rub_earned": 150},
+    )
+
+
+def _promo_response(request: httpx.Request) -> httpx.Response:
+    """`POST /internal/accounts/{id}/promo/validate`.
+
+    Недействительный код — **успешный** ответ `200` с `valid: false`: «код не
+    подходит» это результат проверки, а не отказ запроса. Тест на клиент
+    держится за это различие: клиент обязан вернуть разобранный результат, а не
+    бросить исключение.
+    """
+    code = json.loads(request.content).get("code", "")
+    if code == "GOOD10":
+        return httpx.Response(200, json={"valid": True, "discount_percent": 10, "reason": None})
+    return httpx.Response(200, json={"valid": False, "discount_percent": 0, "reason": "not_found"})
 
 
 def _unlink_response(api: FakeApi, account_id: int, action: str) -> httpx.Response:
@@ -428,3 +489,120 @@ async def test_revoke_session_is_idempotent():
     revokes = [r for r in requests if r.url.path == "/internal/sessions/revoke"]
     assert len(revokes) == 2
     assert exc.value.code == "unauthorized"
+
+
+# --- деньги человека: баланс, рефералка, промокод (W5б, #40) --------------
+#
+# Пути проверяются строкой целиком, как у отвязки и сессий: подмена `balance`
+# на `bonus` или `promo/validate` на `promo` оставила бы подстроку и прошла бы
+# мимо сверки на вхождение. Ровно на такой подстроке проект уже терял зелёный
+# тест.
+
+
+async def test_balance_hits_the_contract_path_and_parses_the_amount():
+    """Баланс идёт на **точный** путь §1 и разбирает сумму числом."""
+    api = FakeApi()
+    account = api.create_account(chat_id=123_456_789)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        balance = await client.get_balance(account.id)
+
+    assert paths == [f"/internal/accounts/{account.id}/balance"]
+    assert balance.credit_rub == 450
+
+
+async def test_balance_without_telegram_is_a_bot_error_telegram_required():
+    """У аккаунта без Telegram баланс — `BotError` с кодом `telegram_required`.
+
+    Это **не** «баланс 0»: кредит живёт под `chat_id`, которого у аккаунта ещё
+    нет, и суммы не существует. Тест держится за код, а не за текст: по коду
+    кабинет решает показать «баланс недоступен», а не `0 ₽`.
+    """
+    api = FakeApi()
+    account = api.create_account(mail="user@example.com", mail_verified_at=NOW)
+
+    client = _client_for(api)
+    async with client:
+        with pytest.raises(BotError) as exc:
+            await client.get_balance(account.id)
+
+    assert exc.value.code == "telegram_required"
+    assert exc.value.status == 409
+
+
+async def test_referral_hits_the_contract_path_and_parses_all_three_fields():
+    """Рефералка идёт на **точный** путь §1 и разбирает код, счёт и сумму."""
+    api = FakeApi()
+    account = api.create_account(chat_id=123_456_789)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        referral = await client.get_referral(account.id)
+
+    assert paths == [f"/internal/accounts/{account.id}/referral"]
+    assert referral.referral_code == "CAB-9f2a"
+    assert referral.invited_count == 3
+    assert referral.rub_earned == 150
+
+
+async def test_referral_without_telegram_is_telegram_required():
+    """У аккаунта без Telegram рефералка — тот же `409 telegram_required`."""
+    api = FakeApi()
+    account = api.create_account(mail="user@example.com", mail_verified_at=NOW)
+
+    client = _client_for(api)
+    async with client:
+        with pytest.raises(BotError) as exc:
+            await client.get_referral(account.id)
+
+    assert exc.value.code == "telegram_required"
+
+
+async def test_valid_promo_returns_parsed_discount():
+    """Действительный код — разобранный результат со скидкой, без исключения."""
+    api = FakeApi()
+    account = api.create_account(chat_id=123_456_789)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        result = await client.validate_promo(account.id, "GOOD10")
+
+    assert paths == [f"/internal/accounts/{account.id}/promo/validate"]
+    assert result.valid is True
+    assert result.discount_percent == 10
+
+
+async def test_invalid_promo_is_a_result_not_an_error():
+    """Недействительный код — результат `valid: false` с причиной, не исключение.
+
+    Это различие и есть предмет проверки: «код не подходит» бот отдаёт
+    успешным `200`, и клиент обязан вернуть разобранный ответ. Клиент, который
+    бросил бы здесь `BotError`, заставил бы кабинет показывать «сбой» на
+    обычное «код неверный».
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=123_456_789)
+
+    client = _client_for(api)
+    async with client:
+        result = await client.validate_promo(account.id, "NOPE")
+
+    assert result.valid is False
+    assert result.discount_percent == 0
+    assert result.reason == "not_found"
