@@ -220,11 +220,16 @@ class SmtpTransport:
 
 @dataclass
 class ApiTransport:
-    """HTTP-API почтового сервиса.
+    """HTTP-API почтового сервиса — Brevo.
 
-    Ключ уходит заголовком, тело — компактным JSON. Транспорт не знает ни
-    схемы сервиса, ни его лимитов: он доставляет и честно сообщает, если не
-    доставил.
+    Тело и заголовок подогнаны под Brevo, а не под «обобщённый» API: у него
+    свой формат (`sender.email`, `to` списком объектов, `textContent`) и своё
+    имя заголовка (`api-key`, без `Bearer`). Обобщённый формат выглядел
+    красивее, но с ним письма просто не уходили — а узнать это можно было
+    только живой отправкой, что и делает такие расхождения дорогими.
+
+    Транспорт не знает ни схемы сервиса, ни его лимитов: он доставляет и
+    честно сообщает, если не доставил.
     """
 
     url: str
@@ -237,12 +242,14 @@ class ApiTransport:
 
     def send(self, *, to: str, subject: str, body: str) -> None:
         payload = {
-            "from": self.sender,
-            "to": to,
+            "sender": {"email": self.sender},
+            "to": [{"email": to}],
             "subject": subject,
-            "text": body,
+            "textContent": body,
         }
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        # `api-key`, а не `Authorization: Bearer` — Brevo принимает ключ
+        # только в своём заголовке, и с чужим отвечает 401.
+        headers = {"api-key": self.api_key, "accept": "application/json"}
 
         try:
             client = self.client or httpx.Client(timeout=self.timeout)

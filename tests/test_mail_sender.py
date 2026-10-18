@@ -11,12 +11,15 @@
 
 from __future__ import annotations
 
+import json
 import smtplib
 
+import httpx
 import pytest
 from fakes import FakeMailSender
 
 from cabinet.mail_sender import (
+    ApiTransport,
     MailAddressError,
     MailConfigError,
     MailSender,
@@ -192,3 +195,39 @@ def test_from_env_returns_ready_sender():
     потому что транспорт пока не вызывается."""
     sender = from_env(SMTP_ENV)
     assert sender.sender == "cabinet@example.com"
+
+
+def test_api_transport_sends_brevo_shape_not_generic():
+    """Формат запроса — Brevo, а не «обобщённый» API.
+
+    Транспорт был написан под формат `{from, to, text}` с заголовком
+    `Authorization: Bearer`. С ним письма через Brevo не уходили: у сервиса
+    своё тело (`sender.email`, `to` списком объектов, `textContent`) и своё
+    имя заголовка. Расхождение нашлось только при подготовке к подключению —
+    потому что транспорт не был покрыт ни одним тестом.
+
+    Тест держит формат: если его «упростить» обратно, письма перестанут
+    уходить, и это заметят не сразу.
+    """
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(201, json={"messageId": "1"})
+
+    transport = ApiTransport(
+        url="https://api.brevo.com/v3/smtp/email",
+        api_key="key-123",
+        sender="cabinet@example.com",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    transport.send(to="user@example.com", subject="Код входа", body="123456")
+
+    body = captured["body"]
+    assert body["sender"] == {"email": "cabinet@example.com"}
+    assert body["to"] == [{"email": "user@example.com"}]
+    assert body["textContent"] == "123456"
+    # Заголовок именно `api-key`: с `Authorization: Bearer` Brevo отвечает 401.
+    assert captured["headers"].get("api-key") == "key-123"
+    assert "authorization" not in {k.lower() for k in captured["headers"]}
