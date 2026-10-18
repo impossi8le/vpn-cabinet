@@ -42,6 +42,8 @@ __all__ = [
     "BotConfigError",
     "BotError",
     "BotUnreachable",
+    "CurrentSession",
+    "IssuedSession",
     "Subscription",
 ]
 
@@ -161,6 +163,66 @@ class Subscription:
             end_date=_parse_datetime(raw.get("end_date")),
             location=raw.get("location"),
         )
+
+
+@dataclass(frozen=True)
+class IssuedSession:
+    """Только что выданная сессия — ответ `POST /internal/sessions/for-account`.
+
+    Токен здесь есть, и это единственный момент, когда он ходит наружу: его
+    кладёт в cookie вызывающий код. Держать его дольше незачем — в хранилище
+    лежит хеш (`cabinet.sessions`), и токен оттуда не вернётся.
+    """
+
+    token: str
+    account_id: int
+    expires_at: datetime | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> IssuedSession:
+        """Собрать из ответа бота, не доверяя его форме: ответ приходит из
+        другого репозитория, и пропавшее поле не должно ронять вход."""
+        return cls(
+            token=str(raw.get("token", "")),
+            account_id=int(raw.get("account_id", 0)),
+            expires_at=_parse_datetime(raw.get("expires_at")),
+        )
+
+
+@dataclass(frozen=True)
+class CurrentSession:
+    """Сессия, какой её видит `GET /internal/sessions/current`.
+
+    `chat_id` и `mail` — атрибуты аккаунта, а не сессии: они нужны кабинету,
+    чтобы показать, кто вошёл, но владелец сессии — только `account_id`
+    (см. `cabinet.sessions`). Токена здесь нет: он уже у вызывающего в cookie.
+    """
+
+    account_id: int
+    chat_id: int | None = None
+    mail: str | None = None
+    expires_at: datetime | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> CurrentSession:
+        """Собрать из ответа бота. Поля через `.get`: новая версия бота не
+        должна ломать проверку сессии `KeyError`-ом."""
+        return cls(
+            account_id=int(raw.get("account_id", 0)),
+            chat_id=raw.get("chat_id"),
+            mail=raw.get("mail"),
+            expires_at=_parse_datetime(raw.get("expires_at")),
+        )
+
+
+def _bearer(token: str) -> dict[str, str]:
+    """Заголовок с токеном сессии.
+
+    Не в query: query оседает в логах доступа и истории браузера, а заголовок —
+    нет. Тот же выбор, что у секрета в `_headers()`: секрет — не единственное,
+    что нельзя показывать в строке запроса, и токен сессии здесь не исключение.
+    """
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -316,6 +378,58 @@ class BotClient:
         """
         return await self._request_bytes(
             "GET", f"{BOT_PATH}/accounts/{account_id}/configs/{config_id}"
+        )
+
+    # ---------- Сессии (§4) ----------
+
+    async def create_session_for_account(self, account_id: int) -> IssuedSession:
+        """Выдать сессию кабинета по `account_id` (§4).
+
+        Сессия выдаётся **по аккаунту**, а не по `chat_id`: главный случай —
+        человек, зарегистрировавшийся по почте и Telegram не привязавший. Это
+        тот же выбор, что в `cabinet.sessions`, и клиент его не отменяет.
+
+        Ответ возвращается с токеном: он показывается один раз, и вызывающий
+        сам кладёт его в cookie. В лог токен не идёт — `_send` и `_request`
+        заголовки и тело не логируют.
+        """
+        data = await self._request(
+            "POST", f"{BOT_PATH}/sessions/for-account", json={"account_id": account_id}
+        )
+        return IssuedSession.from_api(data)
+
+    async def get_current_session(self, token: str) -> CurrentSession:
+        """Проверить сессию по токену (§4).
+
+        Токен идёт **в заголовке** `Authorization: Bearer`, а не в query: query
+        попадает в логи доступа и историю, заголовок — нет. Причина та же, что
+        у секрета в `_headers()`.
+
+        Неизвестный, истёкший или отозванный токен бот отдаёт как `401` с
+        `code: unauthorized`. Это **осмысленный отказ**, а не сбой связи: он
+        приходит сюда как `BotError` с этим кодом (разбор общий —
+        `_error_from_response`), и вызывающий ветвится по коду, а не по тексту.
+        """
+        data = await self._request("GET", f"{BOT_PATH}/sessions/current", headers=_bearer(token))
+        return CurrentSession.from_api(data)
+
+    async def revoke_session(self, token: str) -> None:
+        """Выход: отозвать сессию по токену (§4). Идемпотентно.
+
+        Повторный выход — не ошибка, поэтому здесь нечего различать: бот
+        отвечает успехом и на уже отозванный токен.
+
+        Токен идёт и в заголовке, и в теле. Заголовок — потому что он не
+        попадает в логи доступа (та же причина, что у секрета в `_headers()`);
+        тело `{"token": ...}` — потому что так требует §4 контракта. Оба места
+        заполняются намеренно: пока W6-роутер не написан, источник правды —
+        контракт, и разойтись с ним на пустом месте нельзя.
+        """
+        await self._request(
+            "POST",
+            f"{BOT_PATH}/sessions/revoke",
+            headers=_bearer(token),
+            json={"token": token},
         )
 
     # ---------- Транспорт ----------

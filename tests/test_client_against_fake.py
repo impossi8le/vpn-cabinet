@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import httpx
@@ -28,7 +29,11 @@ BASE = "http://127.0.0.1:9"
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 
 
-def _transport_for(api: FakeApi, paths: list[str] | None = None) -> httpx.MockTransport:
+def _transport_for(
+    api: FakeApi,
+    paths: list[str] | None = None,
+    requests: list[httpx.Request] | None = None,
+) -> httpx.MockTransport:
     """Мост: HTTP-запросы клиента → вызовы подставного бота.
 
     Маршруты и форма ответа повторяют внутренний роутер бота. Совпадение имён
@@ -38,7 +43,17 @@ def _transport_for(api: FakeApi, paths: list[str] | None = None) -> httpx.MockTr
     `paths` — необязательный журнал путей: тест, которому нужно утверждать
     **точное** имя маршрута (а не только «запрос дошёл»), передаёт сюда список,
     и обработчик складывает в него пришедшие пути. Без него поведение прежнее.
+
+    `requests` — журнал целых запросов: он нужен тесту про **заголовок** токена,
+    потому что путь тут ни при чём — проверяется, где именно лежит токен (в
+    заголовке, а не в query). Тело запроса туда тоже попадает: то, что токен не
+    утёк в query и в путь, надо видеть целиком, а не догадываться.
     """
+
+    # Реестр выданных сессий подставного бота: `token → account_id`. Живёт в
+    # замыкании транспорта — это состояние бота, а не клиента, и наружу оно
+    # отдаётся ровно так, как отдал бы живой роутер `sessions/*`.
+    sessions: dict[str, int] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         # Секрет проверяется на каждом запросе: роутер бота не отвечает без него,
@@ -48,12 +63,20 @@ def _transport_for(api: FakeApi, paths: list[str] | None = None) -> httpx.MockTr
 
         if paths is not None:
             paths.append(request.url.path)
+        if requests is not None:
+            requests.append(request)
 
         path = request.url.path
         if request.method == "GET" and path == "/internal/accounts/by-chat-id":
             acc = api.find_by_chat_id(int(request.url.params["chat_id"]))
         elif request.method == "GET" and path == "/internal/accounts/by-mail":
             acc = api.find_by_mail(request.url.params["mail"])
+        elif request.method == "POST" and path == "/internal/sessions/for-account":
+            return _issue_session(api, sessions, request)
+        elif request.method == "GET" and path == "/internal/sessions/current":
+            return _current_session(api, sessions, request)
+        elif request.method == "POST" and path == "/internal/sessions/revoke":
+            return _revoke_session(sessions, request)
         elif request.method == "POST":
             # `/internal/accounts/{id}/unlink-telegram|unlink-mail`. Разбор по
             # сегментам, а не сравнение строк: `{id}` меняется от аккаунта к
@@ -73,6 +96,77 @@ def _transport_for(api: FakeApi, paths: list[str] | None = None) -> httpx.MockTr
         return httpx.Response(200, json={"account": _account_json(acc)})
 
     return httpx.MockTransport(handler)
+
+
+def _bearer_token(request: httpx.Request) -> str | None:
+    """Токен из заголовка `Authorization: Bearer <token>` — как его читает бот.
+
+    `None`, если заголовка нет вовсе: тогда токен искать негде, и ответ будет
+    тем же `401 unauthorized`. Клиент, положивший токен в query, сюда не
+    попадёт — и это ровно то, что ловит тест про заголовок.
+    """
+    scheme, _, value = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return value or None
+
+
+def _issue_session(
+    api: FakeApi, sessions: dict[str, int], request: httpx.Request
+) -> httpx.Response:
+    """`POST /internal/sessions/for-account` — выдать сессию по аккаунту.
+
+    Токен детерминированный: тесту не нужна случайность бота, ему нужно, чтобы
+    один и тот же `account_id` давал один и тот же ответ при повторе. Форма —
+    `{"token", "expires_at", "account_id"}` из §4.
+    """
+    account_id = int(json.loads(request.content)["account_id"])
+    if api.find_by_id(account_id) is None:
+        return httpx.Response(
+            404, json={"error": {"code": "account_not_found", "retryable": False}}
+        )
+    token = f"token-for-{account_id}"
+    sessions[token] = account_id
+    return httpx.Response(
+        200,
+        json={"token": token, "expires_at": NOW.isoformat(), "account_id": account_id},
+    )
+
+
+def _current_session(
+    api: FakeApi, sessions: dict[str, int], request: httpx.Request
+) -> httpx.Response:
+    """`GET /internal/sessions/current` — проверка токена из заголовка (§4).
+
+    Неизвестный токен — `401 code: unauthorized`, ровно как у живого бота:
+    «нет сессии» и «сессия истекла» снаружи неразличимы.
+    """
+    token = _bearer_token(request)
+    account_id = sessions.get(token) if token else None
+    if account_id is None:
+        return httpx.Response(401, json={"error": {"code": "unauthorized"}})
+    acc = api.find_by_id(account_id)
+    return httpx.Response(
+        200,
+        json={
+            "account_id": account_id,
+            "chat_id": acc.chat_id,
+            "mail": acc.mail,
+            "expires_at": NOW.isoformat(),
+        },
+    )
+
+
+def _revoke_session(sessions: dict[str, int], request: httpx.Request) -> httpx.Response:
+    """`POST /internal/sessions/revoke` — выход. Идемпотентно (§4).
+
+    Токен читается из тела `{"token": ...}`: так требует контракт. Повторный
+    отзыв не ошибка — `.pop(..., None)` и успех в обоих случаях.
+    """
+    body = json.loads(request.content) if request.content else {}
+    token = body.get("token") or _bearer_token(request)
+    sessions.pop(token, None)
+    return httpx.Response(200, json={"revoked": True})
 
 
 def _unlink_response(api: FakeApi, account_id: int, action: str) -> httpx.Response:
@@ -226,3 +320,111 @@ async def test_unlinking_last_login_method_is_a_bot_error_not_a_network_failure(
     assert exc.value.code == "last_login_method"
     # Аккаунт не тронут: отказ на стороне бота ничего не меняет.
     assert api.find_by_id(account.id).chat_id == 123_456_789
+
+
+async def test_create_session_hits_the_contract_path_and_parses_the_token():
+    """Выдача сессии идёт на **точный** путь §4 и разбирает ответ целиком.
+
+    Путь сверяется строкой целиком, а не на «`sessions` где-то есть»: подмена
+    `for-account` на `for_account` или на `session` оставила бы подстроку
+    `sessions` на месте и прошла бы мимо. Ровно этот класс ошибки уже стоил
+    проекту зелёного теста, не защищавшего ничего (`"JOIN accounts" in sql`).
+    """
+    api = FakeApi()
+    account = api.create_account(mail="user@example.com", mail_verified_at=NOW)
+    paths: list[str] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, paths)),
+    )
+    async with client:
+        issued = await client.create_session_for_account(account.id)
+
+    assert paths == ["/internal/sessions/for-account"]
+    assert issued.token == f"token-for-{account.id}"
+    assert issued.account_id == account.id
+    assert issued.expires_at == NOW
+
+
+async def test_current_session_sends_token_in_header_not_query():
+    """Токен идёт **заголовком** `Authorization: Bearer`, а не в query.
+
+    Причина та же, что у секрета: query оседает в логах доступа и истории —
+    заголовок нет. Проверка точная: токен обязан быть в заголовке и обязан
+    **отсутствовать** в строке запроса и в пути. Тест, у которого токен нашёлся
+    бы в query, покраснеет — а он бы прошёл, если бы сверялась подстрока.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=42_000_111, mail="user@example.com", mail_verified_at=NOW)
+    requests: list[httpx.Request] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, None, requests)),
+    )
+    async with client:
+        issued = await client.create_session_for_account(account.id)
+        got = await client.get_current_session(issued.token)
+
+    assert len(requests) == 2
+    verify = requests[1]
+    assert verify.url.path == "/internal/sessions/current"
+    assert verify.headers["Authorization"] == f"Bearer {issued.token}"
+    assert issued.token not in verify.url.query.decode()
+    assert issued.token not in verify.url.path
+    assert got.account_id == account.id
+    assert got.chat_id == 42_000_111
+    assert got.mail == "user@example.com"
+
+
+async def test_unknown_session_token_is_a_bot_error_with_unauthorized_code():
+    """`401 unauthorized` — `BotError` с этим кодом, а не сетевая ошибка.
+
+    Разница для вызывающего принципиальна: по коду он убирает cookie и ведёт на
+    вход, а по `BotUnreachable` — повторяет запрос. Неизвестный, истёкший и
+    отозванный токен снаружи обязаны выглядеть одинаково (§4).
+    """
+    api = FakeApi()
+    api.create_account(mail="user@example.com", mail_verified_at=NOW)
+
+    client = _client_for(api)
+    async with client:
+        with pytest.raises(BotError) as exc:
+            await client.get_current_session("never-issued-token")
+
+    assert exc.value.code == "unauthorized"
+    assert exc.value.status == 401
+
+
+async def test_revoke_session_is_idempotent():
+    """Выход идемпотентен: повторный отзыв — не ошибка (§4).
+
+    Проверяется на живом стыке, потому что «не ошибка при повторе» — это
+    свойство бота, а не клиента: клиент лишь не должен сам придумывать отказ
+    там, где контракт его не предусматривает.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=99_000_111)
+    requests: list[httpx.Request] = []
+
+    client = BotClient(
+        base_url=BASE,
+        secret=SECRET,
+        client=httpx.AsyncClient(base_url=BASE, transport=_transport_for(api, None, requests)),
+    )
+    async with client:
+        issued = await client.create_session_for_account(account.id)
+        await client.revoke_session(issued.token)
+        # Повтор — не исключение.
+        await client.revoke_session(issued.token)
+
+        # После отзыва токен недействителен: тот же `401`, что у неизвестного.
+        with pytest.raises(BotError) as exc:
+            await client.get_current_session(issued.token)
+
+    revokes = [r for r in requests if r.url.path == "/internal/sessions/revoke"]
+    assert len(revokes) == 2
+    assert exc.value.code == "unauthorized"
