@@ -79,6 +79,13 @@ NETWORK_ERROR_CODE = "bot_unreachable"
 
 BOT_PATH = "/internal"
 
+# Коды бота (§1 контракта), которые протокол связывания моделирует «нулём
+# изменённых строк», а не исключением: занятое место при привязке и единственный
+# оставшийся способ входа при отвязке. Для привязки `0` — «место заняли между
+# чтением и записью», для отвязки — «аккаунт остался бы недоступен навсегда».
+# Список — имена контракта, а не текст сообщения: текст меняется, код — нет.
+_REFUSAL_CODES = frozenset({"chat_id_taken", "mail_taken", "last_login_method"})
+
 # Таймауты. Соединение к loopback не может занимать секунды — если занимает,
 # бот не поднят. На чтение даём больше: за ним может стоять запрос к БД, но не
 # бесконечно — запрос кабинета не должен висеть, пока пользователь смотрит на
@@ -673,12 +680,12 @@ class BotStore:
 
     **Что адаптер не делает.** Во-первых, он отдаёт **сырые записи бота**, а не
     готовые представления: сборка `SubscriptionView` остаётся в
-    `subscriptions.subscription_views`, где и была. Во-вторых, он закрывает не
-    весь `AccountStore`, а тот путь, по которому человек попадает на два первых
-    экрана. Связывание и вход (`linking`, `signin`) ждут другой формы —
-    `rowcount` вместо `Account` и создание аккаунта вместе с подтверждением
-    почты; их сведение к живому клиенту — отдельная работа W6 (см. докстроку
-    `linking.AccountStore`).
+    `subscriptions.subscription_views`, где и была. Во-вторых, он отдаёт не
+    `AccountStore` целиком, а ту форму, которую ждут роуты, вход и связывание:
+    для связывания это «сколько строк изменилось» (`link_*`/`unlink_*`), а не
+    объект, — см. `_changed_rows` и докстроку `linking.AccountStore`. Обе формы
+    (`signin.AccountStore`, `linking.AccountStore`) адаптер закрывает: без них
+    вход по почте — главная дверь кабинета — отвечал бы 500 (issue #47).
 
     Конфигурацию адаптер не дублирует: адрес и секрет он берёт у того самого
     клиента, которого оборачивает. Второй копии секрета быть не должно — иначе
@@ -748,6 +755,115 @@ class BotStore:
         )
         return UnlinkPreview.from_api(data)
 
+    # ---------- вход и связывание (signin, linking) ----------
+    #
+    # Семь методов ниже — то, чего адаптеру не хватало для входа и связывания:
+    # без них выложенный кабинет отвечал 500 на входе по почте, а он и есть
+    # главная дверь (issue #47). Формы — из протоколов `signin.AccountStore` и
+    # `linking.AccountStore`, а не из удобства.
+
+    def find_by_mail(self, mail: str) -> Account | None:
+        """Аккаунт по почте (`GET /internal/accounts/by-mail`) или `None`.
+
+        `404 account_not_found` — это «аккаунта нет», а не сбой: по нему вход
+        решает «завести аккаунт», а по недоступности бота — «повторить».
+        Отличать обязательно: иначе первая же регистрация падала бы 500, а
+        недоступность бота выглядела бы как «такого адреса нет».
+        """
+        return self._find(f"{BOT_PATH}/accounts/by-mail", params={"mail": mail})
+
+    def find_by_chat_id(self, chat_id: int) -> Account | None:
+        """Аккаунт по Telegram id (`GET /internal/accounts/by-chat-id`) или `None`.
+
+        Симметрично поиску по почте. Нужен Telegram-входу и связыванию: по нему
+        отличают «место занято другим аккаунтом» от «заняло это же самое».
+        """
+        return self._find(f"{BOT_PATH}/accounts/by-chat-id", params={"chat_id": chat_id})
+
+    def _find(self, path: str, **kwargs: Any) -> Account | None:
+        """Общий разбор поиска: `404` — «не найден», а не ошибка.
+
+        Тот же приём, что у `find_by_id`: «нет аккаунта» и «бот сломался» —
+        разные состояния, и первое обязано быть `None`, а не исключением.
+        """
+        try:
+            data = self._get(path, **kwargs)
+        except BotError as exc:
+            if exc.code == "account_not_found" or exc.status == 404:
+                return None
+            raise
+        account = data.get("account")
+        return _account_from_api(account) if account else None
+
+    def create_account(
+        self,
+        *,
+        chat_id: int | None = None,
+        mail: str | None = None,
+        mail_verified_at: datetime | None = None,
+    ) -> Account:
+        """Завести аккаунт (`POST /internal/accounts`) — регистрация или Telegram-вход.
+
+        `mail_verified_at` уходит боту вместе с адресом: почта без подтверждения
+        не существует (инвариант 2), и бот отвечает `400 mail_not_verified`, если
+        отметки нет. Подставлять её здесь «сейчас» нельзя — вход передаёт момент,
+        полученный от `AuthMail`, а отметка обязана совпадать с моментом проверки
+        кода. Аккаунт без способа входа не заводим: он был бы недоступен навсегда
+        (W3.5), и это отказ вызывающего, а не бота.
+        """
+        if chat_id is None and not mail:
+            raise ValueError("аккаунт без способа входа недоступен навсегда")
+        body: dict[str, Any] = {}
+        if chat_id is not None:
+            body["chat_id"] = chat_id
+        if mail:
+            body["mail"] = mail
+            if mail_verified_at is not None:
+                body["mail_verified_at"] = mail_verified_at.isoformat()
+        data = self._request("POST", f"{BOT_PATH}/accounts", json=body)
+        return _account_from_api(data["account"])
+
+    def link_chat_id(self, account_id: int, chat_id: int) -> int:
+        """Привязать Telegram (`POST /internal/accounts/{id}/link-telegram`).
+
+        `1` — привязали, `0` — место занято. Условие `AND chat_id IS NULL` живёт
+        у бота: занятый `chat_id` приходит `409 chat_id_taken`, и именно ради
+        этого случая `0` отличим от `1` — место мог занять кто-то другой между
+        чтением и записью. Перезаписи нет и быть не должно (§3.3).
+        """
+        return self._changed_rows(
+            f"{BOT_PATH}/accounts/{account_id}/link-telegram", {"chat_id": chat_id}
+        )
+
+    def link_mail(self, account_id: int, mail: str, mail_verified_at: datetime) -> int:
+        """Привязать почту (`POST /internal/accounts/{id}/link-mail`).
+
+        `mail_verified_at` обязателен: владение адресом доказывает код, и
+        `Linking` передаёт сюда момент проверки. Без него бот ответил бы
+        `400 mail_not_verified`, а привязка стала бы заявлением браузера —
+        pre-account hijacking (§3.3). Занятая почта — `409 mail_taken` → `0`.
+        """
+        body = {"mail": mail, "mail_verified_at": mail_verified_at.isoformat()}
+        return self._changed_rows(f"{BOT_PATH}/accounts/{account_id}/link-mail", body)
+
+    def unlink_chat_id(self, account_id: int) -> int:
+        """Отвязать Telegram (`POST /internal/accounts/{id}/unlink-telegram`).
+
+        `1` — отвязали, `0` — отвязка оставила бы аккаунт без способа входа. Бот
+        отвечает на это `409 last_login_method` (§1), и `0` доносит запрет до
+        `Linking.unlink_telegram`, где он становится `UnlinkRefused` — **своим**
+        отказом, а не общим: аккаунт без входа недоступен навсегда (W3.5).
+        """
+        return self._changed_rows(f"{BOT_PATH}/accounts/{account_id}/unlink-telegram")
+
+    def unlink_mail(self, account_id: int) -> int:
+        """Отвязать почту (`POST /internal/accounts/{id}/unlink-mail`).
+
+        Симметрично отвязке Telegram: `409 last_login_method` → `0` → отказ
+        «нельзя отвязать последний способ входа», а не «не удалось» и не 500.
+        """
+        return self._changed_rows(f"{BOT_PATH}/accounts/{account_id}/unlink-mail")
+
     # ---------- транспорт ----------
 
     def _headers(self) -> dict[str, str]:
@@ -756,14 +872,22 @@ class BotStore:
         return self.bot._headers()
 
     def _get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Синхронное чтение. Тонкая обёртка над `_request`: у роутов чтений
+        большинство, и `_get` называет намерение, а общий транспорт — один."""
+        return self._request("GET", path, **kwargs)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """Один синхронный запрос: сеть, статус, разбор отказа.
 
         Разбор ошибок общий с `BotClient` (`_error_from_response`): формат отказа
         — часть контракта бота, и вторая его копия разошлась бы с первой ровно
-        там, где ошибку и надо различать по коду.
+        там, где ошибку и надо различать по коду. Метод — параметр, а не
+        `_get`/`_post` по отдельности: адрес, заголовок и разбор ошибки у чтения
+        и записи те же, и разводить их значило бы держать две копии этого
+        разбора.
         """
         try:
-            response = self._http.request("GET", path, headers=self._headers(), **kwargs)
+            response = self._http.request(method, path, headers=self._headers(), **kwargs)
         except _NETWORK_ERRORS as exc:
             raise BotUnreachable(
                 f"запрос к боту не удался: {exc.__class__.__name__}", cause=exc
@@ -782,6 +906,25 @@ class BotStore:
         if not isinstance(payload, dict):
             raise BotError("invalid_response", "бот вернул не объект", status=response.status_code)
         return payload
+
+    def _changed_rows(self, path: str, body: dict[str, Any] | None = None) -> int:
+        """Запись, отвечающая «сколько строк изменилось»: `1` или `0`.
+
+        Протокол связывания требует именно числа, а не объекта: только `0`
+        отличает «место заняли между чтением и записью» от «привязал». Бот
+        отвечает на это `409` с кодом (`chat_id_taken`, `mail_taken`,
+        `last_login_method`), поэтому контрактный отказ переводится в `0`, а
+        **прочие** отказы (например `404 account_not_found`) пробрасываются как
+        есть: это не «место занято», а расхождение, и сводить его к нулю значило
+        бы спрятать настоящий сбой за состоянием «занято».
+        """
+        try:
+            self._request("POST", path, json=body)
+        except BotError as exc:
+            if exc.code in _REFUSAL_CODES:
+                return 0
+            raise
+        return 1
 
 
 def _error_from_response(response: httpx.Response) -> BotError:
