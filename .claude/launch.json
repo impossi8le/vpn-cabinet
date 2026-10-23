@@ -12,6 +12,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "cabinet"],
       "port": 8000
+    },
+    {
+      "name": "cabinet-dev",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [".claude/dev/cabinet_dev.py"],
+      "port": 8111
     }
   ]
 }
