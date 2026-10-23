@@ -27,11 +27,19 @@ import re
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from cabinet.accounts import Account
-from cabinet.app import COOKIE_NAME, LINK_REFUSED_ERROR, UNLINK_LAST_METHOD_ERROR, build_app
+from cabinet.app import (
+    COOKIE_NAME,
+    LINK_REFUSED_ERROR,
+    UNLINK_DONE_TELEGRAM,
+    UNLINK_LAST_METHOD_ERROR,
+    build_app,
+)
 from cabinet.bot_client import SECRET_HEADER, BotClient, BotStore
+from cabinet.linking import LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailSender
 from tests.fakes import CollisionError, FakeApi, FakeMailSender
 
@@ -78,10 +86,14 @@ class _Race:
     def __init__(
         self,
         *,
+        link_chat_id_taken: bool = False,
         link_mail_taken: bool = False,
+        unlink_chat_last_method: bool = False,
         unlink_mail_last_method: bool = False,
     ) -> None:
+        self.link_chat_id_taken = link_chat_id_taken
         self.link_mail_taken = link_mail_taken
+        self.unlink_chat_last_method = unlink_chat_last_method
         self.unlink_mail_last_method = unlink_mail_last_method
 
 
@@ -138,6 +150,11 @@ def _account_or_404(account: Account | None) -> httpx.Response:
     return httpx.Response(200, json={"account": _account_json(account)})
 
 
+def _link_ok(account: Account) -> httpx.Response:
+    """Успешный ответ `link-*`: `{"ok": true, "account": {...}}` (§1)."""
+    return httpx.Response(200, json={"ok": True, "account": _account_json(account)})
+
+
 def _create_response(api: FakeApi, request: httpx.Request) -> httpx.Response:
     """`POST /internal/accounts` (§1): тело — либо `chat_id`, либо почта с
     подтверждением. Ответ `201` с аккаунтом; занятое значение — `409`."""
@@ -162,15 +179,24 @@ def _action_response(
     request: httpx.Request,
     race: _Race,
 ) -> httpx.Response:
-    """`link-*` / `unlink-*` по имени последнего сегмента пути (§1)."""
+    """`link-*` / `unlink-*` по имени последнего сегмента пути (§1).
+
+    Успех `link-*` отдаётся фактической формой живого роутера —
+    `{"ok": true, "account": {...}}`, а не только `{"ok": true}`. Это не
+    косметика: адаптер отвечает числом и **не должен** читать `account`; тест,
+    у которого тела с аккаунтом нет, пропустил бы адаптер, читающий его зря.
+    """
     if api.find_by_id(account_id) is None:
         return _error("account_not_found", 404)
 
     if action == "link-telegram":
         body = json.loads(request.content)
+        # Гонка: чтение (`by-chat-id`) сказало «свободно», а запись — «занято».
+        if race.link_chat_id_taken:
+            return _error("chat_id_taken", 409)
         if api.link_chat_id(account_id, int(body["chat_id"])) != 1:
             return _error("chat_id_taken", 409)
-        return httpx.Response(200, json={"ok": True})
+        return _link_ok(api.find_by_id(account_id))
 
     if action == "link-mail":
         body = json.loads(request.content)
@@ -185,9 +211,11 @@ def _action_response(
         )
         if rowcount != 1:
             return _error("mail_taken", 409)
-        return httpx.Response(200, json={"ok": True})
+        return _link_ok(api.find_by_id(account_id))
 
     if action == "unlink-telegram":
+        if race.unlink_chat_last_method:
+            return _error("last_login_method", 409)
         if api.unlink_chat_id(account_id) != 1:
             return _error("last_login_method", 409)
         return httpx.Response(200, json={"account": _account_json(api.find_by_id(account_id))})
@@ -223,18 +251,28 @@ def _store_over(
     )
 
 
+def _app_over(api: FakeApi, sender: FakeMailSender, **kwargs: object):
+    """Приложение поверх живой формы хранилища.
+
+    Отдельно от `_client_over`: часть проверок идёт на уровне **хранилища и
+    `Linking`**, а не через HTTP (роуты привязки Telegram заглушены до W6), и им
+    нужен доступ к собранным `app.state.linking`/`app.state.sessions`.
+    """
+    return build_app(
+        store=_store_over(api, **kwargs),  # type: ignore[arg-type]
+        mail_sender=MailSender(sender="cabinet@example.com", transport=sender),
+        now=lambda: NOW,
+    )
+
+
 def _client_over(api: FakeApi, sender: FakeMailSender, **kwargs: object) -> TestClient:
-    """Приложение, собранное поверх живой формы хранилища.
+    """Клиент приложения поверх живой формы хранилища.
 
     `raise_server_exceptions=False`: 500 обязан прийти как код ответа, а не
     исключением наружу, — иначе тест «вход работает» видел бы стектрейс вместо
     ответа и не отличил бы сбой от дефекта.
     """
-    app = build_app(
-        store=_store_over(api, **kwargs),  # type: ignore[arg-type]
-        mail_sender=MailSender(sender="cabinet@example.com", transport=sender),
-        now=lambda: NOW,
-    )
+    app = _app_over(api, sender, **kwargs)
     client = TestClient(app, raise_server_exceptions=False)
     # Сессии приложения — для выдачи сессии вошедшему в тесте. Cookie не
     # подставляется напрямую: подставленный cookie был бы не отличим от
@@ -370,3 +408,134 @@ def test_last_login_method_on_unlink_surfaces_as_unlink_refusal() -> None:
     assert UNLINK_LAST_METHOD_ERROR in response.text
     # Почта осталась: отказ на стороне бота ничего не меняет.
     assert api.find_by_id(account.id).mail == MAIL
+
+
+# --- 4. успешная отвязка Telegram через живое хранилище --------------------
+
+
+def test_successful_unlink_telegram_through_the_live_store_shows_success() -> None:
+    """Успешная отвязка Telegram: хранилище вернуло `1` — экран показал успех.
+
+    `POST /account/unlink/telegram` — реальный роут, зовущий `store.unlink_chat_id`
+    напрямую. Успешную сторону семантики не пиннил ни один тест: все проверки
+    отказа гоняли запись через подставной флаг. Здесь бот отвечает успехом, и
+    хранилище обязано вернуть `1`, а экран — текст успеха (`UNLINK_DONE_TELEGRAM`),
+    а не запрет. Регрессия, в которой из записи возвращается объект (`Account`),
+    дала бы `Account != 1` → `UnlinkRefused` → запрет на экране человеку, который
+    отвязать вправе.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=CHAT_ID, mail=MAIL, mail_verified_at=NOW)
+    client = _client_over(api, FakeMailSender())
+    client.cookies.set(COOKIE_NAME, client.app_state.sessions.sign_in(account.id).token)  # type: ignore[attr-defined]
+
+    response = client.post("/account/unlink/telegram", follow_redirects=False)
+
+    assert response.status_code == 200
+    assert UNLINK_DONE_TELEGRAM in response.text
+    assert UNLINK_LAST_METHOD_ERROR not in response.text
+    # Telegram отвязан, почта — второй способ — не тронута.
+    assert api.find_by_id(account.id).chat_id is None
+    assert api.find_by_id(account.id).mail == MAIL
+
+
+# --- 5. успешная привязка: число, а не объект -----------------------------
+
+
+def test_link_chat_id_returns_rowcount_not_an_object() -> None:
+    """`link_chat_id` на успехе возвращает `1`, а не объект аккаунта.
+
+    Протокол связывания требует «сколько строк изменилось»; форма прежнего
+    `BotClient` (объект `Account`) — та самая, от которой ушли в #47. Здесь
+    пиннится **успешная** сторона: `Account != 1` в `Linking` дал бы отказ на
+    законной привязке. Роут привязки Telegram заглушён до W6 (показывает «открой
+    бота»), поэтому уровень хранилища здесь единственно доступный.
+
+    Тест гоняет и подставной бот с фактической формой успеха
+    (`{"ok": true, "account": {...}}`): адаптер обязан отвечать числом и **не**
+    читать `account`.
+    """
+    api = FakeApi()
+    account = api.create_account()  # без способов входа: привязывать есть куда
+    store = _store_over(api)
+
+    result = store.link_chat_id(account.id, CHAT_ID)
+
+    assert type(result) is int
+    assert result == 1
+    assert api.find_by_id(account.id).chat_id == CHAT_ID
+
+
+def test_link_mail_returns_rowcount_not_an_object() -> None:
+    """`link_mail` на успехе возвращает `1`, а не объект. Симметрично Telegram."""
+    api = FakeApi()
+    account = api.create_account()
+    store = _store_over(api)
+
+    result = store.link_mail(account.id, MAIL, NOW)
+
+    assert type(result) is int
+    assert result == 1
+    assert api.find_by_id(account.id).mail == MAIL
+
+
+# --- 6. отказы на уровне BotStore → LinkRefused / UnlinkRefused ------------
+#
+# Роуты привязки Telegram заглушены до W6 (`POST /account/link/telegram` не зовёт
+# `Linking.link_telegram`, `/login/telegram` — тоже), поэтому отказы этих путей
+# пиннятся на уровне хранилища и `Linking` — другом уровне здесь нет.
+
+
+def test_chat_id_taken_reaches_link_refused() -> None:
+    """`409 chat_id_taken` → `0` → `LinkRefused` (место занято, не сбой).
+
+    Код `chat_id_taken` — из брифа задачи. Гонка: чтение (`by-chat-id`) читается
+    как «свободно», запись бот отвергает. Отказ обязан стать `LinkRefused`
+    (коллизия), а не проброшенным `BotError` и не 500.
+    """
+    api = FakeApi()
+    account = api.create_account()
+    app = _app_over(api, FakeMailSender(), race=_Race(link_chat_id_taken=True))
+
+    assert app.state.store.link_chat_id(account.id, CHAT_ID) == 0
+    with pytest.raises(LinkRefused):
+        app.state.linking.link_telegram(account.id, chat_id=CHAT_ID, confirmed=True)
+    # Место не занято: отказ бота ничего не перезаписал.
+    assert api.find_by_id(account.id).chat_id is None
+
+
+def test_last_login_method_on_unlink_chat_reaches_unlink_refused() -> None:
+    """`409 last_login_method` на отвязке Telegram → `0` → `UnlinkRefused`.
+
+    Парная к тесту почты проверка: запрет последнего способа входа обязан
+    доходить до `UnlinkRefused` и на Telegram-пути. Аккаунт с двумя способами:
+    предварительная проверка `Linking` пропускает (останется почта), а бот
+    отвергает запись — гонка, запрет приходит по коду.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=CHAT_ID, mail=MAIL, mail_verified_at=NOW)
+    app = _app_over(api, FakeMailSender(), race=_Race(unlink_chat_last_method=True))
+
+    assert app.state.store.unlink_chat_id(account.id) == 0
+    with pytest.raises(UnlinkRefused):
+        app.state.linking.unlink_telegram(account.id)
+    # Telegram остался: отказ бота ничего не меняет.
+    assert api.find_by_id(account.id).chat_id == CHAT_ID
+
+
+def test_find_by_chat_id_reads_the_contract_path() -> None:
+    """`find_by_chat_id` идёт на **точный** путь `by-chat-id` и разбирает аккаунт.
+
+    Telegram-вход и связывание ищут этим методом; сейчас он не пиннут ничем.
+    Путь сверяется целиком: подмена сегмента (`by-tg-id`) прошла бы мимо проверки
+    на вхождение подстроки.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=CHAT_ID)
+    paths: list[str] = []
+    store = _store_over(api, paths=paths)
+
+    found = store.find_by_chat_id(CHAT_ID)
+
+    assert paths == ["/internal/accounts/by-chat-id"]
+    assert found is not None and found.id == account.id
