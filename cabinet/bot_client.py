@@ -9,6 +9,12 @@
 значения не должны попасть в публичный репозиторий. Здесь стоит плейсхолдер
 `127.0.0.1` — реальный хост и порт задаёт переменная `BOT_BASE_URL`.
 
+Клиент асинхронный, а роуты кабинета — синхронные. Поэтому у клиента есть
+синхронная форма — `BotStore`: она держит свой `httpx.Client` и отдаёт клиента
+таким, каким его ждут роуты (issue #46). Асинхронность снимается в одном месте, а
+не по месту в каждом роуте, — тот же приём, что у `_StoreConfigSource` в
+`cabinet/app.py` для `.ovpn`.
+
 Разбор ошибок. У бота единый формат отказа (тот же, что у `client_api_svc.py`
 в боте):
 
@@ -42,6 +48,7 @@ __all__ = [
     "BotClient",
     "BotConfigError",
     "BotError",
+    "BotStore",
     "BotUnreachable",
     "CurrentSession",
     "IssuedSession",
@@ -641,6 +648,140 @@ class BotClient:
         if response.status_code >= 400:
             raise _error_from_response(response)
         return response
+
+
+class BotStore:
+    """Живой клиент в форме, которую ждут роуты кабинета (issue #46).
+
+    **Зачем.** Роуты кабинета синхронные и зовут хранилище синхронно:
+    `find_by_id`, `subscriptions_for`, `get_balance`, `get_referral`,
+    `unlink_preview`. У `BotClient` таких методов нет вовсе: его методы —
+    корутины и называются иначе (`list_subscriptions` против
+    `subscriptions_for`, `find_account_by_chat_id` против `find_by_id`).
+    Пока адаптера не было, выложенный кабинет отвечал 500 на первом же экране:
+    тесты этого не видели, потому что шли против `tests.fakes.FakeApi`, у
+    которого нужная форма есть по определению.
+
+    **Как снимается асинхронность.** Здесь, в одном месте, и синхронным
+    `httpx.Client`, а не `asyncio.run` поверх корутин. Причина: роуты
+    объявлены как `def`, и FastAPI исполняет их в пуле потоков, где цикла
+    событий нет. `asyncio.run` заводил бы **новый** цикл и **новое**
+    соединение на каждый запрос экрана — работа впустую там, где соединение
+    уже может переиспользоваться; а внутри уже запущенного цикла он падает
+    вовсе. Синхронный клиент держит пул соединений и переиспользует его между
+    запросами — ровно то, что делает `AsyncClient` у `BotClient`.
+
+    **Что адаптер не делает.** Во-первых, он отдаёт **сырые записи бота**, а не
+    готовые представления: сборка `SubscriptionView` остаётся в
+    `subscriptions.subscription_views`, где и была. Во-вторых, он закрывает не
+    весь `AccountStore`, а тот путь, по которому человек попадает на два первых
+    экрана. Связывание и вход (`linking`, `signin`) ждут другой формы —
+    `rowcount` вместо `Account` и создание аккаунта вместе с подтверждением
+    почты; их сведение к живому клиенту — отдельная работа W6 (см. докстроку
+    `linking.AccountStore`).
+
+    Конфигурацию адаптер не дублирует: адрес и секрет он берёт у того самого
+    клиента, которого оборачивает. Второй копии секрета быть не должно — иначе
+    развёртывание заполнило бы одну, а запрос ушёл бы с другой.
+    """
+
+    def __init__(self, bot: BotClient, *, http_client: httpx.Client | None = None) -> None:
+        # Аргумент важнее умолчания: так тест подставляет транспорт и не зависит
+        # от сети. Порядок тот же, что у `BotClient(client=...)`.
+        self.bot = bot
+        self._http = http_client or httpx.Client(
+            base_url=bot.base_url,
+            timeout=httpx.Timeout(
+                DEFAULT_TOTAL_TIMEOUT,
+                connect=DEFAULT_CONNECT_TIMEOUT,
+                read=DEFAULT_READ_TIMEOUT,
+            ),
+        )
+
+    # ---------- то, что зовут роуты ----------
+
+    def find_by_id(self, account_id: int) -> Account | None:
+        """Аккаунт по `id` (`GET /internal/accounts/{id}`) или `None`.
+
+        `404 account_not_found` — это «аккаунта нет», а не сбой: экран на него
+        гасит сессию и ведёт на вход. Отличать «не найден» от «бот сломался»
+        обязательно — иначе расхождение состояния показывалось бы 500, а
+        недоступность бота молча выглядела бы как «аккаунт удалён».
+        """
+        try:
+            data = self._get(f"{BOT_PATH}/accounts/{account_id}")
+        except BotError as exc:
+            if exc.code == "account_not_found" or exc.status == 404:
+                return None
+            raise
+        account = data.get("account")
+        return _account_from_api(account) if account else None
+
+    def subscriptions_for(self, account_id: int) -> list[Subscription]:
+        """Подписки аккаунта в форме ответа бота.
+
+        Возвращаются сырые записи, а не представления: «истекла ли» и «сколько
+        осталось» решает `subscriptions`, и второй копии этих правил здесь быть
+        не должно. Пустой список — норма: «подписок нет» это состояние экрана
+        (W4.3), а не отказ.
+        """
+        data = self._get(f"{BOT_PATH}/accounts/{account_id}/subscriptions")
+        return [Subscription.from_api(item) for item in data.get("subscriptions", [])]
+
+    def get_balance(self, account_id: int) -> Balance:
+        """Накопленный кредит. Отсутствие Telegram — `BotError` с кодом
+        `telegram_required`, который вызывающий отличает от нуля."""
+        return Balance.from_api(self._get(f"{BOT_PATH}/accounts/{account_id}/balance"))
+
+    def get_referral(self, account_id: int) -> Referral:
+        """Реферальная программа. Без Telegram — тот же `telegram_required`."""
+        return Referral.from_api(self._get(f"{BOT_PATH}/accounts/{account_id}/referral"))
+
+    def unlink_preview(self, account_id: int, method: str) -> UnlinkPreview:
+        """Что потеряется при отвязке `method` (`mail` | `telegram`).
+
+        Синхронный, в отличие от одноимённого метода `BotClient`: экран способов
+        входа синхронный, а число затронутых конфигов знает только бот (§4а).
+        """
+        data = self._get(
+            f"{BOT_PATH}/accounts/{account_id}/unlink-preview", params={"method": method}
+        )
+        return UnlinkPreview.from_api(data)
+
+    # ---------- транспорт ----------
+
+    def _headers(self) -> dict[str, str]:
+        # Тот же заголовок и тот же секрет, что у живого клиента, — берутся из
+        # одного места (`BotClient._headers`), чтобы разойтись им было негде.
+        return self.bot._headers()
+
+    def _get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Один синхронный запрос: сеть, статус, разбор отказа.
+
+        Разбор ошибок общий с `BotClient` (`_error_from_response`): формат отказа
+        — часть контракта бота, и вторая его копия разошлась бы с первой ровно
+        там, где ошибку и надо различать по коду.
+        """
+        try:
+            response = self._http.request("GET", path, headers=self._headers(), **kwargs)
+        except _NETWORK_ERRORS as exc:
+            raise BotUnreachable(
+                f"запрос к боту не удался: {exc.__class__.__name__}", cause=exc
+            ) from exc
+
+        if response.status_code >= 400:
+            raise _error_from_response(response)
+        if not response.content:
+            return {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BotError(
+                "invalid_response", "бот вернул не-JSON", status=response.status_code
+            ) from exc
+        if not isinstance(payload, dict):
+            raise BotError("invalid_response", "бот вернул не объект", status=response.status_code)
+        return payload
 
 
 def _error_from_response(response: httpx.Response) -> BotError:

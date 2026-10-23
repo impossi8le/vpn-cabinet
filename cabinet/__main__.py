@@ -6,7 +6,8 @@
 одной и явной, а не лежала на уровне модуля как побочный эффект импорта.
 
 Зависимости здесь **боевые** и берутся из окружения: хранилище — `BotClient` к
-внутреннему роутеру бота, отправитель писем — по конфигу почты. Умолчания
+внутреннему роутеру бота в синхронной форме `BotStore`, отправитель писем — по
+конфигу почты. Умолчания
 `build_app` (подставной бот и подставная почта) оставлены тестам и стенду
 (`.claude/dev/cabinet_dev.py`) и в боевой запуск не попадают: иначе выложенный
 кабинет вошёл бы любым адресом и показал подписки из фикстур (issue #45).
@@ -32,7 +33,13 @@ import uvicorn
 from fastapi import FastAPI
 
 from cabinet.app import build_app
-from cabinet.bot_client import BOT_BASE_URL_ENV, BOT_SECRET_ENV, BotClient, BotConfigError
+from cabinet.bot_client import (
+    BOT_BASE_URL_ENV,
+    BOT_SECRET_ENV,
+    BotClient,
+    BotConfigError,
+    BotStore,
+)
 from cabinet.mail_sender import MailConfigError, MailSender
 
 # Интерфейс и порт по умолчанию. Порт — настройка развёртывания, поэтому
@@ -67,13 +74,21 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
     хранилище `BotClient` по `BOT_BASE_URL` и общему секрету, отправитель писем
     по конфигу почты. Подставные зависимости сюда не передаются ни одним путём.
 
+    Клиент заворачивается в `BotStore` — синхронную форму того же клиента
+    (issue #46). Иначе выложенный кабинет отвечал бы 500 на первых двух экранах:
+    роуты синхронные, а у `BotClient` нужных им методов нет, его методы —
+    корутины. Конфигурация при этом остаётся общей: адаптер берёт адрес и секрет
+    у того же клиента, а не собирает второй.
+
     Параметр `env` — шов для теста, как у `MailSender.from_env`: без него
     читается настоящее окружение процесса.
     """
     source = os.environ if env is None else env
-    store = BotClient(
-        base_url=_required(source, BOT_BASE_URL_ENV, "адрес бота"),
-        secret=_required(source, BOT_SECRET_ENV, "общий секрет"),
+    store = BotStore(
+        BotClient(
+            base_url=_required(source, BOT_BASE_URL_ENV, "адрес бота"),
+            secret=_required(source, BOT_SECRET_ENV, "общий секрет"),
+        )
     )
     return build_app(store=store, mail_sender=MailSender.from_env(source))
 

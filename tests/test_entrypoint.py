@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 from cabinet.__main__ import build_from_env, main
-from cabinet.bot_client import SECRET_HEADER, BotClient, BotConfigError
+from cabinet.bot_client import SECRET_HEADER, BotClient, BotConfigError, BotStore
 
 # Адрес бота — loopback: настоящий роутер `/internal/*` живёт там же, наружу не
 # выставлен, а конкретный порт здесь и есть тот, что назван в контракте.
@@ -67,16 +67,23 @@ def test_missing_secret_refuses_to_start():
 
 
 def test_builds_bot_client_from_environment():
-    """С переменными хранилищем становится живой `BotClient`, а не подставной бот."""
+    """С переменными хранилищем становится живой `BotClient`, а не подставной бот.
+
+    Хранилище — `BotStore`, синхронная форма того же клиента (#46): роуты
+    синхронные, и без адаптера экраны отвечали бы 500. Проверяется, что под
+    адаптером лежит именно живой клиент с адресом и секретом из окружения, —
+    иначе выложенный кабинет ходил бы не туда и представлялся не тем секретом.
+    """
     app = build_from_env(FULL_ENV)
     store = app.state.store
 
-    assert isinstance(store, BotClient)
-    assert store.base_url == BOT_URL
+    assert isinstance(store, BotStore)
+    assert isinstance(store.bot, BotClient)
+    assert store.bot.base_url == BOT_URL
     # Секрет доходит до того самого заголовка, которым кабинет представляется
     # боту: проверяется контракт (`SECRET_HEADER`), а не поле объекта — иначе
     # тест закрепил бы внутреннее устройство клиента, а не его поведение.
-    assert store._headers()[SECRET_HEADER] == SECRET
+    assert store.bot._headers()[SECRET_HEADER] == SECRET
 
 
 def test_process_refuses_and_exits_nonzero_without_environment(monkeypatch, capsys):
