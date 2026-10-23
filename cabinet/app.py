@@ -200,10 +200,14 @@ class _StoreConfigSource:
 LOGIN_MAIL_ERROR = "Не удалось отправить код на этот адрес. Проверьте адрес и попробуйте ещё раз."
 # Код не принят: не запрашивался, истёк, не совпал или попытки исчерпаны.
 # Для человека это одно действие — ввести код заново (см. `signin.MailSignInError`).
-LOGIN_CODE_ERROR = "Код не подошёл. Проверьте цифры из письма и попробуйте ещё раз."
+# Имя без `LOGIN_`: текст обслуживает оба экрана с кодом — вход и привязку
+# почты, — и `LOGIN_` на втором вводило бы в заблуждение.
+CODE_ERROR = "Код не подошёл. Проверьте цифры из письма и попробуйте ещё раз."
 # Повторная отправка подряд отвергнута лимитом. Число секунд подставляется:
-# «попробуйте через минуту» без числа не подсказывает, сколько ждать.
-LOGIN_RATE_LIMIT = "Слишком часто. Повторите через {seconds} с."
+# «попробуйте через минуту» без числа не подсказывает, сколько ждать. Общий для
+# входа и привязки по той же причине, что и `CODE_ERROR`: лимит один и тот же
+# (`AuthMail`), и экранов у него два.
+RATE_LIMIT_ERROR = "Слишком часто. Повторите через {seconds} с."
 # Адрес пуст или не указан — форма вернулась как есть.
 LOGIN_MAIL_REQUIRED = "Укажите адрес почты."
 # Сбой подписки: список не получен, а не «подписок нет». Пустой список — это
@@ -245,12 +249,6 @@ UNLINK_DONE_MAIL = "Почта отвязана."
 LINK_TELEGRAM_BOT_FLOW = (
     "Привязка Telegram идёт через бота сервиса: откройте бота и подтвердите вход. "
     "После подтверждения Telegram появится здесь привязанным."
-)
-# Код подтверждения почты в разметке экрана привязки пока некуда ввести: форма
-# экрана отправляет только адрес. Об этом говорится прямо, чтобы «код отправлен»
-# не читалось как тупик по вине человека.
-LINK_MAIL_CODE_STEP_PENDING = (
-    "Ввод кода на этом экране ещё не подключён — подтверждение адреса завершается в боте."
 )
 
 # Экран входа через Telegram: ссылка на бота ещё не готова. Тот же честный
@@ -387,7 +385,7 @@ def _add_login_routes(
             signin.request_mail_code(address)
         except RateLimited as exc:
             return _redirect_login_error(
-                LOGIN_RATE_LIMIT.format(seconds=exc.retry_after_seconds), mail=address
+                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds), mail=address
             )
         except (SignInError, AuthMailError):
             # Один текст на «адрес пуст», «письмо не ушло» и прочие отказы: не
@@ -417,7 +415,7 @@ def _add_login_routes(
         try:
             result = signin.sign_in_with_mail(mail, code)
         except MailSignInError:
-            return _redirect_waiting_error(LOGIN_CODE_ERROR, mail=mail)
+            return _redirect_waiting_error(CODE_ERROR, mail=mail)
         except SignInError:
             # Не отказ кода, а расхождение состояния — тот же экран, но текст
             # про сбой, а не про цифры.
@@ -458,7 +456,7 @@ def _add_login_routes(
             signin.request_mail_code(address)
         except RateLimited as exc:
             return _redirect_waiting_error(
-                LOGIN_RATE_LIMIT.format(seconds=exc.retry_after_seconds), mail=address
+                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds), mail=address
             )
         except (SignInError, AuthMailError):
             return _redirect_waiting_error(LOGIN_MAIL_ERROR, mail=address)
@@ -788,15 +786,19 @@ def _add_account_routes(
 
         Почта не привязывается «по заявлению»: `Linking.link_mail` требует
         подтверждённый кодом адрес. Здесь делается только первый шаг — код уходит
-        на адрес. Завершение (ввод кода) в разметке экрана привязки пока не
-        подключено, и об этом сказано прямо, а не изображено кнопкой в никуда.
+        на адрес, — а экран после него держит шаг ввода: показать форму адреса
+        снова значило бы не принять код, который уже отправлен (issue #44).
+
+        Адрес нормализуется, как на входе (`signin._normalize_mail`): запись на
+        `User@Example.com` разошлась бы с входом, который ищет
+        `user@example.com`, и человек завёл бы второй аккаунт на тот же ящик.
         """
         resolved = _account(request)
         if resolved is None:
             return RedirectResponse("/login", status_code=303)
         account, _ = resolved
 
-        address = mail.strip()
+        address = mail.strip().lower()
         if not address:
             return _render(
                 account,
@@ -807,7 +809,19 @@ def _add_account_routes(
         try:
             signin = app.state.signin
             signin.request_mail_code(address)
-        except SignInError:
+        except RateLimited as exc:
+            # `RateLimited` — подкласс `AuthMailError`, и ветка обязана стоять
+            # выше неё: иначе «слишком часто» свелось бы к общему отказу и
+            # потеряло срок ожидания. Адрес остаётся в шаге — код из первого
+            # письма всё ещё действует, и терять шаг нельзя, поэтому
+            # `mail_pending`, а не возврат к форме адреса.
+            return _render(
+                account,
+                error=RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
+                mail_pending=address,
+                unlink_previews=_previews(account) or None,
+            )
+        except (SignInError, AuthMailError):
             return _render(
                 account,
                 error=LINK_REFUSED_ERROR,
@@ -816,8 +830,9 @@ def _add_account_routes(
 
         return _render(
             account,
-            notice=LINK_MAIL_CODE_SENT.format(mail=address) + " " + LINK_MAIL_CODE_STEP_PENDING,
+            notice=LINK_MAIL_CODE_SENT.format(mail=address),
             notice_tone=Tone.PROCESS.value,
+            mail_pending=address,
             unlink_previews=_previews(account) or None,
         )
 

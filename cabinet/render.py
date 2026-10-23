@@ -40,6 +40,7 @@ __all__ = [
     "CSS_FILE",
     "CSS_URL",
     "LINK_MAIL_ACTION",
+    "LINK_MAIL_CONFIRM_ACTION",
     "LINK_TELEGRAM_ACTION",
     "STATIC_DIR",
     "TELEGRAM_ATTEMPTS_EXCEEDED",
@@ -238,6 +239,11 @@ def render_login_telegram(
 # значения по умолчанию, чтобы экран можно было отрендерить без роутера (тесты).
 LINK_TELEGRAM_ACTION = "/account/link/telegram"
 LINK_MAIL_ACTION = "/account/link/mail"
+# Приём кода, отправленного на адрес: отдельный шаг привязки почты, а не тот же
+# адрес с признаком. Один адрес на «выслать» и «проверить» не различить без
+# скрытого поля-признака, и тогда отправку кода нельзя было бы повторить, не
+# рискуя заодно проверить его.
+LINK_MAIL_CONFIRM_ACTION = "/account/link/mail/confirm"
 UNLINK_TELEGRAM_ACTION = "/account/unlink/telegram"
 UNLINK_MAIL_ACTION = "/account/unlink/mail"
 
@@ -587,9 +593,11 @@ def render_linking(
     error: str | None = None,
     notice: str | None = None,
     notice_tone: str = "neutral",
+    mail_pending: str | None = None,
     unlink_previews: dict[str, object] | None = None,
     link_telegram_action: str = LINK_TELEGRAM_ACTION,
     link_mail_action: str = LINK_MAIL_ACTION,
+    link_mail_confirm_action: str = LINK_MAIL_CONFIRM_ACTION,
     unlink_telegram_action: str = UNLINK_TELEGRAM_ACTION,
     unlink_mail_action: str = UNLINK_MAIL_ACTION,
 ) -> str:
@@ -598,6 +606,14 @@ def render_linking(
     Отвязка предлагается только там, где после неё останется второй способ:
     кнопка «отвязать» у единственного входа вела бы к недоступному навсегда
     аккаунту (§8). Экран не даёт нажать то, что всё равно будет отвергнуто.
+
+    `mail_pending` — адрес, на который код уже отправлен, но ещё не подтверждён.
+    `None` значит «шага ввода ещё нет», и карточка почты показывает форму
+    адреса. Заданный адрес переключает карточку на шаг ввода кода: показать
+    форму адреса после отправки значило бы попросить адрес второй раз, а
+    отправленный код проверить нечем. Адрес здесь нужен ещё и потому, что
+    человек должен видеть, на **какой** ящик ушло письмо, — он мог ввести
+    другой.
 
     `unlink_previews` — по записи на способ (`mail`/`telegram`) с числом
     затронутых конфигов и остающимся ключом, как их отдаёт бот (§4а). Экран
@@ -617,6 +633,7 @@ def render_linking(
         mail_linked=mail_linked,
         telegram_id=_mask_telegram(account.chat_id) if account.chat_id is not None else None,
         mail=account.mail,
+        mail_pending=mail_pending,
         can_link_telegram=account.can_link_telegram(),
         can_link_mail=account.can_link_mail(),
         # Отвязка возможна, только если останется другой способ входа.
@@ -626,6 +643,7 @@ def render_linking(
         unlink_telegram_note=notes.get("telegram"),
         link_telegram_action=link_telegram_action,
         link_mail_action=link_mail_action,
+        link_mail_confirm_action=link_mail_confirm_action,
         unlink_telegram_action=unlink_telegram_action,
         unlink_mail_action=unlink_mail_action,
     )

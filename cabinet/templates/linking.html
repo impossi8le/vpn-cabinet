@@ -72,6 +72,34 @@
     <p class="sub-unusable">Это единственный способ входа. Сначала привяжите Telegram — без него отвязывать почту нельзя.</p>
     {%- endif %}
   {% else %}
+    {%- if mail_pending %}
+    {# Код отправлен, но адрес ещё не подтверждён — карточка держит шаг ввода,
+       а не возвращает форму адреса: второй ввод адреса не проверил бы код, а
+       отправленный код остался бы некуда ввести (issue #44). Адрес показан
+       потому, что человек мог ввести другой ящик и должен видеть, куда ушло
+       письмо. #}
+    <p class="sub-note">Код отправлен на <b class="mono">{{ mail_pending }}</b>. Введите его из письма, чтобы подтвердить адрес.</p>
+    <form method="post" action="{{ link_mail_confirm_action }}">
+      <input type="hidden" name="mail" value="{{ mail_pending }}">
+      <label class="field-label" for="code">Код из письма</label>
+      {# Поле кода — как на экране ожидания входа (`login_waiting.html`):
+         `pattern` отсекает нецифры при отправке, а `inputmode` даёт цифровую
+         клавиатуру на телефоне. Скрипт оттуда не переносим: второй его копии
+         в шаблоне быть не должно, а `pattern` уже держит форму. #}
+      <input class="field" id="code" name="code" type="text" inputmode="numeric"
+             autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"
+             autofocus required>
+      <button class="btn btn-p btn-sm" type="submit">Подтвердить</button>
+    </form>
+    {# Повтор — отдельная форма на отправку, с тем же адресом в скрытом поле:
+       человек шлёт письмо заново, а не вводит адрес. Тот же адрес едет, потому
+       что код хранится по адресу, и повтор на переписанный ящик выдал бы код
+       не тому, кто ждёт. #}
+    <form method="post" action="{{ link_mail_action }}">
+      <input type="hidden" name="mail" value="{{ mail_pending }}">
+      <button class="btn btn-g btn-sm" type="submit">Отправить код ещё раз</button>
+    </form>
+    {%- else %}
     <p class="sub-note">Привяжите почту — на неё придёт код подтверждения. Без него адрес не считается вашим.</p>
     <form method="post" action="{{ link_mail_action }}">
       <label class="field-label" for="link-mail">Почта</label>
@@ -79,6 +107,7 @@
              autocomplete="email" required>
       <button class="btn btn-p btn-sm" type="submit">Получить код</button>
     </form>
+    {%- endif %}
   {% endif %}
 </div>
 
