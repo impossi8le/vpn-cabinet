@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cabinet.accounts import Account
 from cabinet.auth_mail import AuthMail, AuthMailError, RateLimited
-from cabinet.bot_client import Balance, BotError, Referral
+from cabinet.bot_client import Balance, BotError, BotUnreachable, Referral
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -109,6 +109,10 @@ def _account_money(
     бот говорит, что у аккаунта нет Telegram, в кабинете нельзя рисовать `0 ₽`:
     ноль читался бы как «вам ничего не начислили», хотя сумма просто неизвестна.
     Это состояние называется текстом, а не значением.
+
+    Недоступность бота (`BotUnreachable`) здесь — тот же «показать нечего», что и
+    `BotError`: деньги человека — необязательный блок, и рушить из-за них экран
+    подписок значило бы прятать от человека то, что работает (issue #49).
     """
     get_balance = getattr(store, "get_balance", None)
     get_referral = getattr(store, "get_referral", None)
@@ -120,9 +124,11 @@ def _account_money(
         if exc.code == "telegram_required":
             return None, None, True
         return None, None, False
+    except BotUnreachable:
+        return None, None, False
     try:
         referral = get_referral(account_id)
-    except BotError:
+    except (BotError, BotUnreachable):
         referral = None
     return balance, referral, False
 
@@ -220,6 +226,22 @@ LOGIN_MAIL_REQUIRED = "Укажите адрес почты."
 # отдельное честное состояние (W4.3), и путать его со сбоем нельзя.
 SUBSCRIPTIONS_ERROR = "Не удалось получить список подписок. Обновите страницу позже."
 
+# Бот недоступен — и это **не** то же, что «аккаунта нет» (issue #49). Сеть,
+# таймаут, обрыв: `BotUnreachable` приходит на любом запросе к боту, а бот
+# авторитетен — без него кабинет на время ослеп. Текст у этих экранов один
+# (способы входа, скачивание): причина у них одна, и разные формулировки одной
+# недоступности наводили бы на мысль о разных сбоях. Сессию отсюда не гасят
+# никогда: человек никуда не выходил, и уводить его на вход значило бы выдать
+# сбой сети за расхождение состояния.
+BOT_UNREACHABLE_ERROR = "Сервис сейчас не отвечает, данные не получены. Обновите страницу позже."
+
+# Бот недоступен на **входе**, и текст здесь свой — не по недосмотру. Код к этому
+# моменту уже проверен и погашен (он одноразовый, `AuthMail.verify`), поэтому
+# «обновите страницу» посоветовало бы ввести использованный код и получить «код
+# не подошёл» за расхождение, которого человек не совершал. Экран возвращает к
+# форме адреса: код надо запросить заново, и адрес на ней уже подставлен.
+LOGIN_BOT_UNREACHABLE = "Сервис сейчас не отвечает. Запросите код заново чуть позже."
+
 # Скачивание по адресу, за которым нет подписки аккаунта. Тот же приём, что у
 # «нет конфига / чужой конфиг» в `configs`: различить их снаружи нечем, значит,
 # и тексты у них одни — иначе перебором `subscription_id` выяснялось бы, у кого
@@ -273,6 +295,25 @@ LOGIN_TELEGRAM_NOT_READY = "Ссылка на вход через Telegram ещ�
 LOGIN_TELEGRAM_UNAVAILABLE = (
     "Проверка кода из Telegram ещё не подключена в кабинете. Войдите по почте или начните заново."
 )
+
+
+def _unreachable_screen(message: str) -> HTMLResponse:
+    """Честный экран «до бота сейчас не дотянуться» (issue #49).
+
+    Один экран на все роуты, которые читают аккаунт у бота, и намеренно без
+    подробностей о том, какой именно запрос не прошёл: сеть бота, таймаут и обрыв
+    соединения для человека — одно состояние, и различать их на экране значило бы
+    показывать ему внутреннее устройство сервиса.
+
+    Пустой список подписок здесь **не** «подписок нет»: отказ показан текстом
+    (`error`), а честная пустота — это отдельное состояние экрана (W4.3).
+    Спутать их — и недоступность читалась бы как «у вас ничего нет», а человек не
+    пошёл бы обновлять страницу.
+
+    Код ответа — `200`, как у соседних отказов: это состояние экрана, а не ошибка
+    HTTP, и браузер не должен подменять разметку своей страницей отказа.
+    """
+    return HTMLResponse(render_subscriptions([], error=message))
 
 
 def build_app(
@@ -443,6 +484,13 @@ def _add_login_routes(
             # Не отказ кода, а расхождение состояния — тот же экран, но текст
             # про сбой, а не про цифры.
             return _redirect_waiting_error(LOGIN_MAIL_ERROR, mail=mail)
+        except BotUnreachable:
+            # Код верен, а аккаунт прочитать не у кого: `sign_in_with_mail` ищет
+            # его у бота (`find_by_mail`) и там же заводит. Недоступность бота —
+            # не «код не подошёл» и не сбой сервера (#49). На форму входа, а не
+            # на экран кода: код уже погашен проверкой, и держать поле ввода
+            # значило бы предложить ввести то, что не примут (`LOGIN_BOT_UNREACHABLE`).
+            return _redirect_login_error(LOGIN_BOT_UNREACHABLE, mail=mail)
 
         response = RedirectResponse("/subscriptions", status_code=303)
         _set_session_cookie(response, result.session.token)
@@ -584,7 +632,14 @@ def _add_subscription_routes(
         if view is None:
             return RedirectResponse("/login", status_code=303)
 
-        account = store.find_by_id(view.account_id)
+        try:
+            account = store.find_by_id(view.account_id)
+        except BotUnreachable:
+            # Бот не ответил — это не «аккаунта нет»: сессия цела, кабинет на
+            # время ослеп. Тот же экран, что у соседнего `subscriptions_for`
+            # (#49): код ответа 200 и текст, а не страница сбоя сервера, и
+            # **без** гашения сессии — выйти человек не пытался.
+            return _unreachable_screen(SUBSCRIPTIONS_ERROR)
         if account is None:
             # Аккаунт исчез при живой сессии — расхождение состояния. Гасим
             # сессию и уводим на вход: подписок показывать не от кого.
@@ -649,6 +704,13 @@ def _add_subscription_routes(
                 config_id=subscription_id,
                 subscription=chosen,
             )
+        except BotUnreachable:
+            # Бот не ответил на запрос профиля — отказ не по логике, и конфига
+            # из него взяться не может. Это не «конфиг не найден» (`ConfigError`
+            # ниже, отказ на карточке) и не 500: скачивание просто не состоялось,
+            # и повторить его надо позже (#49). Список уже получен — экран
+            # показывается тот же, с текстом вместо файла.
+            return HTMLResponse(render_subscriptions(views, error=BOT_UNREACHABLE_ERROR))
         except ConfigError as exc:
             return _config_refusal_screen(store, view.account_id, views, exc, subscription_id)
 
@@ -735,15 +797,31 @@ def _add_account_routes(
     честно говорит «откройте бота», а не изображает успех.
     """
 
-    def _account(request: Request) -> tuple[Account, str] | None:
-        """Аккаунт по сессии и её токен. `None` — сессии нет, нужен редирект."""
+    def _account(request: Request) -> tuple[Account, str] | Response:
+        """Аккаунт по сессии и её токен — либо **готовый ответ**, если аккаунта нет.
+
+        Исходов три, и свести их к двум нельзя (#49):
+
+        - сессии нет — на вход (`RedirectResponse`);
+        - аккаунт исчез (`404 account_not_found`) — тем же редиректом, но **с
+          гашением сессии**: подписок и способов входа показывать не от кого;
+        - бот недоступен (`BotUnreachable`) — экран с отказом и **живой сессией**:
+          кабинет на время ослеп, а человек никуда не выходил.
+
+        Ответ отдаётся отсюда, а не исключением: у всех роутов этого блока первое
+        действие — «взять аккаунт», и решение «что показать вместо него» обязано
+        быть в одном месте, иначе одна ручка однажды осталась бы без него.
+        """
         view = sessions.resolve(request.cookies.get(COOKIE_NAME))
         if view is None:
-            return None
-        account = store.find_by_id(view.account_id)
+            return RedirectResponse("/login", status_code=303)
+        try:
+            account = store.find_by_id(view.account_id)
+        except BotUnreachable:
+            return _unreachable_screen(BOT_UNREACHABLE_ERROR)
         if account is None:
             sessions.sign_out(request.cookies.get(COOKIE_NAME))
-            return None
+            return RedirectResponse("/login", status_code=303)
         return account, request.cookies.get(COOKIE_NAME) or ""
 
     def _previews(account: Account) -> dict[str, object]:
@@ -787,8 +865,8 @@ def _add_account_routes(
         возвращает экран к форме адреса.
         """
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
         return _render(
             account,
@@ -806,8 +884,8 @@ def _add_account_routes(
         сторожит §3.3. Поэтому экран честно отправляет открыть бота.
         """
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
         return _render(
             account,
@@ -830,8 +908,8 @@ def _add_account_routes(
         `user@example.com`, и человек завёл бы второй аккаунт на тот же ящик.
         """
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
 
         address = mail.strip().lower()
@@ -903,8 +981,8 @@ def _add_account_routes(
         из хранилища), а не из прежнего чтения: показать надо то, что записано.
         """
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
 
         address = mail.strip().lower()
@@ -930,6 +1008,15 @@ def _add_account_routes(
                 mail_pending=address,
                 unlink_previews=_previews(account) or None,
             )
+        except BotUnreachable:
+            # Связывание читает аккаунт и занятое место у бота — сбой на этих
+            # чтениях (или на самой записи) значит «не дозвонились», а не «почта
+            # занята»: показать общий отказ привязки значило бы свалить на
+            # человека сбой сети (#49). Код при этом **не** погашен: связывание
+            # читает аккаунт раньше, чем проверяет код (`Linking.link_mail`), а
+            # адрес остаётся в шаге (`PendingMail`) — когда бот ответит, ввод
+            # кода вернётся на экран, и просить письмо заново не придётся.
+            return _unreachable_screen(BOT_UNREACHABLE_ERROR)
 
         # Адрес привязан — шаг кода закончен. На отказах выше адрес **не**
         # забывается: код ещё живой, и человеку нужно поле, чтобы повторить
@@ -947,8 +1034,8 @@ def _add_account_routes(
         обязан быть видимым здесь, а не только спрятанным в вёрстке.
         """
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
         return _do_unlink(
             account,
@@ -963,8 +1050,8 @@ def _add_account_routes(
     def unlink_mail_action(request: Request) -> Response:
         """Отвязка почты. Симметрично отвязке Telegram."""
         resolved = _account(request)
-        if resolved is None:
-            return RedirectResponse("/login", status_code=303)
+        if isinstance(resolved, Response):
+            return resolved
         account, _ = resolved
         return _do_unlink(
             account,
@@ -995,11 +1082,19 @@ def _do_unlink(
 
     `previews` пересчитывается вызывающим **после** отвязки: остаток способов
     изменился, и прежние последствия уже не про это состояние.
+
+    Недоступность бота (`BotUnreachable`) — не отказ человека и не запрет: отвязка
+    читает аккаунт перед записью, и между этими двумя запросами бот может
+    перестать отвечать (#49). Экран говорит «повторите позже», а не «не удалось
+    отвязать» (причина не в том, что человек что-то сделал не так) и тем более не
+    показывает сбой сервера. Подтвердить исход отсюда нельзя: запись могла и
+    пройти, а узнать об этом не у кого, — поэтому и успеха здесь не рисуется.
     """
     if account.id is None:
         raise RuntimeError("аккаунт без id: хранилище не записало его")
     try:
         result = unlink(account.id)
+        updated = getattr(result, "account", None) or store.find_by_id(account.id) or account
     except UnlinkRefused:
         return render(
             account,
@@ -1012,6 +1107,7 @@ def _do_unlink(
             error=LINK_REFUSED_ERROR,
             unlink_previews=previews or None,
         )
+    except BotUnreachable:
+        return _unreachable_screen(BOT_UNREACHABLE_ERROR)
 
-    updated = getattr(result, "account", None) or store.find_by_id(account.id) or account
     return render(updated, notice=success)
