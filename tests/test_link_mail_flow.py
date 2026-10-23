@@ -32,11 +32,13 @@ from fastapi.testclient import TestClient
 
 from cabinet.accounts import Account
 from cabinet.app import LINK_REFUSED_ERROR, build_app
+from cabinet.auth_mail import MAX_ATTEMPTS
 from cabinet.mail_sender import MailSender
 from tests.fakes import FakeApi, FakeMailSender
 
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
 CHAT_ID = 123_456_789
+OTHER_CHAT_ID = 987_654_321
 # Адрес, который привязывается в большинстве тестов. Он не совпадает ни с одним
 # адресом из фикстур: привязка «своего» адреса проверяла бы меньше.
 NEW_MAIL = "new@example.com"
@@ -323,3 +325,65 @@ def test_confirming_without_session_redirects_to_login(
     # показали». Без этой строки тест зеленел бы и на роуте, который успевает
     # записать почту, а потом уводит на вход.
     assert fake_api.find_by_id(account.id).mail is None
+
+
+# --- 5. возврат на экран не теряет шаг кода ------------------------------
+
+
+def test_returning_to_the_screen_keeps_the_code_step(
+    client: TestClient, sender: FakeMailSender, fake_api: FakeApi
+) -> None:
+    """Человек ушёл в почту и вернулся — поле кода на месте, пока код действует.
+
+    Экран с полем кода был **одноразовым ответом** на отправку: стоило уйти на
+    `/account` обычным GET (а возвращаются из ящика именно так), и поля не
+    оставалось, хотя код лежал в письме и действовал. Человек с письмом на руках
+    оставался без шага, ради которого письмо и просил.
+    """
+    _signed_in_telegram_only(client, fake_api)
+    _code_for(client, sender, NEW_MAIL)
+
+    html = client.get("/account").text
+
+    assert 'name="code"' in html
+    assert NEW_MAIL in html
+
+
+def test_dead_code_brings_back_the_address_form(
+    client: TestClient, sender: FakeMailSender, fake_api: FakeApi
+) -> None:
+    """Погасший код не оставляет поля: оно обещало бы шаг, которого уже нет.
+
+    Пара к предыдущему тесту. Код гасится неверными попытками — тем же путём,
+    что у человека с опечатками, — и после этого на экране снова форма адреса:
+    новый код просят заново, а поле для погасшего не рисуется.
+    """
+    _signed_in_telegram_only(client, fake_api)
+    real = _code_for(client, sender, NEW_MAIL)
+    for _ in range(MAX_ATTEMPTS):
+        _confirm(client, NEW_MAIL, _wrong_code(real))
+
+    html = client.get("/account").text
+
+    assert 'name="code"' not in html
+    assert "Получить код" in html
+
+
+def test_pending_code_address_is_not_shown_to_another_account(
+    client: TestClient, sender: FakeMailSender, fake_api: FakeApi
+) -> None:
+    """Чужой аккаунт не видит, какой адрес просил код: память привязана к аккаунту.
+
+    Иначе, войдя вторым аккаунтом, человек прочитал бы на экране адрес, который
+    вводил предыдущий, — а это уже чужие данные на экране.
+    """
+    _signed_in_telegram_only(client, fake_api)
+    _code_for(client, sender, NEW_MAIL)
+
+    other = fake_api.create_account(chat_id=OTHER_CHAT_ID)
+    client.cookies.set(_COOKIE, client.app_state.sessions.sign_in(other.id).token)  # type: ignore[attr-defined]
+
+    html = client.get("/account").text
+
+    assert NEW_MAIL not in html
+    assert 'name="code"' not in html
