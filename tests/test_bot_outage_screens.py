@@ -49,6 +49,7 @@ from cabinet.app import (
 )
 from cabinet.bot_client import SECRET_HEADER, BotClient, BotStore
 from cabinet.mail_sender import MailSender
+from cabinet.render import render_subscriptions
 from tests.fakes import STATUS_ACTIVE, FakeApi, FakeMailSender, FakeSubscription
 
 # Адрес бота — loopback: настоящий роутер `/internal/*` живёт там же, наружу не
@@ -59,6 +60,10 @@ NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 MAIL = "user@example.com"
 CHAT_ID = 123_456_789
 SUBSCRIPTION_NAME = "Нидерланды · Амстердам"
+
+# Карточка честной пустоты (W4.3). Ищем именно её заголовок: он и есть
+# утверждение «список пуст», которое при отказе было бы неправдой.
+EMPTY_LIST_CARD = "Подписок нет"
 
 # Подставное содержимое профиля. Настоящего `.ovpn` здесь не будет никогда:
 # адрес сервера и ключ — это то, чего в публичном репозитории быть не должно.
@@ -134,9 +139,14 @@ class FlakyBot:
             # проверяется отказ, а не успех (успех — предмет соседних файлов).
             return _error("not_found", 404)
 
-        account = self.api.find_by_id(int(parts[2])) if len(parts) >= 3 else None
+        account = self._lookup(request, parts)
         if account is None or account.id in self.forget:
             return _error("account_not_found", 404)
+
+        if not parts[2].isdigit():
+            # Поиск по почте или по Telegram id (§1): ответ — аккаунт целиком.
+            # Нужен связыванию: занятое место оно выясняет именно так.
+            return httpx.Response(200, json={"account": _account_json(account)})
 
         rest = parts[3:]
         if not rest:
@@ -165,6 +175,20 @@ class FlakyBot:
                 200, content=FAKE_BODY, headers={"content-type": "application/x-openvpn-profile"}
             )
         return _error("not_found", 404)
+
+    def _lookup(self, request: httpx.Request, parts: list[str]) -> Account | None:
+        """Найти аккаунт так же, как его нашёл бы бот: по id, почте или Telegram id.
+
+        Три пути — три способа спросить об одном и том же (`find_by_id`,
+        `find_by_mail`, `find_by_chat_id`), и связывание спрашивает всеми тремя.
+        """
+        if len(parts) == 3 and parts[2] == "by-mail":
+            return self.api.find_by_mail(request.url.params["mail"])
+        if len(parts) == 3 and parts[2] == "by-chat-id":
+            return self.api.find_by_chat_id(int(request.url.params["chat_id"]))
+        if len(parts) >= 3 and parts[2].isdigit():
+            return self.api.find_by_id(int(parts[2]))
+        return None
 
     @staticmethod
     def _action(method: str, parts: list[str]) -> str:
@@ -206,15 +230,20 @@ def _app_over(bot: FlakyBot, sender: FakeMailSender | None = None):
     )
 
 
-def _entered_over(bot: FlakyBot, account_id: int) -> TestClient:
+def _entered_over(
+    bot: FlakyBot, account_id: int, sender: FakeMailSender | None = None
+) -> TestClient:
     """Клиент приложения, вошедший аккаунтом.
 
     Сессия выдаётся **при живом боте**: дальше тесты его гасят, а вход уже
     состоялся. Подставлять cookie вручную нельзя — подставленный cookie не
     отличить от поддельного, и «сессия пережила сбой» проверялось бы на сессии,
     которой в хранилище нет.
+
+    `sender` нужен проверкам с почтой: код тест достаёт из подставного ящика, как
+    его достал бы человек из письма, — а не из внутренностей `AuthMail`.
     """
-    app = _app_over(bot)
+    app = _app_over(bot, sender)
     client = TestClient(app, raise_server_exceptions=False)
     client.cookies.set(COOKIE_NAME, app.state.sessions.sign_in(account_id).token)
     client.app_state = app.state  # type: ignore[attr-defined]
@@ -242,10 +271,13 @@ def _subscribed_account() -> tuple[FakeApi, Account, FakeSubscription]:
 def test_subscriptions_screen_survives_a_bot_outage() -> None:
     """Бот не отвечает — экран с текстом отказа, а не 500, и сессия цела (#49).
 
-    Три утверждения, и все три обязательны. Код ответа отделяет этот дефект от
-    страницы сбоя сервера; текст говорит человеку, что делать; а сохранность
-    сессии отделяет недоступность бота от «аккаунта нет» — за недоступность
-    выкидывать из кабинета нельзя, человек никуда не выходил.
+    Утверждений четыре, и все обязательны. Код ответа отделяет этот дефект от
+    страницы сбоя сервера; текст говорит человеку, что делать; сохранность сессии
+    отделяет недоступность бота от «аккаунта нет»; а отсутствие «Подписок нет» —
+    отделяет **неизвестный** список от **известного пустого**: пустой список,
+    переданный в разметку, нарисовал бы рядом с отказом ещё и карточку
+    «Подписок нет», и человек прочёл бы «у вас ничего нет» вместо «повторите
+    позже» (см. `test_refusal_screen_does_not_claim_there_are_no_subscriptions`).
     """
     api, account, _ = _subscribed_account()
     bot = FlakyBot(api)
@@ -257,6 +289,7 @@ def test_subscriptions_screen_survives_a_bot_outage() -> None:
 
     assert response.status_code == 200
     assert SUBSCRIPTIONS_ERROR in response.text
+    assert EMPTY_LIST_CARD not in response.text
     # Отказной экран не трогает cookie сессии: гасят её только на «аккаунта нет».
     assert "set-cookie" not in response.headers
     # Сессия жива — и в хранилище сессий, и на следующем запросе.
@@ -308,9 +341,14 @@ def test_login_methods_screen_survives_a_bot_outage() -> None:
     assert response.status_code == 200
     assert BOT_UNREACHABLE_ERROR in response.text
     assert client.app_state.sessions.resolve(token) is not None
-    # Ложного состояния на экране нет: ни «привязана», ни «не привязана».
+    # Ложного состояния на экране нет: ни «привязана», ни «не привязана» —
+    # состояние аккаунта кабинету сейчас неизвестно.
     assert "Не привязана" not in response.text
     assert "Не привязан" not in response.text
+    # И списка подписок тоже нет: пустой список здесь означает «неизвестен», а
+    # не «пуст». Рядом с отказом «Подписок нет» было бы утверждением о том,
+    # чего мы не знаем.
+    assert EMPTY_LIST_CARD not in response.text
 
 
 # --- 2. недоступность бота на действиях ------------------------------------
@@ -358,7 +396,78 @@ def test_unlink_survives_a_bot_that_stops_answering_the_write() -> None:
 
     assert response.status_code == 200
     assert BOT_UNREACHABLE_ERROR in response.text
+    assert EMPTY_LIST_CARD not in response.text
     assert client.app_state.sessions.resolve(token) is not None
+
+
+def test_link_mail_confirm_survives_a_bot_outage() -> None:
+    """Шаг кода привязки почты при обрыве: отказ, ничего не привязано, тупика нет.
+
+    Роут подтверждения — второе место, где обрыв доходит до хранилища:
+    `SignInService.link_mail` переводит только отказы `AuthMail`, а
+    `BotUnreachable` из связывания проходит насквозь. Чтение аккаунта бот отдаёт,
+    `link-mail` — уже нет, и это то самое окно, в котором шаг кода остаётся
+    позади, а результата нет.
+
+    Про код здесь нельзя обещать одно и то же: `Linking.link_mail` читает аккаунт,
+    а `AuthMail.verify` вызывается **до** записи (`cabinet/linking.py:243`) и код
+    гасит. Поэтому проверяется не «код цел», а «человек не заперт в шаге с
+    погашенным кодом»: на экран возвращается форма адреса, и новое письмо
+    запрашивается обычным действием. Обещание «наберите прежний код» было бы
+    дефектом — тихим: он вылез бы у человека как «код не подошёл» за сбой сети.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=CHAT_ID)  # только Telegram: почту есть куда привязать
+    bot = FlakyBot(api)
+    sender = FakeMailSender()
+    client = _entered_over(bot, account.id, sender)
+
+    # Код запрашивается при живом боте: шаг привязки его помнит и показывает.
+    step = client.post("/account/link/mail", data={"mail": MAIL}, follow_redirects=False)
+    assert "Код отправлен на" in step.text
+    code = _CODE_RE.search(sender.sent_to(MAIL)[-1]["body"]).group(1)
+
+    bot.offline.add("write")  # запись бота не доходит
+    response = client.post(
+        "/account/link/mail/confirm",
+        data={"mail": MAIL, "code": code},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert BOT_UNREACHABLE_ERROR in response.text
+    assert EMPTY_LIST_CARD not in response.text
+    # Ничего не привязалось: отказ — не «привязано» и не «занято другим».
+    assert api.find_by_id(account.id).mail is None
+
+    # Код израсходован проверкой, поэтому шаг кода снят: человек возвращается к
+    # форме адреса и просит письмо заново, а не набирает то, чего не примут.
+    bot.offline.clear()
+    again = client.get("/account", follow_redirects=False)
+    assert again.status_code == 200
+    assert "Код отправлен на" not in again.text
+    assert "на неё придёт код подтверждения" in again.text
+
+
+def test_refusal_screen_does_not_claim_there_are_no_subscriptions() -> None:
+    """Отказ и «Подписок нет» на одном экране не встречаются (#49).
+
+    Это утверждение про сам рендер, и оно — корень той же находки: экран отказа
+    зовётся с пустым списком (список-то как раз и не получен), а пустой список без
+    отказа рисует честную пустоту (W4.3). Рядом они дают прямое противоречие:
+    «не удалось получить список» и «подписок нет» — про одно и то же, и второе
+    человек читает как ответ, после которого незачем обновлять страницу.
+
+    Обе половины в одном тесте намеренно: правило здесь — **развилка**, и
+    проверять её надо с обеих сторон. Сними развилку или сделай её безусловной —
+    покраснеет один из двух наборов.
+    """
+    refusal = render_subscriptions([], error=SUBSCRIPTIONS_ERROR)
+
+    assert SUBSCRIPTIONS_ERROR in refusal
+    assert EMPTY_LIST_CARD not in refusal
+    # Без отказа пустота остаётся честным состоянием экрана (W4.3).
+    assert EMPTY_LIST_CARD in render_subscriptions([])
 
 
 # --- 3. недоступность бота на входе ----------------------------------------

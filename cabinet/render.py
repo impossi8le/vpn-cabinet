@@ -298,6 +298,7 @@ def _end_date_text(view: SubscriptionView) -> str | None:
 def _subscription_context(
     views: list[SubscriptionView],
     *,
+    error: str | None = None,
     config_error: ConfigError | None = None,
     config_error_id: str | None = None,
 ) -> dict[str, object]:
@@ -311,6 +312,14 @@ def _subscription_context(
     ровно той подписки, по которой его нажали. Экран у нас один — карточки, а
     не отдельная страница: человек нажал «Скачать» здесь, и ответ читает здесь
     же, не теряя, к чему он относился.
+
+    `subscriptions_known` отделяет пустоту от неизвестности (issue #49).
+    «Подписок нет» — утверждение о **известном** пустом списке (W4.3), и рядом с
+    отказом (`error`) оно противоречило бы ему: список при отказе не пуст, а
+    неизвестен, и человек прочёл бы «у вас ничего нет» вместо «повторите позже».
+    Развилка нужна одна на все экраны, поэтому она здесь, а не в разметке:
+    ошибок, после которых список неизвестен, набирается уже три (список не
+    получен, бот недоступен, скачивание не состоялось).
     """
     refusal = (
         _config_refusal(config_error) if config_error is not None and config_error_id else None
@@ -336,7 +345,11 @@ def _subscription_context(
                 "refusal": refusal if view.id == config_error_id else None,
             }
         )
-    return {"rows": rows, "has_subscriptions": bool(rows)}
+    return {
+        "rows": rows,
+        "has_subscriptions": bool(rows),
+        "subscriptions_known": error is None,
+    }
 
 
 def _money_context(
@@ -432,6 +445,11 @@ def render_subscriptions(
     остаётся там, откуда скачивал (W5.4). `error` — про другое: сбой самого
     списка, у которого своей подписки нет.
 
+    `error` гасит карточку «Подписок нет» (issue #49): с отказом на экране список
+    не пуст, а **неизвестен**, и утверждать пустоту рядом с отказом нельзя.
+    Пустой список без отказа остаётся честным состоянием (W4.3) — развилку
+    держит `_subscription_context`.
+
     `notices_tone` — тон сообщения о действии, уже названный причиной из
     `theme`. Значение по умолчанию нейтральное: незачем подсвечивать то, о чём
     зрителя не просили.
@@ -451,6 +469,7 @@ def render_subscriptions(
         notices_tone=notices_tone,
         **_subscription_context(
             views,
+            error=error,
             config_error=config_error,
             config_error_id=config_error_id,
         ),
