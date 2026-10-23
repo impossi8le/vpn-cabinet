@@ -49,6 +49,7 @@ from cabinet.configs import (
 )
 from cabinet.linking import Linking, LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailSender
+from cabinet.pending_mail import PendingMail
 from cabinet.render import (
     STATIC_DIR,
     render_linking,
@@ -292,6 +293,10 @@ def build_app(
     clock = now if now is not None else (lambda: datetime.now(UTC))
 
     auth_mail = AuthMail(mail_sender=mail_sender, now=clock)
+    # Адрес незавершённой привязки почты по аккаунту. Рядом с `auth_mail`, но
+    # отдельно: тот хранит коды по адресу, а экрану нужно знать, какому
+    # аккаунту какой адрес показывать (см. `pending_mail`).
+    pending = PendingMail()
     sessions = SessionService(store=SingleSessionStore(), accounts=store, now=clock)
     # Связывание держим отдельной ссылкой: экрану способов входа нужны и
     # привязка, и отвязка, а `SignInService` берёт только привязку почты.
@@ -325,6 +330,7 @@ def build_app(
     app.state.signin = signin
     app.state.clock = clock
     app.state.linking = linking
+    app.state.pending_mail = pending
     app.state.configs = configs
 
     _add_login_routes(app, signin=signin, sessions=sessions, store=store)
@@ -335,7 +341,15 @@ def build_app(
         clock=clock,
         configs=configs,
     )
-    _add_account_routes(app, store=store, sessions=sessions, linking=linking, clock=clock)
+    _add_account_routes(
+        app,
+        store=store,
+        sessions=sessions,
+        linking=linking,
+        clock=clock,
+        auth_mail=auth_mail,
+        pending=pending,
+    )
     return app
 
 
@@ -697,6 +711,8 @@ def _add_account_routes(
     sessions: SessionService,
     linking: Linking,
     clock: Callable[[], datetime],
+    auth_mail: AuthMail,
+    pending: PendingMail,
 ) -> None:
     """Экран способов входа и действия привязки/отвязки.
 
@@ -757,12 +773,23 @@ def _add_account_routes(
 
     @app.get("/account", response_class=HTMLResponse)
     def account_page(request: Request) -> Response:
-        """Экран способов входа. Без сессии — на вход, а не 500."""
+        """Экран способов входа. Без сессии — на вход, а не 500.
+
+        Шаг ввода кода восстанавливается здесь, а не только в ответе на
+        отправку: из почтового ящика человек возвращается на `/account` обычным
+        GET, и без этого поле кода пропадало при живом коде в письме (#44).
+        `live_address` отдаёт адрес, только пока код действует: погасший код
+        возвращает экран к форме адреса.
+        """
         resolved = _account(request)
         if resolved is None:
             return RedirectResponse("/login", status_code=303)
         account, _ = resolved
-        return _render(account, unlink_previews=_previews(account) or None)
+        return _render(
+            account,
+            mail_pending=pending.live_address(account.id, auth_mail),
+            unlink_previews=_previews(account) or None,
+        )
 
     @app.post("/account/link/telegram")
     def link_telegram_action(request: Request) -> Response:
@@ -819,6 +846,7 @@ def _add_account_routes(
             # потеряло срок ожидания. Адрес остаётся в шаге — код из первого
             # письма всё ещё действует, и терять шаг нельзя, поэтому
             # `mail_pending`, а не возврат к форме адреса.
+            pending.remember(account.id, address)
             return _render(
                 account,
                 error=RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
@@ -832,6 +860,9 @@ def _add_account_routes(
                 unlink_previews=_previews(account) or None,
             )
 
+        # Код ушёл — адрес остаётся в памяти до подтверждения: человек уйдёт в
+        # почту и вернётся на `/account` GET-ом, и шаг обязан его дождаться.
+        pending.remember(account.id, address)
         return _render(
             account,
             notice=LINK_MAIL_CODE_SENT.format(mail=address),
@@ -895,6 +926,10 @@ def _add_account_routes(
                 unlink_previews=_previews(account) or None,
             )
 
+        # Адрес привязан — шаг кода закончен. На отказах выше адрес **не**
+        # забывается: код ещё живой, и человеку нужно поле, чтобы повторить
+        # ввод, а не просить письмо заново.
+        pending.forget(account.id)
         return _render(result.account, notice=LINK_DONE_MAIL)
 
     @app.post("/account/unlink/telegram")
