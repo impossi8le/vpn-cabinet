@@ -242,6 +242,10 @@ LINK_REFUSED_ERROR = (
 # Отвязано — завершённое действие: тон нейтральный, зелёного здесь нет (§7).
 UNLINK_DONE_TELEGRAM = "Telegram отвязан."
 UNLINK_DONE_MAIL = "Почта отвязана."
+# Привязано — тоже завершённое действие, и тон тот же нейтральный: зелёный в
+# проекте оставлен подтверждённой защите, а не новому способу входа (§7). Текст
+# говорит, что человек **получил** (вход этим адресом), а не «подключено».
+LINK_DONE_MAIL = "Почта привязана — этим адресом можно входить в кабинет."
 # Привязка Telegram идёт флоу бота, и это звено ещё не подключено в кабинете
 # (W6). Текст честный: кабинет не подставляет `confirmed=True` вручную — это
 # сломало бы главную защиту проекта (привязка только после подтверждения
@@ -835,6 +839,63 @@ def _add_account_routes(
             mail_pending=address,
             unlink_previews=_previews(account) or None,
         )
+
+    @app.post("/account/link/mail/confirm")
+    def link_mail_confirm(
+        request: Request,
+        mail: str = Form(default=""),
+        code: str = Form(default=""),
+    ) -> Response:
+        """Подтвердить код и довести привязку почты до конца (issue #44).
+
+        Это второй шаг того же сценария, что и `link_mail_action`: там код уходит
+        на адрес, здесь он предъявляется. Кода не было, он истёк или не совпал —
+        отказ на экране, а не 500: `SignInService.link_mail` переводит отказы
+        `AuthMail` в `MailSignInError` (`signin._code_refusal`).
+
+        Аккаунт берётся **из сессии**, а не из формы. Адрес приезжает скрытым
+        полем и подменяем, поэтому он ничему не верит на слово: код хранится
+        **по адресу** (`AuthMail`), и код, выданный на другой ящик, у
+        подставленного не найдётся. Само связывание — не здесь, а в
+        `Linking.link_mail` (§3.3: только на пустое место, после проверки кода).
+
+        `SignInError` целиком здесь **не** ловится: в этом вызове он значит
+        «связывание не подключено», то есть ошибку развёртывания. Показать её
+        как «не удалось привязать» значило бы спрятать настоящий сбой.
+
+        На экране успеха аккаунт — из результата (`LinkResult.account` перечитан
+        из хранилища), а не из прежнего чтения: показать надо то, что записано.
+        """
+        resolved = _account(request)
+        if resolved is None:
+            return RedirectResponse("/login", status_code=303)
+        account, _ = resolved
+
+        address = mail.strip().lower()
+        try:
+            result = app.state.signin.link_mail(account.id, address, code)
+        except MailSignInError:
+            # Код не принят. Поле кода остаётся (`mail_pending`): иначе отказ
+            # выглядел бы тупиком, а человек с письмом на руках — без шага.
+            return _render(
+                account,
+                error=CODE_ERROR,
+                mail_pending=address,
+                unlink_previews=_previews(account) or None,
+            )
+        except LinkRefused:
+            # Один текст на все причины отказа привязки (§5): разница между
+            # «занято другим аккаунтом» и «уже привязано» выдала бы перебором
+            # адресов, кто где зарегистрирован. Шаг не гасим — причина может
+            # быть поправимой (опечатка в адресе).
+            return _render(
+                account,
+                error=LINK_REFUSED_ERROR,
+                mail_pending=address,
+                unlink_previews=_previews(account) or None,
+            )
+
+        return _render(result.account, notice=LINK_DONE_MAIL)
 
     @app.post("/account/unlink/telegram")
     def unlink_telegram_action(request: Request) -> Response:

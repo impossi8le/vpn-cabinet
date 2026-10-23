@@ -298,12 +298,22 @@ class SignInService:
         вызывает. Так «привязка не проще входа» остаётся правдой в одном месте —
         `linking.py`, — а не в двух.
 
+        Отказы кода (`AuthMailError` из `verify`) переводятся в `MailSignInError`
+        тем же помощником, что у входа: HTTP-слой ловит наш тип, и истёкший или
+        несовпавший код без перевода долетел бы до него чужим исключением — то
+        есть 500 на ошибку человека вместо отказа на экране. Второй раз код не
+        проверяется: его уже проверил `Linking.link_mail`, а код одноразовый —
+        повторная проверка не нашла бы записи и отвергла бы верный код.
+
         `Linking` необязателен: без него связывание не подключено, и вызов —
         это ошибка развёртывания, а не состояние сценария.
         """
         if self._linking is None:
             raise SignInError("связывание способов входа не подключено")
-        return self._linking.link_mail(account_id, mail=mail, code=code)
+        try:
+            return self._linking.link_mail(account_id, mail=mail, code=code)
+        except AuthMailError as exc:
+            raise _code_refusal(exc) from exc
 
     # ---------- служебное ----------
 
@@ -313,16 +323,12 @@ class SignInService:
         Типы `AuthMail` не текут наружу: вызывающий код кабинета не должен
         зависеть от того, что под ним. Неверный код, истёкший и «не
         запрашивался» сводятся к `MailSignInError`, потому что для экрана это
-        одно действие человека — ввести код заново. `attempts_left` переносится,
-        когда он есть: экран показывает «осталось N попыток» по нему.
+        одно действие человека — ввести код заново.
         """
         try:
             self._auth_mail.verify(mail, code)
         except AuthMailError as exc:
-            raise MailSignInError(
-                "код не принят",
-                attempts_left=getattr(exc, "attempts_left", None),
-            ) from exc
+            raise _code_refusal(exc) from exc
 
     def _session_for(self, account: Account, *, created: bool) -> SignInResult:
         """Выдать сессию аккаунту. Одна точка выдачи на все три двери.
@@ -359,6 +365,21 @@ class SignInService:
         if account is None:
             raise SignInError(f"аккаунт {account_id} не найден")
         return account
+
+
+def _code_refusal(exc: AuthMailError) -> MailSignInError:
+    """Перевести отказ `AuthMail` в наш отказ кода.
+
+    Помощник общий для двух путей — входа и привязки почты. Обе двери проверяют
+    **тот же** код тем же `AuthMail`, и перевод отказа обязан совпадать: разойдись
+    он, и на одной двери «осталось N попыток» потерялось бы, а на другой нет.
+    Здесь формула перевода в одном месте, а не скопирована по вызовам.
+
+    `attempts_left` переносится, только когда `AuthMail` его знает: у «кода не
+    запрашивали» и «срок истёк» попыток не остаётся, и нулём их не подменяем —
+    экран показал бы «осталось 0» на состояние, где счёт неприменим.
+    """
+    return MailSignInError("код не принят", attempts_left=getattr(exc, "attempts_left", None))
 
 
 def _normalize_mail(mail: str) -> str:
