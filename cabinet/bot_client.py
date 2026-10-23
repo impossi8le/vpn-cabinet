@@ -687,6 +687,12 @@ class BotStore:
     (`signin.AccountStore`, `linking.AccountStore`) адаптер закрывает: без них
     вход по почте — главная дверь кабинета — отвечал бы 500 (issue #47).
 
+    Скачиванию `.ovpn` нужен ещё один метод — `get_ovpn`: его ищет на хранилище
+    `_StoreConfigSource` в `cabinet/app.py`, без него боевое скачивание отвечало
+    отказом на `200` и файла не было вовсе (issue #48). Он же держит код отказа
+    бота (`subscription_expired`, `config_revoked`) — по нему `configs` выбирает
+    экран, поэтому отказ не должен свернуться в общий.
+
     Конфигурацию адаптер не дублирует: адрес и секрет он берёт у того самого
     клиента, которого оборачивает. Второй копии секрета быть не должно — иначе
     развёртывание заполнило бы одну, а запрос ушёл бы с другой.
@@ -734,6 +740,29 @@ class BotStore:
         """
         data = self._get(f"{BOT_PATH}/accounts/{account_id}/subscriptions")
         return [Subscription.from_api(item) for item in data.get("subscriptions", [])]
+
+    def get_ovpn(self, account_id: int, config_id: str) -> bytes:
+        """Содержимое `.ovpn` (`GET /internal/accounts/{id}/configs/{config_id}`).
+
+        Байтами, а не текстом: профиль отдаётся файлом, и превращать его в строку
+        по дороге незачем — так же, как у `BotClient.get_ovpn`.
+
+        Этого метода адаптеру и не хватало (issue #48): `_StoreConfigSource` в
+        `cabinet/app.py` ищет `get_ovpn` на хранилище, а без него выложенный
+        кабинет отвечал отказом на **каждое** скачивание — то есть главного своего
+        действия не делал вовсе. Отказ был мягким (`200` с экраном, не `500`),
+        поэтому и незаметным.
+
+        `config_id` здесь равен id подписки: конфиг у подписки один, и адрес
+        скачивания называет подписку (`subscription_config` в `cabinet/app.py`).
+
+        Отказ по истёкшей подписке, чужому или отозванному конфигу приходит
+        `BotError` с кодом контракта. Разбор общий (`_error_from_response`),
+        поэтому код доезжает до `configs`: там по нему выбирается своё исключение,
+        а у исключения — свой текст на экране. Свернуть отказ здесь в «не удалось»
+        значило бы отнять у человека единственную подсказку.
+        """
+        return self._request_bytes("GET", f"{BOT_PATH}/accounts/{account_id}/configs/{config_id}")
 
     def get_balance(self, account_id: int) -> Balance:
         """Накопленный кредит. Отсутствие Telegram — `BotError` с кодом
@@ -877,7 +906,7 @@ class BotStore:
         return self._request("GET", path, **kwargs)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        """Один синхронный запрос: сеть, статус, разбор отказа.
+        """Синхронный запрос, ответ которого — объект JSON.
 
         Разбор ошибок общий с `BotClient` (`_error_from_response`): формат отказа
         — часть контракта бота, и вторая его копия разошлась бы с первой ровно
@@ -886,15 +915,7 @@ class BotStore:
         и записи те же, и разводить их значило бы держать две копии этого
         разбора.
         """
-        try:
-            response = self._http.request(method, path, headers=self._headers(), **kwargs)
-        except _NETWORK_ERRORS as exc:
-            raise BotUnreachable(
-                f"запрос к боту не удался: {exc.__class__.__name__}", cause=exc
-            ) from exc
-
-        if response.status_code >= 400:
-            raise _error_from_response(response)
+        response = self._send(method, path, **kwargs)
         if not response.content:
             return {}
         try:
@@ -906,6 +927,36 @@ class BotStore:
         if not isinstance(payload, dict):
             raise BotError("invalid_response", "бот вернул не объект", status=response.status_code)
         return payload
+
+    def _request_bytes(self, method: str, path: str, **kwargs: Any) -> bytes:
+        """Синхронный запрос, ответ которого — байты (`.ovpn`).
+
+        Тело не разбирается вовсе: профиль бот отдаёт файлом, а не объектом, и
+        ветка «разбери тело как JSON» отвергла бы его как `invalid_response` —
+        то есть отказ бота вместо файла. Проверка статуса и разбор отказа при
+        этом те же, что у JSON-ответов (`_send`), — иначе код отказа терялся бы
+        на байтовом пути.
+        """
+        return self._send(method, path, **kwargs).content
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Один синхронный запрос: сеть, статус, разбор отказа.
+
+        Общая точка для JSON- и байтовых ответов — та же роль, что у
+        `BotClient._send`: своя у каждого, обработка ошибок разъехалась бы ровно
+        там, где отказ бота и надо различать по коду (issue #48: код отказа
+        обязан дойти до экрана, а не свернуться в общий отказ).
+        """
+        try:
+            response = self._http.request(method, path, headers=self._headers(), **kwargs)
+        except _NETWORK_ERRORS as exc:
+            raise BotUnreachable(
+                f"запрос к боту не удался: {exc.__class__.__name__}", cause=exc
+            ) from exc
+
+        if response.status_code >= 400:
+            raise _error_from_response(response)
+        return response
 
     def _changed_rows(self, path: str, body: dict[str, Any] | None = None) -> int:
         """Запись, отвечающая «сколько строк изменилось»: `1` или `0`.
