@@ -241,6 +241,10 @@ def test_confirming_without_requesting_a_code_is_refused(
 
     assert response.status_code == 200
     assert fake_api.find_by_id(account.id).mail is None
+    # И отказ виден на экране: без этой строки подошёл бы и роут, который
+    # отвечает 200 и молчит, — а молчание человек читает как сбой страницы,
+    # а не как «код не подошёл».
+    assert "Код не подошёл" in response.text
 
 
 def test_confirming_does_not_overwrite_an_existing_address(
