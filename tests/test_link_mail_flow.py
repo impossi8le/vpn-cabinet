@@ -299,11 +299,23 @@ def test_confirming_without_session_redirects_to_login(
 
     Шаг привязывает к **вошедшему** аккаунту, и аккаунт берётся из сессии, а не
     из формы. Без сессии привязывать не к кому.
+
+    Код берётся **до** выхода из аккаунта: письмо просят у того же кабинета, а
+    экран отправки без сессии уводит на вход и письма не отправляет. Иначе тест
+    падал бы на пустом ящике — то есть проверял бы отправку письма, а не
+    привязку. Cookie снимается после: человек вышел (или закрыл браузер), а
+    форма осталась открытой — ровно тот случай, ради которого сессия
+    проверяется на сервере, а не в разметке.
     """
-    fake_api.create_account(chat_id=CHAT_ID)
+    account = _signed_in_telegram_only(client, fake_api)
     code = _code_for(client, sender, NEW_MAIL)
+    client.cookies.clear()
 
     response = _confirm(client, NEW_MAIL, code)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+    # И адрес не привязался: редирект без записи — это не «привязали, но не
+    # показали». Без этой строки тест зеленел бы и на роуте, который успевает
+    # записать почту, а потом уводит на вход.
+    assert fake_api.find_by_id(account.id).mail is None
