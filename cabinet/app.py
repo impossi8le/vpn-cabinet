@@ -71,9 +71,14 @@ from cabinet.configs import (
 from cabinet.linking import Linking, LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailSender
 from cabinet.pending_mail import PendingMail
+from cabinet.pricing import PRICES
 from cabinet.render import (
+    DEFAULT_BUY_DAYS,
+    DEFAULT_BUY_DEVICES,
+    PURCHASE_DEVICES,
     STATIC_DIR,
     TELEGRAM_CHECK_LABEL,
+    render_buy,
     render_linking,
     render_login,
     render_login_telegram,
@@ -849,6 +854,33 @@ def _add_subscription_routes(
                 balance=balance,
                 referral=referral,
                 telegram_required=telegram_required,
+            )
+        )
+
+    @app.get("/buy", response_class=HTMLResponse)
+    def buy_page(
+        request: Request,
+        days: int | None = Query(default=None),
+        devices: int | None = Query(default=None),
+    ) -> Response:
+        """Экран покупки: выбор срока и числа устройств, с ценой каждого.
+
+        Без сессии — редирект на вход, как у соседнего `/subscriptions`: это
+        обычное состояние первого захода, а не сбой сервера и не экран чужого
+        аккаунта. Сессии на экране больше ни к чему: цену человек выбирает
+        до всякой покупки, и заказывать пока нечего.
+
+        Неизвестный выбор в адресе (`?days=45&devices=9`) подменяется умолчанием,
+        а не отдаётся 500: `calculate_price` на неподдерживаемый срок бросает
+        `ValueError`, и чужая опечатка в ссылке не должна валить страницу. Ноль
+        на неизвестный срок тоже не показывается — это продало бы подписку даром.
+        """
+        if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
+            return RedirectResponse("/login", status_code=303)
+        return HTMLResponse(
+            render_buy(
+                days=days if days in PRICES else DEFAULT_BUY_DAYS,
+                devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
             )
         )
 

@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from cabinet import theme
+from cabinet import pricing, theme
 from cabinet.accounts import Account
 from cabinet.bot_client import Balance, Referral
 from cabinet.configs import (
@@ -24,6 +25,7 @@ from cabinet.configs import (
     DownloadRateLimited,
     SubscriptionInactive,
 )
+from cabinet.pricing import PriceQuote
 from cabinet.subscriptions import (
     STATUS_ACTIVE,
     STATUS_BLOCKED,
@@ -58,6 +60,7 @@ __all__ = [
     "render_login",
     "render_login_telegram",
     "render_login_waiting",
+    "render_buy",
     "render_subscriptions",
 ]
 
@@ -491,6 +494,143 @@ def render_subscriptions(
             referral=referral,
             telegram_required=telegram_required,
         ),
+    )
+
+
+# --- покупка: тариф и число устройств (#36) ------------------------------
+#
+# Шаги 1–2 покупки на одном экране: срок и число устройств. Цену на нём не
+# считают — её считает `cabinet.pricing`, перенос формулы бота, и рендер лишь
+# раскладывает готовые `PriceQuote` по вариантам. Так цена на экране и цена в
+# боте остаются одним числом: впиши сюда сумму руками — и человек, вошедший по
+# почте, увидел бы не то, что человек в Telegram.
+
+# Срок и число устройств по умолчанию. 30 дней — с него начинается покупка в
+# боте, и он же пробный период; одно устройство — тоже вход бота: комплект это
+# уже скидка, и навязывать её на первом экране нельзя.
+DEFAULT_BUY_DAYS = 30
+DEFAULT_BUY_DEVICES = 1
+
+# Сколько дней в «месяце» для цены в месяц. 30, как и в таблице спеки §2:
+# 90/180/360 дней дают 133/125/108 ₽ — числа, которые человек видит в боте.
+DAYS_PER_MONTH = 30
+
+# Числа устройств, которые вообще предлагаются. Комплект образуют ровно 2 и 3 —
+# только на них у `pricing` есть скидка; четвёртый вариант обещал бы несуществующее.
+PURCHASE_DEVICES = (1, 2, 3)
+
+# Проценты комплекта берутся у `pricing`, а не пишутся числами: правка скидки в
+# одном месте не должна оставить на экране старый процент.
+_DEVICE_DISCOUNT_PERCENTS = {
+    2: pricing.BUNDLE_2_DEVICES_DISCOUNT_PERCENT,
+    3: pricing.BUNDLE_3_DEVICES_DISCOUNT_PERCENT,
+}
+
+# Текст про триал. Он намеренно **не** обещает бесплатный доступ безусловно:
+# триал выдают один раз и только тем, кто ещё не покупал, а кабинет этого не
+# знает — покупки живут у бота. Обещание, которого кабинет не может
+# подтвердить, — та же ложь, что нарисованная кнопка в никуда. Поэтому сказано
+# и что это пробный период, и кто решает, кому он положен.
+BUY_TRIAL_NOTE = (
+    "Пробный период дают один раз — новым покупателям. "
+    "Право на него проверяет бот сервиса, и кабинет заранее его не обещает."
+)
+
+
+def _pluralize_devices(count: int) -> str:
+    """«1 устройство», «2 устройства», «5 устройств» — склонение по числу.
+
+    Без него «2 устройство» читается как сбой страницы. Исключение 11–14 —
+    форма «устройств», хотя последняя цифра выглядит подходящей.
+    """
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} устройств"
+    last = count % 10
+    if last == 1:
+        return f"{count} устройство"
+    if 2 <= last <= 4:
+        return f"{count} устройства"
+    return f"{count} устройств"
+
+
+def _buy_periods(
+    days: int, devices: int, calculator: Callable[..., PriceQuote]
+) -> list[dict[str, object]]:
+    """Варианты срока: цена из калькулятора, месячная цена и метка триала.
+
+    Цена за период — ответ калькулятора на одно устройство: так её называет бот
+    на шаге 1, до выбора числа устройств. Цена в месяц считается из той же суммы
+    (целочисленно вниз), а не берётся вторым числом — иначе она разошлась бы с
+    ценой за период при правке `PRICES`.
+    """
+    rows = []
+    for period in sorted(pricing.PRICES):
+        price = calculator(period, 1).final_price
+        rows.append(
+            {
+                "days": period,
+                "label": _pluralize_days(period),
+                "price": _rubles(price),
+                "per_month": _rubles(price * DAYS_PER_MONTH // period),
+                "selected": period == days,
+                "url": f"/buy?days={period}&devices={devices}",
+                # Триал помечен только у 30 дней и только честно (см. BUY_TRIAL_NOTE).
+                "trial_note": BUY_TRIAL_NOTE if period == DEFAULT_BUY_DAYS else None,
+            }
+        )
+    return rows
+
+
+def _buy_devices(
+    days: int, devices: int, calculator: Callable[..., PriceQuote]
+) -> list[dict[str, object]]:
+    """Варианты числа устройств: скидка комплекта и сумма к оплате — из калькулятора.
+
+    Процент скидки приходит из `pricing`, рубли экономии и итог — из ответа
+    калькулятора на **выбранный** срок. Так «комплект 2 устройства: −10%» и
+    «экономия 28 ₽» — свойства одного расчёта, а не двух чисел, которые могут
+    разойтись.
+    """
+    rows = []
+    for count in PURCHASE_DEVICES:
+        quote = calculator(days, count)
+        percent = _DEVICE_DISCOUNT_PERCENTS.get(count)
+        rows.append(
+            {
+                "count": count,
+                "label": _pluralize_devices(count),
+                "discount": f"-{percent}%" if percent else None,
+                "saved": _rubles(quote.bundle_discount) if quote.bundle_discount else None,
+                "total": _rubles(quote.final_price),
+                "selected": count == devices,
+                "url": f"/buy?days={days}&devices={count}",
+            }
+        )
+    return rows
+
+
+def render_buy(
+    *,
+    days: int = DEFAULT_BUY_DAYS,
+    devices: int = DEFAULT_BUY_DEVICES,
+    calculator: Callable[..., PriceQuote] = pricing.calculate_price,
+) -> str:
+    """Экран покупки: срок и число устройств с ценой каждого варианта.
+
+    `calculator` — шов, а не украшение: и роут, и тест зовут одну функцию, и
+    подмена калькулятора на подставной доказуемо меняет разметку. Без шва тест
+    на «цена считается, а не вписана» проверял бы разметку, а не расчёт.
+
+    `days` и `devices` — выбранная пара. Экран показывает её итог, а варианты
+    ведут себя как ссылки: выбор выражается адресом, пересчёт делает сервер, и
+    экран работает без JavaScript — как и форма входа.
+    """
+    return _ENV.get_template("buy.html").render(
+        **_base_context(),
+        periods=_buy_periods(days, devices, calculator),
+        device_options=_buy_devices(days, devices, calculator),
+        total=_rubles(calculator(days, devices).final_price),
     )
 
 

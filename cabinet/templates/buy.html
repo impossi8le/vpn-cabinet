@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Покупка{% endblock %}
+{% block content %}
+<div class="nav">
+  {# Возврат к подпискам: шаг адресуем, а не тупик — зашли отсюда, сюда и выйдут. #}
+  <a class="back" href="/subscriptions">‹ Назад</a>
+  <span class="t">Покупка</span>
+  <span class="side"></span>
+</div>
+
+{# Два шага покупки — срок и число устройств — на одном экране. Цену считает
+   `cabinet.pricing` (перенос формулы бота), а разметка лишь раскладывает
+   готовые суммы: своей цены здесь нет, иначе кабинет и бот разошлись бы на
+   деньгах. Выбор выражается адресом (`?days=&devices=`), поэтому экран
+   работает без JavaScript. #}
+<h1>Выберите тариф</h1>
+<p class="lead">Срок и число устройств. Цена видна сразу — доплат и скрытых условий нет.</p>
+
+<div class="group">
+  <p class="group-t">Срок</p>
+  <div class="options">
+    {%- for row in periods %}
+    {# Вариант — ссылка: выбор переключает адрес, а не прячется в состояние
+       страницы. Выделен выбранный; цвет выделения — Ice (фокус/выбор), а не
+       зелёный: цена о защите не говорит (§7). #}
+    <a class="opt{{ ' is-selected' if row.selected }}" href="{{ row.url }}">
+      <span class="opt-head">
+        <span class="opt-t">{{ row.label }}</span>
+        <span class="opt-p">{{ row.price }}</span>
+      </span>
+      <span class="opt-m">{{ row.per_month }}/мес</span>
+      {%- if row.trial_note %}
+      {# 30 дней — пробный период. Сказано честно: право на него проверяет бот,
+         и «бесплатно» фактом здесь не стоит (см. `render.BUY_TRIAL_NOTE`). #}
+      <span class="opt-note">{{ row.trial_note }}</span>
+      {%- endif %}
+    </a>
+    {%- endfor %}
+  </div>
+</div>
+
+<div class="group">
+  <p class="group-t">Устройства</p>
+  <div class="options">
+    {%- for row in device_options %}
+    <a class="opt{{ ' is-selected' if row.selected }}" href="{{ row.url }}">
+      <span class="opt-head">
+        <span class="opt-t">{{ row.label }}</span>
+        <span class="opt-p">{{ row.total }}</span>
+      </span>
+      {%- if row.discount %}
+      {# Скидка комплекта и экономия в рублях — оба числа из калькулятора:
+         процент из `pricing`, рубли из его ответа. #}
+      <span class="opt-d">скидка {{ row.discount }} — экономия {{ row.saved }}</span>
+      {%- else %}
+      <span class="opt-m">без скидки</span>
+      {%- endif %}
+    </a>
+    {%- endfor %}
+  </div>
+</div>
+
+{# Итог выбранной пары. Тон нейтральный: цена — ни защита, ни опасность, и
+   своего цвета у неё нет (§7). Оплата и выдача конфигов — следующие шаги, и
+   обещать их здесь нечем. #}
+<div class="card money-card">
+  <div class="money-row">
+    <span class="money-k">Итого</span>
+    <span class="money-v">{{ total }}</span>
+  </div>
+  <p class="money-note">Оплата и выдача конфигов — следующие шаги покупки.</p>
+</div>
+{% endblock %}

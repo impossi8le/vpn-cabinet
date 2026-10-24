@@ -230,3 +230,31 @@ a.btn { text-decoration: none; }
   font-size: 12.5px; line-height: 1.5; color: var(--mist); margin-bottom: 12px;
 }
 .confirm-row input { margin: 1px 0 0; flex: 0 0 auto; accent-color: var(--ice); }
+
+/* Вход в покупку с экрана подписок: кнопка сверху, а не строка в карточке. */
+.cta { margin-bottom: 18px; }
+
+/* Экран покупки — варианты срока и числа устройств. Каждый вариант — ссылка:
+   выбор выражается адресом, а не скрытым состоянием, и работает без JS.
+   Выбранный обведён Ice: это выделение выбора («сюда смотреть»), а не статус.
+   Зелёного здесь нет намеренно — цена и скидка о защите не говорят (§7). */
+.group { margin-bottom: 18px; }
+.group-t { color: var(--text-secondary); font-size: 12.5px; margin-bottom: 8px; }
+.options { display: flex; flex-direction: column; gap: 8px; }
+.opt {
+  display: block; text-decoration: none; color: inherit;
+  background: var(--carbon); border: 0.5px solid var(--hairline);
+  border-radius: var(--radius-card); padding: 13px 15px;
+}
+.opt.is-selected { border-color: var(--ice); background: var(--obsidian); }
+.opt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.opt-t { font-size: 15px; font-weight: 590; letter-spacing: -0.012em; color: var(--bone); }
+.opt-p { font-size: 15.5px; font-weight: 590; letter-spacing: -0.012em; color: var(--bone); }
+/* Цена в месяц тише цены за период: это сравнение, а не вторая сумма. */
+.opt-m { display: block; margin-top: 5px; color: var(--text-secondary); font-size: 12.5px; }
+/* Скидка комплекта и экономия — нейтральный текст: скидка не защита и не
+   опасность, и подсвечивать её нечем (§7). */
+.opt-d { display: block; margin-top: 5px; color: var(--mist); font-size: 12.5px; }
+/* Пояснение к варианту (пробный период). Тихо и без значка: это условие, а не
+   предупреждение и не обещание. */
+.opt-note { display: block; margin-top: 6px; color: var(--ash); font-size: 12px; line-height: 1.5; }
