@@ -39,6 +39,7 @@ from cabinet.bot_client import (
     BotClient,
     BotConfigError,
     BotStore,
+    TelegramAuthClient,
 )
 from cabinet.mail_sender import MailConfigError, MailSender
 
@@ -90,7 +91,16 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
             secret=_required(source, BOT_SECRET_ENV, "общий секрет"),
         )
     )
-    return build_app(store=store, mail_sender=MailSender.from_env(source))
+    # Вход через Telegram — **другой** сервис бота (публичный клиентский API), и
+    # адрес у него свой (`BOT_PUBLIC_BASE`). Общего секрета у него нет: он
+    # выставлен внешним клиентам и секрета внутреннего роутера не ждёт. Пустая
+    # переменная здесь читается как умолчание (loopback, где этот API и слушает),
+    # а не как отказ: за loopback другого сервиса нет, и промахнуться некуда.
+    return build_app(
+        store=store,
+        mail_sender=MailSender.from_env(source),
+        telegram_auth=TelegramAuthClient.from_env(source),
+    )
 
 
 def main() -> None:

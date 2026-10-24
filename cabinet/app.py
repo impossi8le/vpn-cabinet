@@ -39,7 +39,20 @@ from fastapi.staticfiles import StaticFiles
 
 from cabinet.accounts import Account
 from cabinet.auth_mail import AuthMail, AuthMailError, RateLimited
-from cabinet.bot_client import Balance, BotError, BotUnreachable, Referral
+from cabinet.bot_client import (
+    POLL_CONFIRMED,
+    POLL_DENIED,
+    POLL_PENDING,
+    Balance,
+    BotError,
+    BotUnreachable,
+    Challenge,
+    Referral,
+    TelegramAuthClient,
+    TelegramLogin,
+    public_code_and_secret,
+    secret_hash,
+)
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -52,6 +65,7 @@ from cabinet.mail_sender import MailSender
 from cabinet.pending_mail import PendingMail
 from cabinet.render import (
     STATIC_DIR,
+    TELEGRAM_CHECK_LABEL,
     render_linking,
     render_login,
     render_login_telegram,
@@ -283,18 +297,59 @@ LINK_TELEGRAM_BOT_FLOW = (
     "После подтверждения Telegram появится здесь привязанным."
 )
 
-# Экран входа через Telegram: ссылка на бота ещё не готова. Тот же честный
-# текст, что у клиента: нарисованная кнопка, ведущая в никуда, обещает переход,
-# которого сервис не сделал. Флоу бота (`/auth/link` + `/auth/poll`, §5) в
-# кабинете ещё не подключён (W6), поэтому челлендж не начинается здесь, и экран
-# говорит об этом прямо, а не изображает ожидание кода.
-LOGIN_TELEGRAM_NOT_READY = "Ссылка на вход через Telegram ещё не готова. Начните вход заново."
-# Код, введённый на экране Telegram, здесь проверить нечем: подтверждение
-# приходит из флоу бота, а не из кабинета. Сказать «код не подошёл» значило бы
-# свалить на человека расхождение, которого он не совершал.
-LOGIN_TELEGRAM_UNAVAILABLE = (
-    "Проверка кода из Telegram ещё не подключена в кабинете. Войдите по почте или начните заново."
+# --- Вход через Telegram: челлендж бота (§5) ------------------------------
+#
+# Экран начинается с челленджа (`/auth/link`) и завершается опросом (`/auth/poll`).
+# Тексты состояний разные, и это не украшение: за разными причинами стоят разные
+# действия человека. «Подтвердите в Telegram» — это пойти в бота; «отклонён» —
+# начать заново; «код не подошёл» — перечитать код; «сервис не отвечает» —
+# подождать. Один текст на все четыре лишил бы человека единственной подсказки.
+
+# Подпись кнопки опроса. Имя берётся у `render`: строка живёт в одном месте, а
+# роут называет её своим именем, потому что экранное состояние — его дело.
+LOGIN_TELEGRAM_CHECK = TELEGRAM_CHECK_LABEL
+# Вход начат, но человек ещё не подтвердил его в Telegram. Это ожидание, а не
+# отказ: подтвердить нужно там, и кнопка та же.
+LOGIN_TELEGRAM_PENDING = (
+    "Вход ещё не подтверждён. Подтвердите его в Telegram и нажмите «Проверить вход»."
 )
+# Человек отклонил вход в Telegram. Отдельный текст, а не «не удалось»: отказ
+# пришёл от него самого, и повторять тот же челлендж бессмысленно — надо начать
+# заново (кнопка «Войти заново» стоит рядом).
+LOGIN_TELEGRAM_DENIED = "Вход отклонён в Telegram. Если это были не вы — начните вход заново."
+# Код из Telegram не подошёл. Свой текст, а не «вход отклонён»: человек уже
+# подтвердил вход в боте, и отправлять его в Telegram снова значило бы гонять по
+# кругу. Действие здесь — перечитать код в чате с ботом.
+LOGIN_TELEGRAM_CODE_ERROR = "Код из Telegram не подошёл. Проверьте цифры и попробуйте ещё раз."
+# Челлендж истёк или уже использован (`operation_not_found`, `already_consumed`).
+# Это состояние входа, а не ошибка ввода: повторять код нечем — надо начать заново.
+LOGIN_TELEGRAM_EXPIRED = "Время входа истекло или вход уже использован. Начните заново."
+# Челленджа нет: не начинали, он протух или кабинет перезапускался (состояние
+# челленджа живёт в памяти). Отказ обязан быть видимым, а не 500 — это обычное
+# состояние старой вкладки, а не сбой сервера.
+LOGIN_TELEGRAM_NOT_STARTED = "Вход не начат или устарел. Начните вход заново."
+# Прочий отказ бота на опросе (расхождение контракта, неизвестный код). Общий
+# текст, но с действием: начать заново, а не «обновите страницу».
+LOGIN_TELEGRAM_FAILED = "Не удалось проверить вход. Начните вход заново."
+# Бот недоступен на этом пути. Отдельно от «отклонено»: причина не в человеке, и
+# действие другое — повторить позже. Тот же выбор, что у `LOGIN_BOT_UNREACHABLE`
+# на входе по почте (#49).
+LOGIN_TELEGRAM_BOT_UNREACHABLE = (
+    "Сервис сейчас не отвечает — проверить вход не удалось. Начните заново чуть позже."
+)
+
+# Отказы бота на опросе, у которых есть свой текст. Список закрытый и назван
+# кодами контракта (§1, §5), а не текстом сообщения: текст меняется, код — нет.
+# Незнакомый код сюда не попадает и получает `LOGIN_TELEGRAM_FAILED`: выдумывать
+# ему причину на экране значило бы выдавать догадку за сообщение сервиса.
+LOGIN_TELEGRAM_POLL_ERRORS = {
+    "nonce_mismatch": LOGIN_TELEGRAM_CODE_ERROR,
+    "operation_not_found": LOGIN_TELEGRAM_EXPIRED,
+    "already_consumed": LOGIN_TELEGRAM_EXPIRED,
+    # Свой секрет не совпал — снаружи это неотличимо от «челленджа нет», и
+    # подробность выдала бы, что кабинет разошёлся с ботом по своему состоянию.
+    "invalid_secret": LOGIN_TELEGRAM_NOT_STARTED,
+}
 
 
 def _unreachable_screen(message: str) -> HTMLResponse:
@@ -322,6 +377,7 @@ def build_app(
     mail_sender: MailSender | None = None,
     now: Callable[[], datetime] | None = None,
     config_source: ConfigSource | None = None,
+    telegram_auth: TelegramAuthClient | None = None,
 ) -> FastAPI:
     """Собрать приложение, приняв зависимости параметрами.
 
@@ -337,6 +393,14 @@ def build_app(
     store = store if store is not None else _default_store()
     mail_sender = mail_sender if mail_sender is not None else _default_mail_sender()
     clock = now if now is not None else (lambda: datetime.now(UTC))
+    # Клиент входа по Telegram — отдельная зависимость, а не часть хранилища: это
+    # **другой** сервис бота (публичный API), другой адрес и без общего секрета.
+    # Умолчание указывает на loopback, где клиентский API и слушает; боевой адрес
+    # передаёт `build_from_env`.
+    telegram_auth = telegram_auth if telegram_auth is not None else TelegramAuthClient()
+    # Состояние начатых челленджей. В памяти процесса, как коды `AuthMail`: срок
+    # челленджа задаёт бот, и переживать перезапуск этому состоянию незачем.
+    telegram_login = TelegramLogin(now=clock)
 
     auth_mail = AuthMail(mail_sender=mail_sender, now=clock)
     # Адрес незавершённой привязки почты по аккаунту. Рядом с `auth_mail`, но
@@ -378,8 +442,17 @@ def build_app(
     app.state.linking = linking
     app.state.pending_mail = pending
     app.state.configs = configs
+    app.state.telegram_auth = telegram_auth
+    app.state.telegram_login = telegram_login
 
-    _add_login_routes(app, signin=signin, sessions=sessions, store=store)
+    _add_login_routes(
+        app,
+        signin=signin,
+        sessions=sessions,
+        store=store,
+        telegram_auth=telegram_auth,
+        telegram_login=telegram_login,
+    )
     _add_subscription_routes(
         app,
         store=store,
@@ -405,6 +478,8 @@ def _add_login_routes(
     signin: SignInService,
     sessions: SessionService,
     store: AccountStore,
+    telegram_auth: TelegramAuthClient,
+    telegram_login: TelegramLogin,
 ) -> None:
     """Роуты входа: форма, запрос кода, ввод кода.
 
@@ -534,45 +609,123 @@ def _add_login_routes(
         return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
 
     @app.get("/login/telegram", response_class=HTMLResponse)
-    def login_telegram(mail: str | None = Query(default=None)) -> str:
-        """Вход через Telegram: экран ожидания кода из бота.
+    def login_telegram() -> Response:
+        """Начать вход через Telegram и показать ссылку бота.
 
-        Флоу бота (`/auth/link` + `/auth/poll`, §5) ещё не подключён в кабинете
-        (W6), поэтому челлендж здесь не начинается, и `telegram_url` пуст —
-        экран честно говорит, что ссылки нет, а не рисует кнопку в никуда. Это
-        то же состояние, что называет клиент («Ссылка на вход ещё не готова»).
+        Челлендж начинается здесь: кабинет заводит пару «код + секрет», отдаёт
+        боту **хеш секрета** и получает ссылку `deep_link`. Секрет остаётся в
+        памяти процесса (`TelegramLogin`) — в разметку уходит только код, он и
+        так у человека в ссылке.
+
+        Личность здесь не заявляется ничем: `chat_id` в этом запросе нет вовсе.
+        Он появится только в ответе бота на опрос, после того как человек
+        подтвердит вход в Telegram (§3.3). Подставить его было бы той самой
+        ошибкой авто-связывания, ради которой написана §3.3.
         """
-        return render_login_telegram(telegram_url=None)
+        public_code, secret = public_code_and_secret()
+        try:
+            link = telegram_auth.start_login(public_code, secret_hash(secret))
+        except BotUnreachable:
+            # Бот не ответил — начать не удалось, и это не отказ человека.
+            # Свой текст и **без** кнопки «Открыть Telegram»: ссылки нет.
+            return HTMLResponse(
+                render_login_telegram(telegram_url=None, error=LOGIN_TELEGRAM_BOT_UNREACHABLE)
+            )
+        except BotError:
+            # Осмысленный отказ бота на старте (расхождение контракта). Причину
+            # на экран не выносим: человеку действие одно — повторить.
+            return HTMLResponse(
+                render_login_telegram(telegram_url=None, error=LOGIN_TELEGRAM_FAILED)
+            )
+
+        if not link.deep_link:
+            # Бот ответил успехом, но ссылки в ответе нет. Показывать нечего, и
+            # пустая кнопка обещала бы переход, которого сервис не сделал.
+            return HTMLResponse(
+                render_login_telegram(telegram_url=None, error=LOGIN_TELEGRAM_FAILED)
+            )
+
+        telegram_login.remember(
+            public_code, secret=secret, deep_link=link.deep_link, expires_at=link.expires_at
+        )
+        return HTMLResponse(
+            render_login_telegram(telegram_url=link.deep_link, public_code=public_code)
+        )
 
     @app.post("/login/telegram")
-    def login_telegram_restart(
-        request: Request,
-        mail: str = Form(default=""),
-        code: str = Form(default=""),
-    ) -> Response:
-        """«Войти заново» на экране Telegram — возврат к экрану входа.
+    def login_telegram_restart() -> RedirectResponse:
+        """«Войти заново» — начать новый челлендж.
 
-        Проверять код нечем: подтверждение приходит из флоу бота, а не из
-        кабинета. Показать «код не подошёл» значило бы свалить на человека
-        неготовность сервиса, поэтому возвращаем на форму входа с честным
-        текстом.
+        Раньше здесь был честный отказ («флоу не подключён»); теперь заново —
+        это буквально заново: `GET /login/telegram` заводит новый код и секрет, а
+        старый челлендж гасит бот своим сроком. Отказывать тут значило бы
+        оставить тупик ровно там, где экран советует начать заново.
         """
-        return _redirect_login_error(LOGIN_TELEGRAM_UNAVAILABLE, mail=mail)
+        return RedirectResponse("/login/telegram", status_code=303)
 
     @app.post("/login/telegram/verify")
     def login_telegram_verify(
-        request: Request,
-        mail: str = Form(default=""),
+        public_code: str = Form(default=""),
         code: str = Form(default=""),
     ) -> Response:
-        """Проверка кода из бота. Пока нечем: тем же отказом, что у «заново».
+        """Проверить вход у бота и, если подтверждён, выдать сессию кабинета.
 
-        Адрес формы (`render.TELEGRAM_VERIFY_ACTION`) обязан отвечать, а не
-        404: иначе нажатие «Подтвердить» на экране Telegram уходит в никуда.
-        Флоу бота, который проверит код, подключится на W6; до тех пор ответ
-        честный — проверка недоступна, а не «код не подошёл».
+        `account_id` приходит **только** отсюда — из ответа бота на опрос (§5).
+        Ни форма, ни `chat_id` в ней на это не влияют: `chat_id` передаётся в
+        `sign_in_with_telegram` потому, что этого требует сигнатура, и при
+        заданном `account_id` не используется вовсе (см. `signin.py`). Если
+        `account_id` в ответе нет — отказ, а не догадка по `chat_id`.
+
+        Текст отказа выбирается по причине: ожидание, отказ человека, неверный
+        код, истёкший челлендж и недоступность сервиса требуют разных действий.
+        Сессия не выдаётся ни на одном отказе, и ни один отказ не выходит 500.
         """
-        return _redirect_login_error(LOGIN_TELEGRAM_UNAVAILABLE, mail=mail)
+        challenge = telegram_login.get(public_code)
+        if challenge is None:
+            # Челленджа нет: не начинали, он протух или кабинет перезапускался.
+            # Это обычное состояние старой вкладки, а не сбой сервера.
+            return HTMLResponse(render_login_telegram(error=LOGIN_TELEGRAM_NOT_STARTED))
+
+        try:
+            poll = telegram_auth.poll_login(public_code, challenge.secret, code.strip())
+        except BotUnreachable:
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
+        except BotError as exc:
+            return _telegram_retry(
+                challenge,
+                public_code,
+                LOGIN_TELEGRAM_POLL_ERRORS.get(exc.code, LOGIN_TELEGRAM_FAILED),
+            )
+
+        if poll.status == POLL_PENDING:
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_PENDING)
+        if poll.status == POLL_DENIED:
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_DENIED)
+        if poll.status != POLL_CONFIRMED or poll.account_id is None or poll.chat_id is None:
+            # `confirmed` без `account_id` — расхождение контракта (§5). Вывести
+            # аккаунт из `chat_id` здесь значило бы открыть вход в обход
+            # подтверждения ботом: `chat_id` в ответе есть, но кабинет ему не
+            # верит — он пользуется только `account_id`.
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+
+        # Челлендж израсходован ботом (операция односторонняя) — свой гасим тем
+        # же движением, а не оставляем протухать.
+        telegram_login.forget(public_code)
+        try:
+            result = signin.sign_in_with_telegram(poll.chat_id, account_id=poll.account_id)
+        except BotUnreachable:
+            # Бот подтвердил вход, но аккаунт прочитать не удалось: сессии нет, и
+            # обещать её нельзя. Текст — про сервис, а не про код: код человек
+            # ввёл верно.
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
+        except SignInError:
+            # Расхождение состояния: бот назвал аккаунт, которого нет. Гасить
+            # нечего — сессии не было.
+            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+
+        response = RedirectResponse("/subscriptions", status_code=303)
+        _set_session_cookie(response, result.session.token)
+        return response
 
 
 def _redirect_login_error(message: str, *, mail: str) -> RedirectResponse:
@@ -584,6 +737,28 @@ def _redirect_waiting_error(message: str, *, mail: str) -> RedirectResponse:
     """Вернуть на экран кода с текстом отказа."""
     return RedirectResponse(
         f"/login/waiting?error={quote(message)}&mail={quote(mail)}", status_code=303
+    )
+
+
+def _telegram_retry(challenge: Challenge, public_code: str, message: str) -> HTMLResponse:
+    """Экран Telegram с текстом отказа: челлендж жив, сессии нет.
+
+    Отдаётся **тот же** экран, а не отдельная страница отказа: человек должен
+    остаться там, где кнопка «Проверить вход» и «Войти заново», — иначе после
+    «ещё не подтверждён» ему нечем повторить опрос. Ссылку на бота сохраняем
+    (`challenge.deep_link`), чтобы «Открыть Telegram ещё раз» продолжала работать.
+
+    Код ответа — `200`, как у соседних состояний экрана: отказ входа — не ошибка
+    HTTP, и браузер не должен подменять разметку своей страницей отказа. Сессии
+    здесь не выдаётся и не гасится: живая сессия другого входа не при чём, а
+    входить пока не во что.
+    """
+    return HTMLResponse(
+        render_login_telegram(
+            telegram_url=challenge.deep_link,
+            public_code=public_code,
+            error=message,
+        )
     )
 
 

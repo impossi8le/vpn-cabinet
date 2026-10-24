@@ -44,6 +44,7 @@ __all__ = [
     "LINK_TELEGRAM_ACTION",
     "STATIC_DIR",
     "TELEGRAM_ATTEMPTS_EXCEEDED",
+    "TELEGRAM_CHECK_LABEL",
     "TELEGRAM_CODE_EXPIRED",
     "TELEGRAM_ENTRY_URL",
     "TELEGRAM_LINK_NOT_READY",
@@ -90,6 +91,11 @@ TELEGRAM_ENTRY_URL = "/login/telegram"
 # рендерился в тестах без него.
 TELEGRAM_VERIFY_ACTION = "/login/telegram/verify"
 TELEGRAM_RESTART_URL = TELEGRAM_ENTRY_URL
+
+# Подпись кнопки опроса. Кнопка, а не автоопрос: экран обязан работать без
+# JavaScript, и кнопка — единственный способ опросить надёжно. Имя вынесено
+# константой, потому что на него смотрит и роут (`app.LOGIN_TELEGRAM_CHECK`).
+TELEGRAM_CHECK_LABEL = "Проверить вход"
 
 # Тексты неготовых состояний. Вынесены в константы, а не вписаны по месту в
 # разметке: их сверяет тест по имени, и так строка живёт в одном месте.
@@ -192,11 +198,13 @@ def render_login_waiting(
 def render_login_telegram(
     *,
     telegram_url: str | None = None,
+    public_code: str | None = None,
     error: str | None = None,
     error_state: str | None = None,
     busy: bool = False,
     form_action: str = TELEGRAM_VERIFY_ACTION,
     restart_url: str = TELEGRAM_RESTART_URL,
+    check_label: str = TELEGRAM_CHECK_LABEL,
 ) -> str:
     """Экран входа через Telegram: открыть бота, ввести код оттуда, дождаться.
 
@@ -226,12 +234,17 @@ def render_login_telegram(
     return template.render(
         **_base_context(),
         telegram_url=telegram_url,
+        # `public_code` — код начатого челленджа. Он не секрет: он и так в
+        # `deep_link` у человека, и этим полем экран говорит серверу, о каком
+        # входе спрашивает. Секрет челленджа сюда не попадает никогда.
+        public_code=public_code,
         link_ready=bool(telegram_url),
         link_not_ready=TELEGRAM_LINK_NOT_READY,
         error=error,
         busy=busy,
         form_action=form_action,
         restart_url=restart_url,
+        check_label=check_label,
     )
 
 

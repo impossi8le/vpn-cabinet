@@ -29,9 +29,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from dataclasses import dataclass
-from datetime import datetime
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -40,9 +43,15 @@ from cabinet.accounts import Account
 
 __all__ = [
     "BOT_BASE_URL_ENV",
+    "BOT_PUBLIC_BASE_ENV",
     "BOT_SECRET_ENV",
     "DEFAULT_BASE_URL",
+    "DEFAULT_PUBLIC_BASE",
     "NETWORK_ERROR_CODE",
+    "POLL_CONFIRMED",
+    "POLL_DENIED",
+    "POLL_PENDING",
+    "PUBLIC_ERROR_CODE",
     "SECRET_HEADER",
     "Balance",
     "BotClient",
@@ -50,12 +59,19 @@ __all__ = [
     "BotError",
     "BotStore",
     "BotUnreachable",
+    "Challenge",
     "CurrentSession",
     "IssuedSession",
+    "LoginLink",
+    "LoginPoll",
     "PromoValidation",
     "Referral",
     "Subscription",
+    "TelegramAuthClient",
+    "TelegramLogin",
     "UnlinkPreview",
+    "public_code_and_secret",
+    "secret_hash",
 ]
 
 # Плейсхолдер: внутренний роутер бота живёт на loopback, но конкретный порт —
@@ -78,6 +94,43 @@ SECRET_HEADER = "X-Internal-Secret"
 NETWORK_ERROR_CODE = "bot_unreachable"
 
 BOT_PATH = "/internal"
+
+# --- публичный клиентский API бота: вход по Telegram ----------------------
+#
+# Это **другой** сервис, а не второй путь того же роутера. Внутренний
+# (`/internal/*`) отдаёт аккаунты и подписки и требует общий секрет; публичный
+# (`/api/v1/*`) ведёт вход и работает без секрета — он и так выставлен наружу,
+# его адрес знает клиент. Смешать их значило бы либо отправить общий секрет в
+# сервис, который его не ждёт, либо оставить вход без секрета там, где он нужен.
+# Поэтому у публичного клиента своя база и свой транспорт, а общий с внутренним
+# у них ровно один — разбор отказа и недоступности (`_error_from_response`,
+# `BotUnreachable`): формат ошибок у бота один (§1).
+#
+# Адрес тоже из окружения: в бою рядом с кабинетом клиентский API слушает на
+# loopback, но это деталь развёртывания, а не константа публичного репозитория.
+DEFAULT_PUBLIC_BASE = "http://127.0.0.1:8006"
+BOT_PUBLIC_BASE_ENV = "BOT_PUBLIC_BASE"
+
+AUTH_LINK_PATH = "/api/v1/auth/link"
+AUTH_POLL_PATH = "/api/v1/auth/poll"
+
+# Статусы опроса (§5 публичного контракта). Имена — часть контракта бота, а не
+# подписи: ветвиться по ним, а не по тексту.
+POLL_PENDING = "pending"
+POLL_DENIED = "denied"
+POLL_CONFIRMED = "confirmed"
+
+# Длина кода и секрета челленджа. Числа как у кодов `AuthMail`: `secrets` даёт
+# непредсказуемость, а длина — запас против перебора. `public_code` короче не
+# потому, что он менее важен, а потому что он уходит в ссылку и в `start`-payload
+# Telegram, где длина ограничена.
+PUBLIC_CODE_BYTES = 16
+SECRET_BYTES = 32
+
+# Код для случая «публичный API ответил не в формате контракта». Отделён от кодов
+# бота по той же причине, что `NETWORK_ERROR_CODE`: расхождение формата — это не
+# отказ входа, и вызывающий код не должен принимать его за «человек отклонил».
+PUBLIC_ERROR_CODE = "public_invalid_response"
 
 # Коды бота (§1 контракта), которые протокол связывания моделирует «нулём
 # изменённых строк», а не исключением: занятое место при привязке и единственный
@@ -1022,3 +1075,302 @@ def _account_from_api(raw: dict[str, Any]) -> Account:
         last_login_at=_parse_datetime(raw.get("last_login_at")),
         blocked=bool(raw.get("blocked", False)),
     )
+
+
+# --- Вход по Telegram: публичный API бота (§5) -----------------------------
+
+
+def public_code_and_secret() -> tuple[str, str]:
+    """Новая пара «код челленджа + секрет» для входа.
+
+    Источник — `secrets`, не `random`: угаданный `public_code` — половина входа,
+    а угаданный секрет — весь он целиком. Оба возвращаются вместе, потому что
+    порознь они смысла не имеют: секрет существует ровно ради этого кода.
+    """
+    return (
+        secrets.token_urlsafe(PUBLIC_CODE_BYTES),
+        secrets.token_urlsafe(SECRET_BYTES),
+    )
+
+
+def secret_hash(secret: str) -> str:
+    """Хеш секрета — то, что кабинет отправляет боту при `/auth/link`.
+
+    Бот хранит хеш и сверяет его при опросе: сам секрет у него не лежит. Форма
+    (`sha256` в hex, без префикса) — та, что принимает `secret_matches` бота.
+    """
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class LoginLink:
+    """Ответ `POST /api/v1/auth/link` — начатый челлендж.
+
+    `deep_link` показывает человеку «Открыть Telegram»; `expires_at` задаёт срок
+    челленджа. Срок берётся **у бота**, а не выдумывается кабинетом: челлендж
+    живёт там, и свой таймер разошёлся бы с ним — кабинет считал бы вход живым,
+    когда бот его уже погасил, и наоборот.
+    """
+
+    deep_link: str
+    expires_at: datetime | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> LoginLink:
+        """Собрать из ответа бота, не доверяя его форме: пропавшее поле не должно
+        ронять начало входа, а незнакомый срок — трактоваться как «истёк»."""
+        return cls(
+            deep_link=str(raw.get("deep_link", "")),
+            expires_at=_parse_datetime(raw.get("expires_at")),
+        )
+
+
+@dataclass(frozen=True)
+class LoginPoll:
+    """Ответ `POST /api/v1/auth/poll` — что случилось с челленджем.
+
+    `status` — `pending`, `denied` или `confirmed` (§5). На `confirmed` бот
+    отдаёт `account_id` и `chat_id`: аккаунт он уже нашёл или завёл для
+    подтверждённого `chat_id`, и **это единственный источник личности**.
+    `account_id` здесь `None`, если бот его не прислал, — вызывающий обязан
+    отказать, а не догадываться по `chat_id` (§3.3).
+
+    `retry_after_ms` приходит только с `pending`: сколько ждать до следующего
+    опроса. Читается через `.get`, потому что ответ приходит из другого
+    репозитория, и пропавшее поле не должно ронять разбор.
+    """
+
+    status: str
+    retry_after_ms: int | None = None
+    account_id: int | None = None
+    chat_id: int | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> LoginPoll:
+        """Собрать из ответа бота, не доверяя его форме.
+
+        `account_id`/`chat_id` читаются как `int | None`, а не приводятся к нулю:
+        ноль — валидный по типу, но ложный идентификатор, и подстановка его
+        означала бы вход в чужой аккаунт вместо честного отказа.
+        """
+        return cls(
+            status=str(raw.get("status", "")),
+            retry_after_ms=_optional_int(raw.get("retry_after_ms")),
+            account_id=_optional_int(raw.get("account_id")),
+            chat_id=_optional_int(raw.get("chat_id")),
+        )
+
+
+def _optional_int(value: Any) -> int | None:
+    """Целое из ответа бота или `None`. Нечисловое — `None`, а не исключение."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class Challenge:
+    """Начатый челлендж входа: секрет, ссылка и срок. Живёт только в памяти.
+
+    Секрет тут потому, что опрос требует его вместе с кодом, а хранить его в
+    браузере нельзя: он даёт завершить вход. Ссылка — чтобы экран мог предложить
+    «открыть бота ещё раз» на повторном показе, не начиная новый челлендж.
+    """
+
+    secret: str
+    deep_link: str
+    expires_at: datetime | None = None
+
+
+@dataclass
+class TelegramLogin:
+    """Состояние начатых челленджей входа в памяти процесса кабинета.
+
+    **Почему в памяти.** Тот же выбор, что у кодов `AuthMail` (§3.4 спеки): кабинет
+    не трогает базу, а челлендж живёт минуты и переживать перезапуск не должен —
+    его срок задаёт бот. Перезапуск процесса просто теряет начатые входы, и это
+    честное состояние: человек начинает заново, а не входит по протухшему.
+
+    **Ключ — `public_code`.** Он не секрет: он и так у человека в `deep_link` и
+    уходит в скрытое поле формы. Секрет по нему находится только здесь, на
+    сервере, и в разметку не попадает никогда.
+
+    **Опрос не забирает запись.** При `pending` человек опрашивает снова, и
+    запись обязана пережить это; гасит её только исход (`forget`) — успех,
+    отказ или истечение.
+    """
+
+    now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    _challenges: dict[str, Challenge] = field(default_factory=dict, init=False, repr=False)
+
+    def remember(
+        self,
+        public_code: str,
+        *,
+        secret: str,
+        deep_link: str,
+        expires_at: datetime | None = None,
+    ) -> None:
+        """Запомнить начатый челлендж. Заодно убирает протухшие.
+
+        Чистка здесь, а не по таймеру: таймеров в процессе кабинета нет, а
+        растущий словарь — утечка. Свежий вход — естественная точка, где старые
+        записи точно никому не нужны.
+        """
+        self._prune()
+        self._challenges[public_code] = Challenge(
+            secret=secret, deep_link=deep_link, expires_at=_as_utc(expires_at)
+        )
+
+    def get(self, public_code: str | None) -> Challenge | None:
+        """Челлендж по коду или `None`. Протухший — `None` и забывается."""
+        if not public_code:
+            return None
+        challenge = self._challenges.get(public_code)
+        if challenge is None:
+            return None
+        if self._expired(challenge):
+            del self._challenges[public_code]
+            return None
+        return challenge
+
+    def secret_for(self, public_code: str) -> str:
+        """Секрет челленджа. Нужен только своим кодом кабинета — не для экрана."""
+        return self._challenges[public_code].secret
+
+    def forget(self, public_code: str) -> None:
+        """Погасить челлендж: он завершён, отказом или успехом."""
+        self._challenges.pop(public_code, None)
+
+    def _prune(self) -> None:
+        for code in [c for c, ch in self._challenges.items() if self._expired(ch)]:
+            del self._challenges[code]
+
+    def _expired(self, challenge: Challenge) -> bool:
+        """Истёк ли челлендж. Без срока — считаем живым: срок задаёт бот, и
+        выдумывать свой значило бы гасить вход раньше, чем это делает он."""
+        if challenge.expires_at is None:
+            return False
+        return self.now() >= challenge.expires_at
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Привести срок к UTC. Наивное время бот пишет как UTC (тот же приём, что
+    в `cabinet.sessions._as_utc`), и сравнивать его с зональным иначе нельзя."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+class TelegramAuthClient:
+    """Клиент публичного API бота: начало входа и опрос подтверждения (§5).
+
+    **Синхронный, в отличие от `BotClient`.** Роуты кабинета синхронные, и
+    синхронный клиент здесь — не упрощение, а отсутствие лишнего звена: у
+    внутреннего клиента асинхронность нужна была потому, что он уже был
+    асинхронным, и для роутов к нему пришлось писать адаптер `BotStore`. Здесь
+    адаптера нет вовсе, и держать его незачем.
+
+    **Секрета у него нет.** Публичный API его не требует — он для внешних
+    клиентов. Общий секрет внутреннего роутера сюда не передаётся и не должен:
+    иначе он уходил бы в сервис, который его не проверяет, и в логи той стороны.
+
+    **Что клиент не делает.** Он не хранит секрет челленджа — это дело
+    `TelegramLogin`; он не решает, что показать человеку; и он не заводит аккаунт
+    сам. Ответ опроса отдаётся как есть, а трактовка (`pending`/`denied`/
+    `confirmed`, отказ по коду) — дело вызывающего.
+    """
+
+    def __init__(self, base_url: str | None = None, *, client: httpx.Client | None = None) -> None:
+        self.base_url = (base_url or os.getenv(BOT_PUBLIC_BASE_ENV) or DEFAULT_PUBLIC_BASE).rstrip(
+            "/"
+        )
+        self._client = client or httpx.Client(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(
+                DEFAULT_TOTAL_TIMEOUT,
+                connect=DEFAULT_CONNECT_TIMEOUT,
+                read=DEFAULT_READ_TIMEOUT,
+            ),
+        )
+
+    @classmethod
+    def from_env(cls, source: Mapping[str, str]) -> TelegramAuthClient:
+        """Собрать из окружения, как `MailSender.from_env`.
+
+        Адрес — настройка развёртывания, но пустая переменная здесь читается как
+        «взять умолчание», а не как отказ: умолчание — loopback рядом с
+        кабинетом, где клиентский API и слушает. В отличие от адреса внутреннего
+        роутера, промахнуться тут некуда: за loopback другой сервис не отвечает.
+        """
+        return cls(base_url=source.get(BOT_PUBLIC_BASE_ENV, "").strip() or None)
+
+    def start_login(self, public_code: str, secret_hash_value: str) -> LoginLink:
+        """Начать челлендж: `public_code` + `secret_hash` → ссылка `deep_link`.
+
+        Ссылку строит бот: именем бота владеет он, и собранная кабинетом ссылка
+        однажды разошлась бы с настоящей. Возвращается ссылка и её срок — больше
+        экрану показывать нечего, а срок нужен, чтобы гасить протухшие челленджи
+        в памяти.
+        """
+        return LoginLink.from_api(
+            self._request(
+                "POST",
+                AUTH_LINK_PATH,
+                json={"public_code": public_code, "secret_hash": secret_hash_value},
+            )
+        )
+
+    def poll_login(self, public_code: str, secret: str, device_nonce: str) -> LoginPoll:
+        """Опрос подтверждения: `public_code` + `secret` (+ код из Telegram).
+
+        `device_nonce` — код, который бот прислал человеку в чат; его вводит
+        человек. Бот требует его лишь тогда, когда подтверждение уже произошло,
+        но отправляем всегда: пустой код — это `nonce_mismatch` (человеку «код
+        не подошёл»), а не спор с ботом о порядке проверок.
+
+        Отказы по коду (`invalid_secret`, `operation_not_found`,
+        `already_consumed`, `nonce_mismatch`) приходят сюда `BotError` — разбор
+        общий с внутренним клиентом, и код доходит до вызывающего неизменным.
+        """
+        return LoginPoll.from_api(
+            self._request(
+                "POST",
+                AUTH_POLL_PATH,
+                json={"public_code": public_code, "secret": secret, "device_nonce": device_nonce},
+            )
+        )
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Один запрос к публичному API: сеть, статус, разбор ответа.
+
+        Заголовка с секретом здесь нет намеренно — у этого сервиса секрета нет.
+        Обработка ошибок та же, что у внутреннего клиента, и это не дублирование
+        ради красоты: формат отказа у бота один, и вторая его копия разошлась бы
+        ровно там, где код отказа и надо различить.
+        """
+        try:
+            response = self._client.request(method, path, **kwargs)
+        except _NETWORK_ERRORS as exc:
+            raise BotUnreachable(
+                f"запрос к публичному API бота не удался: {exc.__class__.__name__}", cause=exc
+            ) from exc
+
+        if response.status_code >= 400:
+            raise _error_from_response(response)
+        if not response.content:
+            return {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BotError(
+                PUBLIC_ERROR_CODE, "бот вернул не-JSON", status=response.status_code
+            ) from exc
+        if not isinstance(payload, dict):
+            raise BotError(PUBLIC_ERROR_CODE, "бот вернул не объект", status=response.status_code)
+        return payload
