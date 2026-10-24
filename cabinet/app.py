@@ -85,6 +85,7 @@ from cabinet.payments import (
 from cabinet.pending_mail import PendingMail
 from cabinet.pricing import PRICES, calculate_price
 from cabinet.render import (
+    BUY_DONE_URL,
     DEFAULT_BUY_DAYS,
     DEFAULT_BUY_DEVICES,
     PURCHASE_DEVICES,
@@ -101,8 +102,9 @@ from cabinet.render import (
     render_login_telegram,
     render_login_waiting,
     render_subscriptions,
+    trial_refusal_note,
 )
-from cabinet.sessions import SessionService, SingleSessionStore
+from cabinet.sessions import SessionService, SessionView, SingleSessionStore
 from cabinet.signin import MailSignInError, SignInError, SignInService
 from cabinet.subscriptions import SubscriptionView, subscription_views
 from cabinet.theme import Tone
@@ -335,14 +337,20 @@ BUY_SERVERS_ERROR = "Список серверов не получен. Обно
 BUY_PAY_DESCRIPTION = "Подписка VPN"
 
 
-def _purchase_query(days: int, devices: int, picks: list[str]) -> str:
+def _purchase_query(days: int, devices: int, picks: list[str], *, free: bool = False) -> str:
     """Общая часть адресов покупки: `days`, `devices` и повторяющиеся `pick`.
 
     Один сборщик на экран оплаты, возврат к серверам и повтор: набор у них один,
     и вторая копия формата разошлась бы при первой правке.
+
+    `free` едет вместе с набором: без него возврат на экран оплаты потерял бы
+    признак бесплатного пути, и человек, отказавшийся от бесплатного доступа,
+    вернулся бы к оплате того же самого.
     """
     parts = [f"days={days}", f"devices={devices}"]
     parts.extend(f"pick={quote(code)}" for code in picks)
+    if free:
+        parts.append("free=1")
     return "&".join(parts)
 
 
@@ -1165,6 +1173,7 @@ def _add_subscription_routes(
         request: Request,
         days: int | None = Query(default=None),
         devices: int | None = Query(default=None),
+        free: bool = False,
     ) -> Response:
         """Шаг 3 покупки: сводка заказа и честное право на триал.
 
@@ -1192,6 +1201,11 @@ def _add_subscription_routes(
                 devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
                 trial=trial,
                 trial_unreachable=trial_unreachable,
+                # Признак бесплатного пути экран не проверяет, а **несёт дальше**:
+                # проверка права стоит на шаге оплаты, там же, где выдаётся
+                # конфиг. Здесь он нужен только чтобы кнопка и адрес не потеряли
+                # бесплатную пару по дороге.
+                free=free,
             )
         )
 
@@ -1203,6 +1217,7 @@ def _add_subscription_routes(
         # `Annotated`, а не `= Query(...)`: список в значении по умолчанию
         # изменяем, и ruff справедливо не считает его неизменным (`B008`).
         pick: Annotated[list[str] | None, Query()] = None,
+        free: bool = False,
     ) -> Response:
         """Шаг 4 покупки: выбрать ровно столько серверов, сколько устройств.
 
@@ -1237,16 +1252,30 @@ def _add_subscription_routes(
                 servers=servers,
                 picked=picks,
                 error=error,
+                free=free,
             )
         )
 
-    def _pay_screen(state: str, days: int, devices: int, picks: list[str] | None) -> HTMLResponse:
+    def _pay_screen(
+        state: str,
+        days: int,
+        devices: int,
+        picks: list[str] | None,
+        *,
+        free: bool = False,
+        note: str | None = None,
+    ) -> HTMLResponse:
         """Экран отказа на шаге оплаты: текст и действие по состоянию.
 
         Оба адреса (повтор и возврат к серверам) собираются из того же набора,
         что пришёл: набор у них один, и вторую копию формата держать незачем.
+        Признак `free` едет в них вместе с набором — иначе повтор запустил бы
+        платный путь вместо бесплатного.
+
+        `note` — причина отказа, когда её знает не экран, а бот (отказ в
+        бесплатном доступе).
         """
-        query = _purchase_query(days, devices, list(picks or []))
+        query = _purchase_query(days, devices, list(picks or []), free=free)
         return HTMLResponse(
             render_buy_pay(
                 state=state,
@@ -1254,8 +1283,66 @@ def _add_subscription_routes(
                 devices=devices,
                 back_url=f"/buy/servers?{query}",
                 retry_url=f"/buy/pay?{query}",
+                note=note,
             )
         )
+
+    def _free_access(
+        view: SessionView, account_store: AccountStore, days: int, devices: int, picks: list[str]
+    ) -> Response:
+        """Бесплатный путь: проверка права → заказ с нулевой суммой → выдача.
+
+        Право проверяется **здесь**, а не только на экране подтверждения:
+        `free=1` приходит из адреса, а адрес можно набрать руками. Признак
+        бесплатного пути не должен сам по себе ничего давать — иначе бесплатный
+        доступ получал бы любой, кто дописал параметр.
+
+        Пара берётся из констант, а не из адреса (`days`/`devices` сюда приходят
+        уже подменёнными на бесплатные): `free=1&days=360&devices=3` иначе выдал
+        бы год на три устройства даром.
+
+        Сумма заказа — **ноль**, а не цена тридцати дней: бесплатность здесь не
+        скидка, а право на пробный период, и платёж по такому заказу не
+        создаётся вовсе.
+        """
+        trial, unreachable = _trial_eligibility(account_store, view.account_id)
+        if unreachable:
+            return _pay_screen("bot_unreachable", days, devices, picks, free=True)
+        if trial is None or not trial.eligible:
+            if trial is not None and trial.reason == "telegram_required":
+                return _pay_screen("telegram_required", days, devices, picks, free=True)
+            return _pay_screen(
+                "trial_refused",
+                days,
+                devices,
+                picks,
+                free=True,
+                note=trial_refusal_note(trial.reason if trial is not None else None),
+            )
+        try:
+            order = account_store.create_order(
+                account_id=view.account_id,
+                days=days,
+                devices=devices,
+                servers=picks,
+                amount_rub=0,
+            )
+        except BotError as exc:
+            state = "telegram_required" if exc.code == "telegram_required" else "rejected"
+            return _pay_screen(state, days, devices, picks, free=True)
+        except BotUnreachable:
+            return _pay_screen("bot_unreachable", days, devices, picks, free=True)
+
+        # Заказ подтверждается тем же способом, что оплаченный: `changed` здесь
+        # тоже первый переход, и выдача с письмом идут одним путём. Платежа нет —
+        # и это не пропущенный шаг: подтверждением служит право на триал,
+        # проверенное выше.
+        try:
+            account_store.mark_order_paid(order.order_id, amount_rub=0)
+        except (BotError, BotUnreachable):
+            return _pay_screen("bot_unreachable", days, devices, picks, free=True)
+        _fulfil_paid_order(account_store, mail_sender, order, order.order_id)
+        return RedirectResponse(f"{BUY_DONE_URL}?order_id={quote(order.order_id)}", status_code=303)
 
     @app.get("/buy/pay", response_class=HTMLResponse)
     def buy_pay_page(
@@ -1263,30 +1350,39 @@ def _add_subscription_routes(
         days: int | None = Query(default=None),
         devices: int | None = Query(default=None),
         pick: Annotated[list[str] | None, Query()] = None,
+        free: bool = False,
     ) -> Response:
-        """Шаг 5: собрать заказ, создать платёж и увести на страницу оплаты.
+        """Шаг 5: собрать заказ и завершить покупку — оплатой или бесплатно.
 
         **Цена не читается из адреса.** Её считает `calculate_price` по паре
         `days`/`devices`, она же записывается в заказ бота, и платёж берёт сумму
         **из заказа** (`order.amount_rub`). Взятая от браузера сумма позволила бы
         купить за рубль — это первый пункт Review Focus плана.
 
+        `free=True` — бесплатный путь, и тогда пара **не из адреса**, а
+        бесплатная (30 дней, одно устройство): право на триал проверяется здесь
+        же, и без подмены пары `free=1` в ссылке давал бы что угодно даром.
+
         Состояния разведены и не смешиваются: нет сессии — на вход; у аккаунта
         нет Telegram — бот отказывает `telegram_required`, и экран объясняет, что
         конфиг выдаётся Telegram-аккаунту (граница сервиса, а не сбой); бот не
-        ответил — своё состояние; платёж не создан — своё. Успех — **редирект** на
-        страницу ЮKassa, а не экран.
+        ответил — своё состояние; платёж не создан — своё; право на бесплатный
+        доступ не подтверждено — своё, с причиной от бота. Успех — **редирект**
+        (на страницу ЮKassa или на экран возврата), а не экран.
         """
         view = sessions.resolve(request.cookies.get(COOKIE_NAME))
         if view is None:
             return RedirectResponse("/login", status_code=303)
-        chosen_days = days if days in PRICES else DEFAULT_BUY_DAYS
-        chosen_devices = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
+        if free:
+            chosen_days, chosen_devices = DEFAULT_BUY_DAYS, DEFAULT_BUY_DEVICES
+        else:
+            chosen_days = days if days in PRICES else DEFAULT_BUY_DAYS
+            chosen_devices = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
 
         try:
             servers = store.list_servers()
         except (BotError, BotUnreachable):
-            return _pay_screen("bot_unreachable", chosen_days, chosen_devices, pick)
+            return _pay_screen("bot_unreachable", chosen_days, chosen_devices, pick, free=free)
         # Набор сверяется со списком, который кабинет получил: код, которого в
         # списке нет, пришёл из чужой или устаревшей ссылки, и оформить на него
         # заказ значило бы записать несуществующий сервер. Неполный набор — не
@@ -1294,7 +1390,10 @@ def _add_subscription_routes(
         known = {server.code for server in servers}
         picks = [code for code in (pick or []) if code in known][:chosen_devices]
         if len(picks) != chosen_devices:
-            return _pay_screen("incomplete", chosen_days, chosen_devices, picks)
+            return _pay_screen("incomplete", chosen_days, chosen_devices, picks, free=free)
+
+        if free:
+            return _free_access(view, store, chosen_days, chosen_devices, picks)
 
         amount = calculate_price(chosen_days, chosen_devices).final_price
         try:

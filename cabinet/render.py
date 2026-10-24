@@ -86,6 +86,7 @@ __all__ = [
     "render_login_telegram",
     "render_login_waiting",
     "render_buy",
+    "trial_refusal_note",
     "render_buy_confirm",
     "render_buy_done",
     "render_buy_pay",
@@ -584,23 +585,45 @@ DAYS_PER_MONTH = 30
 # только на них у `pricing` есть скидка; четвёртый вариант обещал бы несуществующее.
 PURCHASE_DEVICES = (1, 2, 3)
 
-# Проценты комплекта берутся у `pricing`, а не пишутся числами: правка скидки в
-# одном месте не должна оставить на экране старый процент.
-_DEVICE_DISCOUNT_PERCENTS = {
-    2: pricing.BUNDLE_2_DEVICES_DISCOUNT_PERCENT,
-    3: pricing.BUNDLE_3_DEVICES_DISCOUNT_PERCENT,
-}
+# Рекомендуемый срок. Док продающего кабинета (§2) просит выделить **один**
+# вариант: выбор из четырёх без подсказки — трение, а глаз идёт к подсказанному.
+# Именно 180 дней, как записано в доке.
+RECOMMENDED_DAYS = 180
+BUY_RECOMMENDED_LABEL = "Рекомендуем"
 
-# Текст про триал на шаге выбора тарифа (1–2). Он по-прежнему **не** обещает
-# бесплатный доступ: право на триал проверяется на шаге подтверждения, и здесь
-# проверка ещё не сделана — обещать «бесплатно» до неё значило бы обещать то,
-# чего кабинет на этом экране не подтвердил. Что изменилось после шага 3: там
-# право уже **проверяется** у бота, поэтому здесь сказано, где именно это
-# произойдёт, — а не что кабинет этого не умеет вовсе.
-BUY_TRIAL_NOTE = (
-    "Пробный период дают один раз — новым покупателям. "
-    "Право на него кабинет проверит на шаге подтверждения."
-)
+# Продающий слой: тексты, которые снимают трение (§3, §4, §6 док).
+#
+# Цвета здесь нет намеренно. Док §5 разбирает это отдельно: у нас цвет несёт
+# **состояние** (зелёный — замер, янтарный — процесс, красный — опасность), и
+# покрасить кнопку в акцентный цвет значило бы завести второе значение у того
+# же средства. Заметность делается размером, весом и положением.
+#
+# Микрокопия под кнопкой — самый дешёвый пункт списка (§6 п. 1): одна строка, а
+# человек перестаёт бояться, что нажатие спишет деньги или попросит карту.
+BUY_MICROCOPY = "Без карты на входе. Оплата — после выбора серверов."
+SERVERS_MICROCOPY = "Оплата картой через ЮKassa. Автопродления нет."
+CONFIRM_MICROCOPY = "Дальше — выбор серверов, оплата последним шагом."
+
+# Бесплатный доступ — отдельным блоком и **выше** платных тарифов (§1, §6 п. 2).
+# Он ведёт в тот же путь, но с бесплатной парой; право на него проверяет
+# следующий экран, и обещать здесь успех нечем.
+BUY_FREE_TITLE = "30 дней бесплатно"
+BUY_FREE_LEAD = "Пробный период: 30 дней и одно устройство. Карта не нужна."
+BUY_FREE_CTA = "Начать бесплатно"
+SERVERS_FREE_CTA = "Получить бесплатно"
+SERVERS_FREE_MICROCOPY = "Списаний не будет: это бесплатный доступ."
+# Отказ по бесплатному доступу: заголовок свой, текст — причина от бота
+# (`TRIAL_REASON_TEXTS`), потому что причины разные и человеку нужна его.
+PAY_TRIAL_TITLE = "Бесплатный доступ недоступен"
+
+# Проценты комплекта здесь больше не нужны: на экране экономия в рублях (§6 п. 4
+# дока), а процент остался в текстах бота. Сама скидка считается в `pricing` —
+# кабинет её не повторяет.
+
+# Отдельного текста про триал у варианта «30 дней» больше нет: бесплатный доступ
+# назван своим блоком выше тарифов (`BUY_FREE_*`), и вторая надпись про то же
+# читалась бы как два разных предложения. Право на триал по-прежнему проверяется
+# на шаге подтверждения — и проверка стоит на пути, а не в тексте.
 
 
 def _pluralize_devices(count: int) -> str:
@@ -640,9 +663,8 @@ def _buy_periods(
                 "price": _rubles(price),
                 "per_month": _rubles(price * DAYS_PER_MONTH // period),
                 "selected": period == days,
+                "recommended": period == RECOMMENDED_DAYS,
                 "url": f"/buy?days={period}&devices={devices}",
-                # Триал помечен только у 30 дней и только честно (см. BUY_TRIAL_NOTE).
-                "trial_note": BUY_TRIAL_NOTE if period == DEFAULT_BUY_DAYS else None,
             }
         )
     return rows
@@ -661,12 +683,13 @@ def _buy_devices(
     rows = []
     for count in PURCHASE_DEVICES:
         quote = calculator(days, count)
-        percent = _DEVICE_DISCOUNT_PERCENTS.get(count)
         rows.append(
             {
                 "count": count,
                 "label": _pluralize_devices(count),
-                "discount": f"-{percent}%" if percent else None,
+                # Рубли, а не проценты (§6 п. 4 дока): «−10%» требует счёта, а
+                # «экономия 28 ₽» — нет. Сумма приходит из ответа калькулятора,
+                # поэтому она не может разойтись со скидкой, которую он применил.
                 "saved": _rubles(quote.bundle_discount) if quote.bundle_discount else None,
                 "total": _rubles(quote.final_price),
                 "selected": count == devices,
@@ -701,6 +724,17 @@ def render_buy(
         # существовали, а путь обрывался: человек выбирал тариф и дальше мог
         # попасть только зная адрес. Нашёл сквозной прогон.
         confirm_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}",
+        # Бесплатный доступ — тот же путь с бесплатной парой и признаком `free`.
+        # Признак обязателен: на шаге оплаты по нему кабинет пойдёт бесплатным
+        # путём, а без него тот же адрес привёл бы к оплате 30 дней за 140 ₽.
+        free_url=(
+            f"{BUY_CONFIRM_URL}?days={DEFAULT_BUY_DAYS}&devices={DEFAULT_BUY_DEVICES}&free=1"
+        ),
+        free_title=BUY_FREE_TITLE,
+        free_lead=BUY_FREE_LEAD,
+        free_cta=BUY_FREE_CTA,
+        microcopy=BUY_MICROCOPY,
+        recommended_label=BUY_RECOMMENDED_LABEL,
     )
 
 
@@ -754,6 +788,17 @@ TRIAL_UNREACHABLE_NOTE = (
 )
 
 
+def trial_refusal_note(reason: str | None) -> str:
+    """Причина отказа в бесплатном доступе — человеческим текстом.
+
+    Одна функция на два места: шаг подтверждения показывает эту причину в блоке
+    триала, а шаг оплаты — на экране отказа бесплатного пути. Вторая копия
+    подстановки разошлась бы при первой правке, и человек прочитал бы на одном
+    экране объяснение, а на другом — код.
+    """
+    return TRIAL_REASON_TEXTS.get(reason or "", TRIAL_UNKNOWN_REASON_NOTE)
+
+
 def _trial_context(trial: TrialEligibility | None, *, unreachable: bool) -> dict[str, object]:
     """Право на триал, каким его видит разметка: факт, причина или сбой.
 
@@ -779,7 +824,7 @@ def _trial_context(trial: TrialEligibility | None, *, unreachable: bool) -> dict
             "trial_note": TRIAL_AVAILABLE_NOTE,
         }
     reason = trial.reason if trial is not None else None
-    note = TRIAL_REASON_TEXTS.get(reason or "", TRIAL_UNKNOWN_REASON_NOTE)
+    note = trial_refusal_note(reason)
     return {
         "trial_state": "refused",
         "trial_available": False,
@@ -793,6 +838,7 @@ def render_buy_confirm(
     devices: int = DEFAULT_BUY_DEVICES,
     trial: TrialEligibility | None = None,
     trial_unreachable: bool = False,
+    free: bool = False,
     calculator: Callable[..., PriceQuote] = pricing.calculate_price,
 ) -> str:
     """Шаг 3: сводка заказа и честное право на триал.
@@ -810,12 +856,17 @@ def render_buy_confirm(
     адресом, и хранить черновик на сервере здесь нечего.
     """
     quote_ = calculator(days, devices)
+    # Признак бесплатного пути едет дальше — до шага оплаты. Без него тот же
+    # адрес привёл бы к оплате: шаг оплаты решает по нему, брать деньги или
+    # выдавать по праву на триал.
+    suffix = "&free=1" if free else ""
     return _ENV.get_template("buy_confirm.html").render(
         **_base_context(),
         days_label=_pluralize_days(days),
         devices_label=_pluralize_devices(devices),
         total=_rubles(quote_.final_price),
-        total_url=f"{BUY_SERVERS_URL}?days={days}&devices={devices}",
+        total_url=f"{BUY_SERVERS_URL}?days={days}&devices={devices}{suffix}",
+        microcopy=CONFIRM_MICROCOPY,
         back_url=f"/buy?days={days}&devices={devices}",
         **_trial_context(trial, unreachable=trial_unreachable),
     )
@@ -838,7 +889,7 @@ def _pluralize_servers(count: int) -> str:
     return f"{count} серверов"
 
 
-def _order_url(base: str, days: int, devices: int, picks: list[str]) -> str:
+def _order_url(base: str, days: int, devices: int, picks: list[str], *, free: bool = False) -> str:
     """Адрес шага покупки с текущим набором в query.
 
     Выбор выражается **адресом**, а не скрытым состоянием: так экран работает
@@ -848,15 +899,21 @@ def _order_url(base: str, days: int, devices: int, picks: list[str]) -> str:
 
     Один сборщик на выбор серверов и на оплату: оба адреса несут один и тот же
     набор, и вторая копия формата разошлась бы при первой правке.
+
+    `free` едет в адресе вместе с набором, и это **не** украшение: потеряйся он
+    на ссылке «Добавить» — и человек, начавший с бесплатной кнопки, оказался бы
+    на экране оплаты за те же 30 дней. Нашёл сквозной прогон бесплатного пути.
     """
     parts = [f"days={days}", f"devices={devices}"]
     parts.extend(f"pick={quote(code)}" for code in picks)
+    if free:
+        parts.append("free=1")
     return f"{base}?{'&'.join(parts)}"
 
 
-def _servers_url(days: int, devices: int, picks: list[str]) -> str:
+def _servers_url(days: int, devices: int, picks: list[str], *, free: bool = False) -> str:
     """Адрес выбора серверов — тот же сборщик, что у оплаты (`_order_url`)."""
-    return _order_url(BUY_SERVERS_URL, days, devices, picks)
+    return _order_url(BUY_SERVERS_URL, days, devices, picks, free=free)
 
 
 def render_buy_servers(
@@ -866,6 +923,7 @@ def render_buy_servers(
     servers: list[Server] | None = None,
     picked: list[str] | None = None,
     error: str | None = None,
+    free: bool = False,
 ) -> str:
     """Шаг 4: выбор ровно столько серверов, сколько устройств (спека §1).
 
@@ -886,6 +944,10 @@ def render_buy_servers(
     picked = list(picked or [])
     total_picked = len(picked)
     complete = total_picked == devices
+    # Признак бесплатного пути едет во **все** ссылки экрана — и в добавление
+    # сервера, и в возврат к подтверждению. Потеряется на любой из них — и
+    # человек вернётся к оплате того, что взял бесплатно.
+    suffix = "&free=1" if free else ""
     rows = []
     for server in servers:
         chosen = picked.count(server.code)
@@ -900,10 +962,12 @@ def render_buy_servers(
                 "chosen_label": _pluralize_servers(chosen) if chosen else None,
                 "can_add": can_add,
                 "can_remove": chosen > 0,
-                "add_url": _servers_url(days, devices, [*picked, server.code]),
+                "add_url": _servers_url(days, devices, [*picked, server.code], free=free),
                 # Убираем **одно** вхождение: сервер мог стоять дважды, и снять
                 # сразу оба значило бы потерять задуманный комплект.
-                "remove_url": _servers_url(days, devices, _without_one(picked, server.code)),
+                "remove_url": _servers_url(
+                    days, devices, _without_one(picked, server.code), free=free
+                ),
             }
         )
     return _ENV.get_template("buy_servers.html").render(
@@ -919,10 +983,16 @@ def render_buy_servers(
         picked_label=_pluralize_servers(total_picked),
         remaining=devices - total_picked,
         complete=complete,
-        back_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}",
+        back_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}{suffix}",
         # Ссылка на оплату — только когда набор полон: «Готово» и есть то
         # состояние, в котором шаг 5 достижим. Сам адрес несёт выбранный набор.
-        pay_url=_order_url(BUY_PAY_URL, days, devices, picked),
+        #
+        # На бесплатном пути кнопка не обещает оплаты: там не платят. Текст и
+        # микрокопия переключаются признаком `free`, а сам признак едет в адрес
+        # шага 5 — он решает, брать деньги или выдавать по праву на триал.
+        pay_url=_order_url(BUY_PAY_URL, days, devices, picked, free=free),
+        pay_label=SERVERS_FREE_CTA if free else "Перейти к оплате",
+        pay_microcopy=SERVERS_FREE_MICROCOPY if free else SERVERS_MICROCOPY,
     )
 
 
@@ -1011,6 +1081,8 @@ def render_buy_pay(
     devices: int = DEFAULT_BUY_DEVICES,
     back_url: str | None = None,
     retry_url: str | None = None,
+    buy_url: str = "/buy",
+    note: str | None = None,
 ) -> str:
     """Шаг 5: экран оплаты в состояниях, когда увести на оплату нельзя.
 
@@ -1022,8 +1094,12 @@ def render_buy_pay(
     человека единственную подсказку, что делать.
 
     `state` — имя состояния (`telegram_required`, `incomplete`, `bot_unreachable`,
-    `rejected`, `payment_failed`). Разметка берёт по нему текст и действие, а не
-    ветвится по сырым строкам на месте.
+    `rejected`, `payment_failed`, `trial_refused`). Разметка берёт по нему текст
+    и действие, а не ветвится по сырым строкам на месте.
+
+    `note` — текст для состояний, у которых он **не свой**: отказ в бесплатном
+    доступе называет причину, а причину знает бот (`TRIAL_REASON_TEXTS`), и
+    подставлять туда общую фразу значило бы скрыть от человека, почему нельзя.
     """
     states: dict[str, dict[str, str | None]] = {
         "telegram_required": {
@@ -1031,6 +1107,15 @@ def render_buy_pay(
             "note": PAY_TELEGRAM_REQUIRED_NOTE,
             "action_url": "/account",
             "action_label": "Привязать Telegram",
+        },
+        "trial_refused": {
+            "title": PAY_TRIAL_TITLE,
+            "note": note,
+            # Действие — выбрать платный тариф, а не вернуться к серверам:
+            # бесплатный путь для этого человека закрыт, и возврат к выбору
+            # серверов вёл бы его по тому же кругу.
+            "action_url": buy_url,
+            "action_label": "Выбрать тариф",
         },
         "incomplete": {
             "title": "Выбор не закончен",

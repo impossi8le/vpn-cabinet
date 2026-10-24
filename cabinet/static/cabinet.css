@@ -250,6 +250,12 @@ a.btn { text-decoration: none; }
   border-radius: var(--radius-card); padding: 13px 15px;
 }
 .opt.is-selected { border-color: var(--ice); background: var(--obsidian); }
+/* Рекомендуемый вариант: заметность **размером и весом**, а не цветом (§5 дока
+   продающего кабинета). Рамка — тот же Ice, что у выделения: он и означает
+   «сюда смотрят», а не состояние. Второй семантики у цвета не появляется. */
+.opt.is-best { border-color: var(--edge); }
+.opt.is-best .opt-t { font-size: 15.5px; }
+.opt.is-best .opt-d { color: var(--ice); }
 .opt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .opt-t { font-size: 15px; font-weight: 590; letter-spacing: -0.012em; color: var(--bone); }
 .opt-p { font-size: 15.5px; font-weight: 590; letter-spacing: -0.012em; color: var(--bone); }
@@ -258,9 +264,22 @@ a.btn { text-decoration: none; }
 /* Скидка комплекта и экономия — нейтральный текст: скидка не защита и не
    опасность, и подсвечивать её нечем (§7). */
 .opt-d { display: block; margin-top: 5px; color: var(--mist); font-size: 12.5px; }
-/* Пояснение к варианту (пробный период). Тихо и без значка: это условие, а не
-   предупреждение и не обещание. */
+/* Пояснение к варианту. Тихо и без значка: это условие, а не предупреждение и
+   не обещание. */
 .opt-note { display: block; margin-top: 6px; color: var(--ash); font-size: 12px; line-height: 1.5; }
-/* Шаг 4: ссылки «Добавить»/«Убрать» внутри варианта сервера — строкой ниже имени.
-   Не инлайн-стилем: набор стилей один на кабинет, и правка живёт здесь. */
 .opt .stack { margin-top: 10px; }
+
+/* Бесплатный доступ — отдельным блоком выше тарифов (§1 и §6 п. 2 дока). Не
+   вариант выбора, а другое предложение, поэтому карточка, а не `.opt`: если
+   нарисовать его пятым вариантом, человек будет сравнивать его с тарифами,
+   а он не тариф. Цвета нет и здесь: заметность даёт размер заголовка. */
+.free-card { margin-bottom: 18px; }
+.free-head { display: flex; align-items: baseline; gap: 10px; }
+.free-t { font-size: 17px; font-weight: 600; letter-spacing: -0.015em; color: var(--bone); }
+.free-lead { margin-top: 6px; color: var(--text-secondary); font-size: 12.5px; line-height: 1.55; }
+.free-card .btn { margin-top: 13px; }
+
+/* Микрокопия под главной кнопкой (§3, §6 п. 1 дока): одна строка, которая
+   снимает страх «спишет сразу» и «нужна карта». Тише основного текста — это
+   пояснение к действию, а не само действие. */
+.micro { margin-top: 10px; color: var(--ash); font-size: 12px; line-height: 1.5; text-align: center; }
