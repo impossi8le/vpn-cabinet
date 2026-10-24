@@ -51,6 +51,7 @@ from fastapi.staticfiles import StaticFiles
 from cabinet.accounts import Account
 from cabinet.auth_mail import AuthMail, AuthMailError, RateLimited
 from cabinet.bot_client import (
+    AUTH_MODE_LINK,
     POLL_CONFIRMED,
     POLL_DENIED,
     POLL_PENDING,
@@ -73,7 +74,7 @@ from cabinet.configs import (
     ConfigSource,
     DownloadLimiter,
 )
-from cabinet.linking import Linking, LinkRefused, UnlinkRefused
+from cabinet.linking import CHAT_ID_TAKEN, Linking, LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailError, MailSender
 from cabinet.payments import (
     PAYMENT_STATUS_SUCCEEDED,
@@ -403,14 +404,54 @@ UNLINK_DONE_MAIL = "Почта отвязана."
 # проекте оставлен подтверждённой защите, а не новому способу входа (§7). Текст
 # говорит, что человек **получил** (вход этим адресом), а не «подключено».
 LINK_DONE_MAIL = "Почта привязана — этим адресом можно входить в кабинет."
-# Привязка Telegram идёт флоу бота, и это звено ещё не подключено в кабинете
-# (W6). Текст честный: кабинет не подставляет `confirmed=True` вручную — это
-# сломало бы главную защиту проекта (привязка только после подтверждения
-# владения, §3.3). Поэтому экран отправляет открыть бота, а не изображает успех.
-LINK_TELEGRAM_BOT_FLOW = (
-    "Привязка Telegram идёт через бота сервиса: откройте бота и подтвердите вход. "
-    "После подтверждения Telegram появится здесь привязанным."
+# Telegram привязан — тем же нейтральным тоном, что и почта (§7: зелёный оставлен
+# подтверждённой защите, а не новому способу входа).
+LINK_DONE_TELEGRAM = "Telegram привязан."
+
+# --- Привязка Telegram: челлендж бота в режиме `link` (issue #65) ----------
+#
+# Тот же флоу, что у входа, но `mode="link"`: бот подтверждает `chat_id`, не
+# заводя аккаунт. Состояния разведены так же, как на экране входа, и по той же
+# причине — за разными причинами стоят разные действия человека.
+# «Подтвердите в Telegram» — пойти в бота; «отклонено» — начать заново; «код не
+# подошёл» — перечитать код; «сервис не отвечает» — подождать.
+#
+# Отказ «этот `chat_id` занят» показан **своим** текстом, а не общим «не удалось»:
+# `chat_id` подтверждён ботом, человек владеет этим Telegram, и молчание не
+# защищает ничьей тайны — только оставляет человека без подсказки (issue #65).
+
+# Привязка начата, но человек ещё не подтвердил её в Telegram.
+LINK_TELEGRAM_PENDING = (
+    "Привязка ещё не подтверждена. Подтвердите её в Telegram и нажмите «Проверить привязку»."
 )
+# Человек отклонил привязку в Telegram — начать заново (кнопка рядом).
+LINK_TELEGRAM_DENIED = "Привязка отклонена в Telegram. Если это были не вы — начните заново."
+# Код из Telegram не подошёл: человек уже подтвердил в боте, действие — перечитать код.
+LINK_TELEGRAM_CODE_ERROR = "Код из Telegram не подошёл. Проверьте цифры и попробуйте ещё раз."
+# Челлендж истёк или уже использован (`operation_not_found`, `already_consumed`).
+LINK_TELEGRAM_EXPIRED = "Время привязки истекло или она уже использована. Начните заново."
+# Челленджа нет: не начинали, он протух или кабинет перезапускался (состояние в
+# памяти). Обычное состояние старой вкладки, а не сбой сервера.
+LINK_TELEGRAM_NOT_STARTED = "Привязка не начата или устарела. Начните заново."
+# Прочий отказ бота (расхождение контракта, неизвестный код).
+LINK_TELEGRAM_FAILED = "Не удалось проверить привязку. Начните заново."
+# Бот недоступен на этом пути. Отдельно от «отклонено»: причина не в человеке.
+LINK_TELEGRAM_BOT_UNREACHABLE = (
+    "Сервис сейчас не отвечает — проверить привязку не удалось. Начните заново чуть позже."
+)
+# `chat_id` уже занят другим аккаунтом (`chat_id_taken`). Свой текст, потому что
+# человеку нужно знать, что делать, а не «не удалось» (issue #65).
+LINK_TELEGRAM_TAKEN = "Этот Telegram уже привязан к другому аккаунту."
+
+# Отказы бота на опросе, у которых есть свой текст. Список закрытый и назван
+# кодами контракта (§1, §5), а не текстом: текст меняется, код — нет. Незнакомый
+# код получает `LINK_TELEGRAM_FAILED`.
+LINK_TELEGRAM_POLL_ERRORS = {
+    "nonce_mismatch": LINK_TELEGRAM_CODE_ERROR,
+    "operation_not_found": LINK_TELEGRAM_EXPIRED,
+    "already_consumed": LINK_TELEGRAM_EXPIRED,
+    "invalid_secret": LINK_TELEGRAM_NOT_STARTED,
+}
 
 # --- Вход через Telegram: челлендж бота (§5) ------------------------------
 #
@@ -649,6 +690,8 @@ def build_app(
         clock=clock,
         auth_mail=auth_mail,
         pending=pending,
+        telegram_auth=telegram_auth,
+        telegram_login=telegram_login,
     )
     return app
 
@@ -1824,6 +1867,8 @@ def _add_account_routes(
     clock: Callable[[], datetime],
     auth_mail: AuthMail,
     pending: PendingMail,
+    telegram_auth: TelegramAuthClient,
+    telegram_login: TelegramLogin,
 ) -> None:
     """Экран способов входа и действия привязки/отвязки.
 
@@ -1834,11 +1879,13 @@ def _add_account_routes(
     запрос отвечал 404. Здесь адреса получают обработчики.
 
     Подтверждение Telegram **не подделывается**. `Linking.link_telegram` требует
-    `confirmed=True`, а подтверждение приходит из флоу бота (`/auth/link` +
-    `/auth/poll`, §5 контракта), который в кабинете ещё не подключён (W6).
+    `confirmed=True`, и это подтверждение приходит из флоу бота (`/auth/link` +
+    `/auth/poll`, §5 контракта) в режиме `link`: бот подтверждает `chat_id`, не
+    заводя аккаунт, а кабинет отдаёт его существующему аккаунту (issue #65).
     Присвой кабинет `confirmed=True` сам — сломалась бы главная защита проекта
-    (§3.3: привязка только после подтверждения владения). Поэтому роут Telegram
-    честно говорит «откройте бота», а не изображает успех.
+    (§3.3: привязка только после подтверждения владения). `chat_id` из формы или
+    адреса не берётся нигде: он приходит **только** из ответа бота, подтвердившего
+    человека.
     """
 
     def _account(request: Request) -> tuple[Account, str] | Response:
@@ -1898,6 +1945,39 @@ def _add_account_routes(
         """Экран способов входа с последствиями отвязки, но без их пересчёта."""
         return HTMLResponse(render_linking(account, **kwargs))  # type: ignore[arg-type]
 
+    def _link_telegram_retry(
+        challenge: Challenge | None,
+        public_code: str | None,
+        message: str,
+        *,
+        account: Account,
+    ) -> HTMLResponse:
+        """Экран привязки Telegram с текстом отказа: челлендж жив, привязки нет.
+
+        Отдаётся **тот же** экран, а не отдельная страница отказа: человек должен
+        остаться там, где кнопка «Проверить привязку» и «Начать заново», — иначе
+        после «ещё не подтверждена» ему нечем повторить опрос. Ссылку на бота
+        сохраняем (`challenge.deep_link`), чтобы «Открыть Telegram» продолжала
+        работать.
+
+        Когда челленджа нет (`challenge is None` — не начинали или протух),
+        показывать нечего, кроме отказа: ссылки и поля кода нет, и экран
+        возвращается к стартовой кнопке с текстом.
+
+        Код ответа — `200`, как у соседних состояний экрана: отказ — не ошибка
+        HTTP. Сессии здесь не выдаётся и не гасится: живая сессия другого входа
+        не при чём.
+        """
+        if challenge is None or public_code is None:
+            return _render(account, error=message, unlink_previews=_previews(account) or None)
+        return _render(
+            account,
+            error=message,
+            telegram_link_url=challenge.deep_link,
+            telegram_link_code=public_code,
+            unlink_previews=_previews(account) or None,
+        )
+
     @app.get("/account", response_class=HTMLResponse)
     def account_page(request: Request) -> Response:
         """Экран способов входа. Без сессии — на вход, а не 500.
@@ -1920,23 +2000,149 @@ def _add_account_routes(
 
     @app.post("/account/link/telegram")
     def link_telegram_action(request: Request) -> Response:
-        """Привязка Telegram — только через подтверждение ботом (§3.3).
+        """Начать привязку Telegram: челлендж бота в режиме `link` (§3.3, #65).
 
-        Роут не подставляет `confirmed=True`: подтверждение приходит из флоу
-        бота, которого в кабинете ещё нет (W6). Показать успех без подтверждения
-        значило бы привязать заявленный `chat_id` — ровно та ошибка, от которой
-        сторожит §3.3. Поэтому экран честно отправляет открыть бота.
+        Кабинет заводит пару «код + секрет» и просит у бота ссылку в режиме
+        **привязки**: бот подтвердит `chat_id`, не заводя аккаунт. Обычный вход
+        здесь не годится — свежий `chat_id` в режиме `login` занял бы новый
+        аккаунт, и привязка конфликтовала бы сама с собой (issue #65).
+
+        Личность здесь не заявляется ничем: `chat_id` в этом запросе нет и быть
+        не может. Он появится только в ответе бота на опрос, после подтверждения
+        в Telegram, и роут проверки (§3.3) отдаст его связыванию. Подставить
+        `chat_id` из формы значило бы открыть связывание по заявлению браузера —
+        ровно класс CVE-2026-53516 / nOAuth.
+
+        Секрет остаётся в памяти процесса (`TelegramLogin`) — в разметку уходит
+        только код: он и так у человека в ссылке.
         """
         resolved = _account(request)
         if isinstance(resolved, Response):
             return resolved
         account, _ = resolved
+
+        public_code, secret = public_code_and_secret()
+        try:
+            link = telegram_auth.start_login(public_code, secret_hash(secret), mode=AUTH_MODE_LINK)
+        except BotUnreachable:
+            # Бот не ответил — начать не удалось, и это не отказ человека. Свой
+            # текст и **без** кнопки «Открыть Telegram»: ссылки нет.
+            return _render(
+                account,
+                error=LINK_TELEGRAM_BOT_UNREACHABLE,
+                unlink_previews=_previews(account) or None,
+            )
+        except BotError:
+            # Осмысленный отказ бота на старте (расхождение контракта). Причину
+            # на экран не выносим: человеку действие одно — повторить.
+            return _render(
+                account,
+                error=LINK_TELEGRAM_FAILED,
+                unlink_previews=_previews(account) or None,
+            )
+
+        if not link.deep_link:
+            # Бот ответил успехом, но ссылки в ответе нет: показывать нечего, и
+            # пустая кнопка обещала бы переход, которого сервис не сделал.
+            return _render(
+                account,
+                error=LINK_TELEGRAM_FAILED,
+                unlink_previews=_previews(account) or None,
+            )
+
+        telegram_login.remember(
+            public_code, secret=secret, deep_link=link.deep_link, expires_at=link.expires_at
+        )
         return _render(
             account,
-            notice=LINK_TELEGRAM_BOT_FLOW,
-            notice_tone=Tone.PROCESS.value,
+            telegram_link_url=link.deep_link,
+            telegram_link_code=public_code,
             unlink_previews=_previews(account) or None,
         )
+
+    @app.post("/account/link/telegram/verify")
+    def link_telegram_verify(
+        request: Request,
+        public_code: str = Form(default=""),
+        code: str = Form(default=""),
+    ) -> Response:
+        """Проверить привязку у бота и отдать `chat_id` существующему аккаунту.
+
+        `chat_id` приходит **только** отсюда — из ответа бота на опрос (§5), в
+        форме режима привязки: `{"status": "confirmed", "chat_id": <id>}` без
+        `account_id` и без `session_token`. Форма и адрес на это не влияют: в
+        разметке поля `chat_id` нет, а подставленное в тело значение не читается
+        вовсе — `Linking.link_telegram` получает `chat_id` из ответа бота.
+
+        Сессия здесь **не** выдаётся: привязка — не вход. Человек уже вошёл;
+        привязка лишь добавляет способ. Режим `link` для того и заведён, чтобы
+        подтверждение привязки не выдавало сессию (§5, issue #65).
+
+        Текст отказа выбирается по причине: ожидание, отказ человека, неверный
+        код, истёкший челлендж, занятый `chat_id` и недоступность сервиса
+        требуют разных действий, и ни один отказ не выходит 500.
+        """
+        resolved = _account(request)
+        if isinstance(resolved, Response):
+            return resolved
+        account, _ = resolved
+
+        challenge = telegram_login.get(public_code)
+        if challenge is None:
+            # Челленджа нет: не начинали, он протух или кабинет перезапускался.
+            # Обычное состояние старой вкладки, а не сбой сервера.
+            return _link_telegram_retry(None, None, LINK_TELEGRAM_NOT_STARTED, account=account)
+
+        try:
+            poll = telegram_auth.poll_login(public_code, challenge.secret, code.strip())
+        except BotUnreachable:
+            return _link_telegram_retry(
+                challenge, public_code, LINK_TELEGRAM_BOT_UNREACHABLE, account=account
+            )
+        except BotError as exc:
+            return _link_telegram_retry(
+                challenge,
+                public_code,
+                LINK_TELEGRAM_POLL_ERRORS.get(exc.code, LINK_TELEGRAM_FAILED),
+                account=account,
+            )
+
+        if poll.status == POLL_PENDING:
+            return _link_telegram_retry(
+                challenge, public_code, LINK_TELEGRAM_PENDING, account=account
+            )
+        if poll.status == POLL_DENIED:
+            return _link_telegram_retry(
+                challenge, public_code, LINK_TELEGRAM_DENIED, account=account
+            )
+        if poll.status != POLL_CONFIRMED or poll.chat_id is None:
+            # `confirmed` без `chat_id` — расхождение контракта (§5): привязывать
+            # нечего, а выдумывать `chat_id` нельзя.
+            return _link_telegram_retry(
+                challenge, public_code, LINK_TELEGRAM_FAILED, account=account
+            )
+
+        # Челлендж израсходован ботом (операция односторонняя) — свой гасим тем
+        # же движением, а не оставляем протухать.
+        telegram_login.forget(public_code)
+        try:
+            result = linking.link_telegram(account.id, chat_id=poll.chat_id, confirmed=True)  # type: ignore[arg-type]
+        except BotUnreachable:
+            # Бот подтвердил привязку, но запись не прошла: привязки нет, и
+            # обещать её нельзя. Текст — про сервис, а не про код.
+            return _link_telegram_retry(
+                challenge, public_code, LINK_TELEGRAM_BOT_UNREACHABLE, account=account
+            )
+        except LinkRefused as exc:
+            # `chat_id_taken` — свой честный текст: человек доказал владение этим
+            # Telegram, и «занят другим аккаунтом» подсказывает, что делать.
+            # Прочие отказы (уже привязан, аккаунт пропал) — общим текстом §5.
+            message = LINK_TELEGRAM_TAKEN if exc.code == CHAT_ID_TAKEN else LINK_REFUSED_ERROR
+            return _link_telegram_retry(challenge, public_code, message, account=account)
+
+        # Успех: аккаунт показывается из результата (`LinkResult.account`
+        # перечитан из хранилища), а не из прежнего чтения.
+        return _render(result.account, notice=LINK_DONE_TELEGRAM)
 
     @app.post("/account/link/mail")
     def link_mail_action(request: Request, mail: str = Form(default="")) -> Response:

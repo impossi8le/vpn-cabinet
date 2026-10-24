@@ -1,18 +1,25 @@
 """Стенд для живого прогона кабинета: `python .claude/dev/cabinet_dev.py`.
 
 Зачем отдельный запуск, если есть `python -m cabinet`. Тот поднимает кабинет на
-пустом подставном боте: аккаунтов нет, а входа по Telegram в кабинете ещё нет
-(флоу бота — волна W6), поэтому дойти до экрана привязки почты в браузере
-нечем — а он и есть предмет проверки. Стенд сеет три аккаунта в разных
-состояниях и печатает письма в консоль сервера: код подтверждения живёт в памяти
-процесса, и без распечатки его некому прочитать.
+пустом подставном боте: аккаунтов нет, поэтому дойти до экрана привязки в браузере
+нечем — а он и есть предмет проверки. Стенд сеет три аккаунта в разных состояниях
+и печатает письма в консоль сервера: код подтверждения живёт в памяти процесса, и
+без распечатки его некому прочитать.
 
 Это **не** часть кабинета. Кабинет собирается из `build_app` параметрами
-(зависимости — подставной бот и подставная почта), и стенд не добавляет к нему
-ничего, кроме посева и одного служебного роута `/dev/as/{account_id}`: он выдаёт
-сессию уже существующему аккаунту, чтобы в браузер можно было войти тем способом,
-которого в кабинете ещё нет. В `build_app` этого роута нет и не будет — в бою он
-означал бы вход без подтверждения, то есть ровно ту ошибку, от которой сторожит
+(зависимости — подставной бот, подставная почта и подставной публичный API бота),
+и стенд не добавляет к нему ничего, кроме посева и служебных роутов. Их три:
+
+- `/dev/as/{account_id}` — выдать сессию уже существующему аккаунту, чтобы в
+  браузер можно было войти тем способом, которого иначе не пройти;
+- `/dev/tg/{public_code}` — подставной «чат с ботом» с кнопкой подтверждения —
+  сюда ведёт «Открыть Telegram» на экране привязки;
+- `/dev/tg-confirm/{public_code}` — **имитация «человек нажал кнопку в Telegram»**:
+  помечает челлендж подтверждённым в подставном боте (`tests.fakes.FakeTelegramAuth`),
+  чтобы флоу привязки можно было пройти в браузере без настоящего Telegram.
+
+В `build_app` этих роутов нет и не будет — в бою `/dev/tg-confirm` означал бы
+привязку Telegram без подтверждения, то есть ровно ту ошибку, от которой сторожит
 §3.3 спеки.
 
 Запуск — конфигурацией `cabinet-dev` из `.claude/launch.json` (порт 8111) или
@@ -47,7 +54,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 from cabinet.app import COOKIE_NAME, DEFAULT_SENDER, build_app  # noqa: E402
 from cabinet.mail_sender import Attachment, MailSender  # noqa: E402
 from cabinet.payments import Payment  # noqa: E402
-from tests.fakes import FakeApi  # noqa: E402
+from tests.fakes import FakeApi, FakeTelegramAuth  # noqa: E402
 
 PORT = 8111
 
@@ -150,10 +157,15 @@ def seeded_api() -> FakeApi:
 
 def build() -> FastAPI:
     payments = StubPayments()
+    # Подставной публичный API бота: флоу привязки/входа идёт на стенде без
+    # живого Telegram. Ссылку ведём на страницу стенда `/dev/tg/{code}`, где
+    # «нажатие кнопки в Telegram» имитирует отдельный служебный роут.
+    telegram_auth = FakeTelegramAuth(deep_link_template=f"http://127.0.0.1:{PORT}/dev/tg/{{code}}")
     app = build_app(
         store=seeded_api(),
         mail_sender=MailSender(sender=DEFAULT_SENDER, transport=PrintingMail()),
         payments=payments,
+        telegram_auth=telegram_auth,
     )
 
     @app.get("/dev/as/{account_id}", include_in_schema=False)
@@ -163,6 +175,36 @@ def build() -> FastAPI:
         response = RedirectResponse("/account", status_code=303)
         response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", path="/")
         return response
+
+    @app.get("/dev/tg-confirm/{public_code}", include_in_schema=False)
+    def dev_tg_confirm(public_code: str) -> RedirectResponse:
+        """Служебный роут стенда: имитирует «человек нажал кнопку в Telegram».
+
+        В бою подтверждение делает бот: он показывает человеку код и, когда тот
+        жмёт «Подтвердить», помечает челлендж подтверждённым. Здесь это делается
+        за него — иначе флоу привязки в браузере не пройти без настоящего
+        Telegram. `chat_id` задаёт подставной бот (`FakeTelegramAuth.chat_id`);
+        из адреса он не берётся, чтобы стенд не приучал к «`chat_id` из ссылки».
+
+        В `build_app` этого роута нет и не будет: в бою он означал бы привязку
+        без подтверждения — ту самую ошибку, от которой сторожит §3.3 спеки.
+        """
+        telegram_auth.confirm(public_code)
+        return RedirectResponse("/account", status_code=303)
+
+    @app.get("/dev/tg/{public_code}", include_in_schema=False)
+    def dev_tg(public_code: str) -> HTMLResponse:
+        """Подставной «чат с ботом»: страница с кнопкой подтверждения.
+
+        Сюда ведёт «Открыть Telegram» со стенда. Кнопка ведёт на служебный роут
+        `dev_tg_confirm` — как настоящая кнопка в Telegram ведёт подтверждение.
+        """
+        return HTMLResponse(
+            "<h1>Подставной Telegram (стенд)</h1>"
+            f"<p>Челлендж <span class='mono'>{public_code}</span>.</p>"
+            f'<p><a href="/dev/tg-confirm/{public_code}">Подтвердить</a></p>'
+            "<p>Любой непустой код подойдёт — его сверяет подставной бот.</p>"
+        )
 
     @app.get("/dev/pay/{payment_id}", include_in_schema=False)
     def dev_pay(payment_id: str) -> HTMLResponse:

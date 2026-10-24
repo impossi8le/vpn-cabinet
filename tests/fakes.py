@@ -26,10 +26,17 @@ from datetime import UTC, datetime
 
 from cabinet.accounts import Account
 from cabinet.bot_client import (
+    AUTH_MODE_LINK,
+    AUTH_MODE_LOGIN,
     ORDER_CANCELLED,
     ORDER_COMPLETED,
     ORDER_PENDING,
+    POLL_CONFIRMED,
+    POLL_DENIED,
+    POLL_PENDING,
     BotError,
+    LoginLink,
+    LoginPoll,
     Order,
     OrderConfig,
     OrderIssue,
@@ -622,3 +629,76 @@ def utc(year: int = 2026, month: int = 10, day: int = 17, hour: int = 12) -> dat
     """Время с явной зоной. Наивные `datetime` в тестах скрывают расхождения
     между локальным временем машины и UTC."""
     return datetime(year, month, day, hour, tzinfo=UTC)
+
+
+@dataclass
+class FakeTelegramAuth:
+    """Подставной публичный API бота: флоу входа и привязки (§5).
+
+    Не ходит в сеть и не поднимает HTTP — это объект **той же формы**, что
+    `cabinet.bot_client.TelegramAuthClient` (`start_login` / `poll_login`), но
+    без транспорта. Так его берёт стенд (`.claude/dev/cabinet_dev.py`): живой
+    `TelegramAuthClient` там упёрся бы в loopback, которого рядом нет, и флоу
+    привязки в браузере не прошёлся бы.
+
+    **Решения челленджа задаёт тест** (или служебный роут стенда) вызовами
+    `confirm` / `deny`: это ровно то, что делает человек в Telegram, нажимая
+    кнопку. Пустой код на подтверждении — `nonce_mismatch`, как у бота; любой
+    непустой принимается: настоящий код сверяет бот, а здесь важно лишь, что
+    кабинет прислал его непустым.
+
+    `deep_link_template` строит ссылку с подстановками `{prefix}` (`login` или
+    `link`) и `{code}`: ссылку в бою собирает бот, и здесь её адрес — деталь
+    стенда, а не кабинета.
+    """
+
+    deep_link_template: str = "https://example.invalid/bot?start={prefix}_{code}"
+    chat_id: int = 555_000_111
+    # Последние запросы — тест может утверждать, что кабинет ходил туда, куда
+    # должен, и не ходил лишний раз.
+    link_calls: list[dict] = field(default_factory=list)
+    poll_calls: list[dict] = field(default_factory=list)
+    _challenges: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
+
+    def start_login(
+        self, public_code: str, secret_hash_value: str, *, mode: str = AUTH_MODE_LOGIN
+    ) -> LoginLink:
+        """Начать челлендж: ссылка бота, режим — часть тела запроса, как в бою."""
+        self.link_calls.append(
+            {"public_code": public_code, "secret_hash": secret_hash_value, "mode": mode}
+        )
+        self._challenges[public_code] = {"mode": mode, "decision": POLL_PENDING, "chat_id": None}
+        prefix = "link" if mode == AUTH_MODE_LINK else "login"
+        deep_link = self.deep_link_template.format(prefix=prefix, code=public_code)
+        return LoginLink(deep_link=deep_link)
+
+    def poll_login(self, public_code: str, secret: str, device_nonce: str) -> LoginPoll:
+        """Опрос челленджа. Подтверждение отдаётся без `account_id` (§5, `link`)."""
+        self.poll_calls.append(
+            {"public_code": public_code, "secret": secret, "device_nonce": device_nonce}
+        )
+        state = self._challenges.get(public_code)
+        if state is None:
+            raise BotError("operation_not_found", "челлендж не найден", status=404)
+        if state["decision"] == POLL_CONFIRMED:
+            if not device_nonce:
+                # Пустой код бот считает несовпавшим: подтверждение было, но код
+                # из чата не предъявлен.
+                raise BotError("nonce_mismatch", "код не совпал", status=409)
+            return LoginPoll(status=POLL_CONFIRMED, chat_id=state["chat_id"])
+        return LoginPoll(status=state["decision"], retry_after_ms=1000)
+
+    def confirm(self, public_code: str, *, chat_id: int | None = None) -> None:
+        """Имитировать подтверждение в Telegram — «человек нажал кнопку»."""
+        state = self._challenges.setdefault(
+            public_code, {"mode": AUTH_MODE_LINK, "decision": POLL_PENDING, "chat_id": None}
+        )
+        state["decision"] = POLL_CONFIRMED
+        state["chat_id"] = state.get("chat_id") or chat_id or self.chat_id
+
+    def deny(self, public_code: str) -> None:
+        """Имитировать отказ человека в Telegram."""
+        state = self._challenges.setdefault(
+            public_code, {"mode": AUTH_MODE_LINK, "decision": POLL_PENDING, "chat_id": None}
+        )
+        state["decision"] = POLL_DENIED

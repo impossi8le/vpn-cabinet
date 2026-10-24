@@ -49,6 +49,7 @@ from cabinet.accounts import Account
 from cabinet.auth_mail import AuthMail
 
 __all__ = [
+    "CHAT_ID_TAKEN",
     "AccountStore",
     "LinkRefused",
     "LinkResult",
@@ -66,7 +67,19 @@ class LinkRefused(Exception):
     «почта уже привязана к этому» позволяет перебором адресов выяснять, кто где
     зарегистрирован. Поэтому наружу из кабинета уходит одно сообщение, а
     подробность остаётся в этом исключении.
+
+    `code` — необязательная машинная метка причины из контракта бота
+    (`chat_id_taken`), для случаев, где различие человеку **полезно** и ничего не
+    выдаёт. Так у привязки Telegram: `chat_id` уже подтверждён ботом, человек
+    владеет этим Telegram, и «занят другим аккаунтом» — честная подсказка, а не
+    утечка, которую закрывает общий текст (issue #65). Там, где метки нет, экран
+    по-прежнему показывает одно общее сообщение.
     """
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message or ""
+        self.code = code
 
 
 class UnlinkRefused(Exception):
@@ -164,6 +177,12 @@ class UnlinkResult:
 METHOD_TELEGRAM = "telegram"
 METHOD_MAIL = "mail"
 
+# Код отказа бота «этот `chat_id` уже занят другим аккаунтом» (§1). Тот же код
+# лежит в `_COLLISION_CODES`; вынесен отдельной константой, потому что им
+# помечается `LinkRefused.code` — по нему экран отличает этот отказ от прочих и
+# показывает честный текст (issue #65).
+CHAT_ID_TAKEN = "chat_id_taken"
+
 
 class Linking:
     """Связывание и отвязка способов входа.
@@ -212,14 +231,16 @@ class Linking:
             raise LinkRefused("Telegram уже привязан к аккаунту: перезапись запрещена")
 
         # Занятый `chat_id` — коллизия с другим аккаунтом (§5): честный отказ и
-        # предложение войти тем способом. Никогда — перезапись.
+        # предложение войти тем способом. Никогда — перезапись. Код `chat_id_taken`
+        # помечает его отдельно: `chat_id` подтверждён ботом, и «занят» — не
+        # утечка, а подсказка человеку (issue #65).
         if self._taken_by_other(chat_id=chat_id, account_id=account_id):
-            raise LinkRefused("chat_id занят другим аккаунтом")
+            raise LinkRefused("chat_id занят другим аккаунтом", code=CHAT_ID_TAKEN)
 
         # `rowcount != 1` — место заняли между чтением и записью; ровно тот
         # случай, ради которого условие `IS NULL` стоит в UPDATE.
         if self._link_chat_id(account_id, chat_id) != 1:
-            raise LinkRefused("chat_id занят другим аккаунтом")
+            raise LinkRefused("chat_id занят другим аккаунтом", code=CHAT_ID_TAKEN)
 
         return LinkResult(account=self._require(account_id), method=METHOD_TELEGRAM)
 
@@ -299,7 +320,7 @@ class Linking:
             return self._store.link_chat_id(account_id, chat_id)
         except Exception as exc:
             if _is_collision(exc):
-                raise LinkRefused("chat_id занят другим аккаунтом") from exc
+                raise LinkRefused("chat_id занят другим аккаунтом", code=CHAT_ID_TAKEN) from exc
             raise
 
     def _link_mail(self, account_id: int, mail: str) -> int:
