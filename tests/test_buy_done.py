@@ -183,16 +183,38 @@ def test_unreachable_bot_is_not_the_same_as_missing_order() -> None:
 
 
 def test_done_screen_does_not_promise_an_email() -> None:
-    """Про письмо с конфигом на экране не сказано: доставки письма ещё нет.
+    """До подтверждения оплаты про письмо не сказано: его ещё нет.
 
-    Обещать письмо, которого никто не отправляет, — то же, что нарисованная
-    кнопка: человек ждал бы его и не дождался.
+    Обещать письмо, которого никто не отправил, — то же, что нарисованная
+    кнопка: человек ждал бы его и не дождался. Письмо уходит после
+    подтверждения вебхуком, поэтому и упоминание появляется только в оплаченном
+    состоянии — см. тест ниже.
     """
     api, account_id, order_id = _api_with_order()
 
     html = _client(api, account_id).get(f"/buy/done?order_id={order_id}").text
 
     assert "письм" not in html.lower()
+
+
+def test_paid_screen_leads_to_the_configs_and_mentions_the_letter() -> None:
+    """Оплачено: экран ведёт к конфигам и честно говорит про письмо.
+
+    Два случая и один текст на оба. Аккаунту с почтой письмо уходит, аккаунту
+    без неё — нет, но конфигурации у него есть в подписках, и это первое, что
+    сказано. Поэтому на экране **не** написано «мы отправили вам письмо»:
+    человеку без почты такое обещание было бы ложью, а он бы ждал письма.
+    """
+    api, account_id, order_id = _api_with_order()
+    api.mark_order_paid(order_id)
+
+    html = _client(api, account_id).get(f"/buy/done?order_id={order_id}").text
+
+    assert "Оплата прошла" in html
+    assert "подписок" in html.lower()
+    assert 'href="/subscriptions"' in html
+    assert "письм" in html.lower()
+    assert "Если к аккаунту привязана почта" in html
 
 
 # --- цвет -----------------------------------------------------------------
