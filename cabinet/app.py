@@ -38,6 +38,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Protocol
@@ -124,6 +125,14 @@ LOGIN_NOTICE_COOKIE = "cabinet_login_notice"
 # Срок жизни cookie отказа. Секунд лимита (60) с запасом на переход по
 # редиректу; истечение здесь только страховка — гасит cookie первый же GET.
 LOGIN_NOTICE_TTL_SECONDS = 300
+
+# Cookie посещения для воронки (issue #64). Значение — случайные байты
+# (`secrets`), без данных человека: оно нужно, чтобы два анонимных шага
+# (`login_shown`, `code_requested`) считались одним человеком, а не двумя
+# показами. Ставится там, где впервые понадобилось (`GET /login`), и едет в
+# каждом событии. Срок — как у сессии (`SessionService.ttl`): воронка живёт
+# дольше одного перехода, а cookie посещения должна его пережить.
+VISITOR_COOKIE = "cabinet_visitor"
 
 # Адрес отправителя писем по умолчанию. Это не боевой ящик, а подставной
 # (`example.com` зарезервирован для примеров): репозиторий публичный, и
@@ -710,6 +719,10 @@ def _add_login_routes(
         """
         notice = _take_login_notice(request)
         mail = mail or _notice_str(notice.get("mail")) or None
+        # Воронка начинается с показа экрана входа (issue #64). Здесь же заводится
+        # идентификатор посещения — первый шаг анонимный, `account_id` у него нет.
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="login_shown")
         response = HTMLResponse(
             render_login(
                 mail=mail,
@@ -718,10 +731,10 @@ def _add_login_routes(
             )
         )
         response.delete_cookie(LOGIN_NOTICE_COOKIE, path="/")
-        return response
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.post("/login")
-    def login_request(mail: str = Form(default="")) -> Response:
+    def login_request(request: Request, mail: str = Form(default="")) -> Response:
         """Запросить код на адрес и увести на экран ввода кода.
 
         Код шлёт `AuthMail` внутри `SignInService`; роут только переводит отказ
@@ -744,10 +757,15 @@ def _add_login_routes(
             # Один текст на «адрес пуст», «письмо не ушло» и прочие отказы: не
             # выдаём, кто зарегистрирован (§3.3).
             return _login_refusal(LOGIN_MAIL_ERROR, mail=address)
+        # Шаг воронки — только на успехе: письмо ушло (issue #64). Отказ сюда не
+        # пишется, иначе «запросил код» считался бы и у тех, кому код не ушёл.
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="code_requested")
         # Успех: адрес уходит в query — его знает только этот переход, и
         # хранить его между запросами незачем. Отказ так не делается: там
         # ссылка обязана остаться голой (issue #55).
-        return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
+        response = RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.get("/login/waiting", response_class=HTMLResponse)
     def login_waiting(
@@ -803,9 +821,13 @@ def _add_login_routes(
             # значило бы предложить ввести то, что не примут (`LOGIN_BOT_UNREACHABLE`).
             return _login_refusal(LOGIN_BOT_UNREACHABLE, mail=mail)
 
+        # Шаг воронки: успешный вход. Здесь уже есть `account_id` — по нему бот
+        # и сшивает анонимные шаги с человеком (issue #64).
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
         response = RedirectResponse("/subscriptions", status_code=303)
         _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
-        return response
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.post("/login/verify")
     def login_verify_alias(
@@ -903,6 +925,7 @@ def _add_login_routes(
 
     @app.post("/login/telegram/verify")
     def login_telegram_verify(
+        request: Request,
         public_code: str = Form(default=""),
         code: str = Form(default=""),
     ) -> Response:
@@ -961,9 +984,13 @@ def _add_login_routes(
             # нечего — сессии не было.
             return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
 
+        # Шаг воронки: успешный вход через Telegram — тем же шагом, что вход по
+        # почте (issue #64): человек один, и способ входа воронку не раздваивает.
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
         response = RedirectResponse("/subscriptions", status_code=303)
         _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
-        return response
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
 
 def _login_refusal(
@@ -1097,6 +1124,67 @@ def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -
     )
 
 
+def _visitor_of(request: Request) -> tuple[str, bool]:
+    """Идентификатор посещения для воронки (issue #64): из cookie или новый.
+
+    Новое значение — случайные байты (`secrets`), без данных человека. Возвращается
+    пара «значение, новое ли»: cookie ставит вызывающий на **своём** ответе — там,
+    где оно понадобилось впервые (`GET /login`), — а дальше посещение
+    переиспользуется тем же cookie.
+    """
+    visitor = request.cookies.get(VISITOR_COOKIE)
+    if visitor:
+        return visitor, False
+    return secrets.token_urlsafe(16), True
+
+
+def _record_event(
+    store: AccountStore,
+    *,
+    visitor: str,
+    step: str,
+    account_id: int | None = None,
+    order_id: str | None = None,
+) -> None:
+    """Записать шаг воронки у бота (issue #64).
+
+    Правило нерушимое: **аналитика не ломает экраны**. Бот может не ответить,
+    отказать или вернуть не то — для человека это не меняет ничего, а ошибка
+    уходит в журнал (`logger`). Хранилище может вовсе не уметь запись
+    (подставной бот) — это тот же «события нет», а не сбой экрана.
+    """
+    record = getattr(store, "record_event", None)
+    if record is None:
+        return
+    try:
+        record(account_id=account_id, visitor=visitor, step=step, order_id=order_id)
+    except Exception as exc:  # noqa: BLE001 - аналитика не ломает экран
+        logger.warning("событие воронки %s не записано: %r", step, exc)
+
+
+def _set_visitor_cookie(
+    response: Response, visitor: str, *, is_new: bool, max_age: timedelta
+) -> Response:
+    """Поставить cookie посещения, если оно новое, и вернуть ответ.
+
+    `HttpOnly` и `SameSite=Lax` — те же, что у сессии, и по тем же причинам:
+    значение не секрет, но разметке в нём делать нечего, а переход по внешней
+    ссылке обязан донести его до кабинета. `Secure` не ставится ради локального
+    `http://127.0.0.1` (как у `_set_session_cookie`). Уже известное посещение
+    cookie не переписывает: иначе каждое событие заводило бы нового человека.
+    """
+    if is_new:
+        response.set_cookie(
+            VISITOR_COOKIE,
+            visitor,
+            max_age=int(max_age.total_seconds()),
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
 def _add_subscription_routes(
     app: FastAPI,
     *,
@@ -1179,12 +1267,15 @@ def _add_subscription_routes(
         """
         if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
             return RedirectResponse("/login", status_code=303)
-        return HTMLResponse(
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="buy_shown")
+        response = HTMLResponse(
             render_buy(
                 days=days if days in PRICES else DEFAULT_BUY_DAYS,
                 devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
             )
         )
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.get("/buy/confirm", response_class=HTMLResponse)
     def buy_confirm_page(
@@ -1212,8 +1303,10 @@ def _add_subscription_routes(
         view = sessions.resolve(request.cookies.get(COOKIE_NAME))
         if view is None:
             return RedirectResponse("/login", status_code=303)
+        visitor, is_new = _visitor_of(request)
+        _record_event(store, visitor=visitor, step="confirm_shown", account_id=view.account_id)
         trial, trial_unreachable = _trial_eligibility(store, view.account_id)
-        return HTMLResponse(
+        response = HTMLResponse(
             render_buy_confirm(
                 days=days if days in PRICES else DEFAULT_BUY_DAYS,
                 devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
@@ -1226,6 +1319,7 @@ def _add_subscription_routes(
                 free=free,
             )
         )
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.get("/buy/servers", response_class=HTMLResponse)
     def buy_servers_page(
@@ -1430,6 +1524,19 @@ def _add_subscription_routes(
         except BotUnreachable:
             return _pay_screen("bot_unreachable", chosen_days, chosen_devices, picks)
 
+        # Шаг воронки: заказ создан — покупка начата (issue #64). Пишется именно
+        # здесь, а не при выдаче страницы оплаты: заказ к этому моменту уже есть,
+        # и `order_id` в событии настоящий. Отказ на создании заказа сюда не
+        # доходит — там шага нет.
+        visitor, is_new = _visitor_of(request)
+        _record_event(
+            store,
+            visitor=visitor,
+            step="pay_started",
+            account_id=view.account_id,
+            order_id=order.order_id,
+        )
+
         try:
             payment = payments.create_payment(
                 order_id=order.order_id,
@@ -1444,7 +1551,8 @@ def _add_subscription_routes(
             return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
         if not payment.confirmation_url:
             return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
-        return RedirectResponse(payment.confirmation_url, status_code=303)
+        response = RedirectResponse(payment.confirmation_url, status_code=303)
+        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.get("/buy/done", response_class=HTMLResponse)
     def buy_done_page(
@@ -1574,7 +1682,20 @@ def _add_subscription_routes(
             return JSONResponse({"ok": True})
 
         if paid.changed:
+            # Первое подтверждение — единственный момент, когда покупка состоялась
+            # (issue #64). `visitor` пуст: вебхук приходит от провайдера, cookie
+            # посещения у него нет, а человек здесь опознан `account_id`. Повтор
+            # уведомления сюда не доходит — `changed` уже был `false`.
+            _record_event(
+                store, visitor="", step="paid", account_id=order.account_id, order_id=order_id
+            )
             _fulfil_paid_order(store, mail_sender, order, order_id)
+            # `issued` — там же, после выдачи конфигов и письма: это то же
+            # подтверждение, что и `paid`, и воронка закрывается уже выданным
+            # доступом, а не только принятыми деньгами.
+            _record_event(
+                store, visitor="", step="issued", account_id=order.account_id, order_id=order_id
+            )
         return JSONResponse({"ok": True})
 
     @app.get("/subscriptions/{subscription_id}/config")

@@ -461,6 +461,11 @@ ORDER_CANCELLED = "cancelled"
 # «Контракты»).
 ORDERS_PATH = f"{BOT_PATH}/cabinet-orders"
 
+# Путь записи шагов воронки у бота (issue #64). Тело — одно событие. `account_id`
+# бывает `None` (шаги до входа), `visitor` — случайное значение cookie, не данные
+# человека, а `order_id` — только у шагов оплаты.
+EVENTS_PATH = f"{BOT_PATH}/cabinet-events"
+
 
 @dataclass(frozen=True)
 class OrderConfig:
@@ -902,6 +907,32 @@ class BotClient:
         data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/issue")
         return OrderIssue.from_api(data)
 
+    # ---------- Воронка (issue #64) ----------
+
+    async def record_event(
+        self,
+        *,
+        account_id: int | None,
+        visitor: str,
+        step: str,
+        order_id: str | None = None,
+    ) -> None:
+        """Записать шаг воронки (`POST /internal/cabinet-events`).
+
+        Одно событие на запрос. Все поля едут всегда — «значения нет» это `null`,
+        а не отсутствующий ключ: бот по ним различает «до входа» и «поле забыли».
+        """
+        await self._request(
+            "POST",
+            EVENTS_PATH,
+            json={
+                "account_id": account_id,
+                "visitor": visitor,
+                "step": step,
+                "order_id": order_id,
+            },
+        )
+
     # ---------- Сессии (§4) ----------
 
     async def create_session_for_account(self, account_id: int) -> IssuedSession:
@@ -1317,6 +1348,32 @@ class BotStore:
         """Выдать конфиги (`POST .../{order_id}/issue`). Повтор — `already=true`."""
         data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/issue")
         return OrderIssue.from_api(data)
+
+    # ---------- Воронка (issue #64) ----------
+
+    def record_event(
+        self,
+        *,
+        account_id: int | None,
+        visitor: str,
+        step: str,
+        order_id: str | None = None,
+    ) -> None:
+        """Записать шаг воронки (`POST /internal/cabinet-events`).
+
+        Тот же контракт, что у асинхронного клиента. Тело ответа (`201
+        {"ok": true}`) не читается: роуту важен факт записи, а не его содержимое.
+        """
+        self._request(
+            "POST",
+            EVENTS_PATH,
+            json={
+                "account_id": account_id,
+                "visitor": visitor,
+                "step": step,
+                "order_id": order_id,
+            },
+        )
 
     # ---------- транспорт ----------
 

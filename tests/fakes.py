@@ -186,6 +186,12 @@ class FakeApi:
     # Заказы кабинета (шаг 5). Пусто по умолчанию: заказ заводит тот же тест,
     # что проверяет экран оплаты.
     orders: list[FakeOrder] = field(default_factory=list)
+    # Шаги воронки, записанные кабинетом (issue #64). Порядок — как их прислали:
+    # сквозной тест утверждает последовательность, а не «событие было».
+    events: list[dict] = field(default_factory=list)
+    # Сбой записи события. `None` — запись идёт; задан — каждый `record_event`
+    # бросает это исключение: так проверяется правило «аналитика не ломает экран».
+    events_error: Exception | None = None
     # Журнал вызовов: тест может утверждать, что кабинет ходил ровно туда,
     # куда должен, и не ходил лишний раз.
     calls: list[tuple[str, dict]] = field(default_factory=list)
@@ -540,6 +546,40 @@ class FakeApi:
         """
         self._log("get_ovpn", account_id=account_id, config_id=config_id)
         return f"client\nremote {config_id}\n".encode()
+
+    # --- воронка кабинета (issue #64) ------------------------------------
+
+    def record_event(
+        self,
+        *,
+        account_id: int | None,
+        visitor: str,
+        step: str,
+        order_id: str | None = None,
+    ) -> None:
+        """Запись шага воронки (`POST /internal/cabinet-events`, issue #64).
+
+        Событие копится в `events` в порядке прихода. `events_error` повторяет
+        сбойный бот: кабинет обязан ответить человеку как обычно, а не упасть, —
+        поэтому тест с этим полем проверяет непустоту правила.
+        """
+        self._log(
+            "record_event",
+            account_id=account_id,
+            visitor=visitor,
+            step=step,
+            order_id=order_id,
+        )
+        if self.events_error is not None:
+            raise self.events_error
+        self.events.append(
+            {
+                "account_id": account_id,
+                "visitor": visitor,
+                "step": step,
+                "order_id": order_id,
+            }
+        )
 
 
 @dataclass
