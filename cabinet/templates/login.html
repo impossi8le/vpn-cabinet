@@ -37,13 +37,20 @@
            autocomplete="email" required value="{{ mail or '' }}">
     {# Адрес отвергнут (пустой, или занят другим аккаунтом). Тон — общий для
        ошибок ввода, а не красный: см. login_waiting.html про смысл цвета. #}
+    {% if retry_after %}
+    {# Отказ по лимиту: число отсчёта — живой меткой внутри фразы, страница
+       обновляет только его. Кнопку гаснет скрипт (не сервер), поэтому без
+       JavaScript она остаётся живой и сервер ответит новым числом. #}
+    <p class="error" role="alert" data-resend-wait="{{ retry_after }}">{{ rate_limit_html }}</p>
+    {% else %}
     <p class="error" role="alert">{{ error or '' }}</p>
+    {% endif %}
 
     {# Ссылки на документы стоят ДО кнопки — как в реализации клиента (§2
        implemented-ui-spec): условие видно, прежде чем нажать, а не после. #}
     <p class="legal">Нажимая «Получить код», вы соглашаетесь с <a href="{{ privacy_url }}">политикой конфиденциальности</a> и <a href="{{ terms_url }}">условиями</a>.</p>
 
-    <button class="btn btn-p" type="submit">Получить код</button>
+    <button class="btn btn-p" type="submit"{% if retry_after %} data-resend-target{% endif %}>Получить код</button>
   </form>
 
   {# Второй путь — рядом с первым, а не спрятан за вкладкой: вкладку надо ещё
@@ -58,4 +65,5 @@
   <p class="alt-lead">Или войдите тем же Telegram — тот же аккаунт, а почта для этого не нужна. Откроется бот, он пришлёт кнопку подтверждения входа.</p>
   <a class="btn btn-g" href="{{ telegram_url }}">Войти через Telegram</a>
 </div>
+{% include "_resend_wait.html" %}
 {% endblock %}

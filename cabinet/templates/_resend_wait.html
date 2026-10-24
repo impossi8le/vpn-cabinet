@@ -1,0 +1,35 @@
+{# Ожидание повторной отправки кода: отсчёт и гаснущая кнопка (issue #55).
+
+   Включается на экранах входа и ввода кода, когда отказ пришёл по лимиту
+   (`retry_after`). Число секунд стоит в самой фразе отказа отдельной меткой
+   (`data-resend-countdown`), и скрипт обновляет только её — фраза не
+   перерисовывается целиком.
+
+   Кнопку гасит **страница**, а не сервер: у человека без JavaScript
+   серверный `disabled` оставил бы мёртвую кнопку и тупик. Вместо этого такой
+   человек жмёт снова и получает от сервера новый ответ с **новым** числом
+   секунд — ожидание остаётся конечным и видимым без скрипта. #}
+{% if retry_after %}
+<script>
+  (function () {
+    var strip = document.querySelector('[data-resend-wait]');
+    var label = document.querySelector('[data-resend-countdown]');
+    if (!strip || !label) return;
+    var left = parseInt(strip.getAttribute('data-resend-wait'), 10) || 0;
+    var targets = document.querySelectorAll('[data-resend-target]');
+    function paint() {
+      label.textContent = String(left);
+      for (var i = 0; i < targets.length; i++) {
+        targets[i].disabled = left > 0;
+      }
+    }
+    paint();
+    if (left <= 0) return;
+    var timer = setInterval(function () {
+      left = Math.max(0, left - 1);
+      paint();
+      if (left === 0) clearInterval(timer);
+    }, 1000);
+  })();
+</script>
+{% endif %}

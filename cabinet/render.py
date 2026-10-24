@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import Markup
 
 from cabinet import pricing, theme
 from cabinet.accounts import Account
@@ -44,6 +45,7 @@ __all__ = [
     "LINK_MAIL_ACTION",
     "LINK_MAIL_CONFIRM_ACTION",
     "LINK_TELEGRAM_ACTION",
+    "RATE_LIMIT_ERROR",
     "STATIC_DIR",
     "TELEGRAM_ATTEMPTS_EXCEEDED",
     "TELEGRAM_CHECK_LABEL",
@@ -146,10 +148,30 @@ def _base_context() -> dict[str, object]:
     }
 
 
+# Текст отказа по лимиту отправки. Число секунд подставляется **отдельной
+# меткой отсчёта**, а не текстом: страницу видит человек, и «повторите через
+# 60 с» без живого отсчёта он читает как «ждите непонятно сколько» (issue #55).
+# Текст один на все экраны с этим отказом — вход и привязка почты, — потому что
+# и лимит один (`AuthMail`).
+RATE_LIMIT_ERROR = "Слишком часто. Повторите через {seconds} с."
+
+
+def _rate_limit_message(seconds: int) -> Markup:
+    """Отказ по лимиту с живой меткой отсчёта вместо числа.
+
+    Число выносится отдельным элементом (`data-resend-countdown`), и страница
+    обновляет **только** его — сама фраза остаётся той же. Так надпись и отсчёт
+    не расходятся: разошлись бы, будь число вписано в разметку дважды.
+    """
+    number = Markup('<b class="mono" data-resend-countdown>{}</b>').format(seconds)
+    return Markup(RATE_LIMIT_ERROR).format(seconds=number)
+
+
 def render_login(
     *,
     mail: str | None = None,
     error: str | None = None,
+    retry_after: int | None = None,
     form_action: str = "/login",
     telegram_url: str = TELEGRAM_ENTRY_URL,
 ) -> str:
@@ -160,6 +182,12 @@ def render_login(
     янтарный текст здесь уместнее красного: красный зарезервирован под
     реальную опасность (§7).
 
+    `retry_after` — отказ по лимиту отправки: сколько секунд ждать. Экран
+    показывает это число живым отсчётом, а кнопку гасит до его конца (issue
+    #55): без числа человек жмёт снова и получает тот же ответ, читая его как
+    «зависло». Число приходит с сервера, и сервер же отвечает новым числом на
+    повторный запрос — поэтому экран остаётся честным и без JavaScript.
+
     `telegram_url` — куда ведёт кнопка входа через Telegram. Оба способа —
     выбор, а не один путь с оговоркой: у человека может не быть доступа к
     любому из двух, и тогда спасает второй (§1, §5 спеки).
@@ -169,6 +197,8 @@ def render_login(
         **_base_context(),
         mail=mail,
         error=error,
+        retry_after=retry_after,
+        rate_limit_html=_rate_limit_message(retry_after) if retry_after else None,
         form_action=form_action,
         telegram_url=telegram_url,
     )
@@ -179,6 +209,7 @@ def render_login_waiting(
     mail: str,
     error: str | None = None,
     busy: bool = False,
+    retry_after: int | None = None,
     form_action: str = "/login/verify",
     resend_action: str = "/login/resend",
 ) -> str:
@@ -186,6 +217,11 @@ def render_login_waiting(
 
     `busy` показывает «Проверяем…» и блокирует кнопку: второй тап по
     «Подтвердить» не должен запускать вторую проверку того же кода.
+
+    `retry_after` — повторная отправка отвергнута лимитом: сколько секунд
+    ждать. Тот же отсчёт и та же честная кнопка, что на экране входа (issue
+    #55): у человека есть чем запросить новый код, и он видит, когда это
+    снова сработает.
     """
     template = _ENV.get_template("login_waiting.html")
     return template.render(
@@ -193,6 +229,8 @@ def render_login_waiting(
         mail=mail,
         error=error,
         busy=busy,
+        retry_after=retry_after,
+        rate_limit_html=_rate_limit_message(retry_after) if retry_after else None,
         form_action=form_action,
         resend_action=resend_action,
     )

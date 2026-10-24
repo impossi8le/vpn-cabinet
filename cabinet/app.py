@@ -36,10 +36,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, Form, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -76,6 +77,7 @@ from cabinet.render import (
     DEFAULT_BUY_DAYS,
     DEFAULT_BUY_DEVICES,
     PURCHASE_DEVICES,
+    RATE_LIMIT_ERROR,
     STATIC_DIR,
     TELEGRAM_CHECK_LABEL,
     render_buy,
@@ -95,6 +97,15 @@ __all__ = ["COOKIE_NAME", "build_app"]
 # Имя cookie сессии. Одно на весь кабинет: второе имя означало бы вторую
 # сессию, и человек входил бы дважды.
 COOKIE_NAME = "cabinet_session"
+
+# Cookie отказа на экране входа. Текст отказа — состояние экрана, а не часть
+# ссылки: он живёт здесь, до первого GET, который его прочитает и погасит
+# (issue #55). `HttpOnly` — разметка до значения не дотягивается; короткий
+# `Max-Age` — дольше этого состояния носить нечего.
+LOGIN_NOTICE_COOKIE = "cabinet_login_notice"
+# Срок жизни cookie отказа. Секунд лимита (60) с запасом на переход по
+# редиректу; истечение здесь только страховка — гасит cookie первый же GET.
+LOGIN_NOTICE_TTL_SECONDS = 300
 
 # Адрес отправителя писем по умолчанию. Это не боевой ящик, а подставной
 # (`example.com` зарезервирован для примеров): репозиторий публичный, и
@@ -242,11 +253,9 @@ LOGIN_MAIL_ERROR = "Не удалось отправить код на этот 
 # Имя без `LOGIN_`: текст обслуживает оба экрана с кодом — вход и привязку
 # почты, — и `LOGIN_` на втором вводило бы в заблуждение.
 CODE_ERROR = "Код не подошёл. Проверьте цифры из письма и попробуйте ещё раз."
-# Повторная отправка подряд отвергнута лимитом. Число секунд подставляется:
-# «попробуйте через минуту» без числа не подсказывает, сколько ждать. Общий для
-# входа и привязки по той же причине, что и `CODE_ERROR`: лимит один и тот же
-# (`AuthMail`), и экранов у него два.
-RATE_LIMIT_ERROR = "Слишком часто. Повторите через {seconds} с."
+# Повторная отправка подряд отвергнута лимитом. Текст живёт в `render` (там же,
+# где экран с отсчётом): число секунд показывается живой меткой, а не строкой,
+# и формулировка обязана быть одна на вход и привязку — лимит тоже один.
 # Адрес пуст или не указан — форма вернулась как есть.
 LOGIN_MAIL_REQUIRED = "Укажите адрес почты."
 # Сбой подписки: список не получен, а не «подписок нет». Пустой список — это
@@ -513,44 +522,88 @@ def _add_login_routes(
         return RedirectResponse("/subscriptions", status_code=303)
 
     @app.get("/login", response_class=HTMLResponse)
-    def login_form(mail: str | None = Query(default=None), error: str | None = None) -> str:
+    def login_form(
+        request: Request,
+        mail: str | None = Query(default=None),
+        error: str | None = None,
+    ) -> Response:
         """Форма входа: почта или Telegram.
 
         Оба пути на одном экране (§1): почта — самостоятельный вход, Telegram —
         рядом. Значение `mail` возвращается в поле, когда форма вернулась с
         ошибкой, — человеку не нужно набирать адрес заново.
+
+        Отказ прошлого перехода приходит одноразовой cookie и **здесь же
+        гасится** (`_take_login_notice`): адрес остаётся `/login`, а
+        перезагрузка отказ не повторяет (issue #55). Cookie читается до рендера
+        и удаляется в ответе — тем же движением.
         """
-        return render_login(mail=mail, error=error)
+        notice = _take_login_notice(request)
+        mail = mail or _notice_str(notice.get("mail")) or None
+        error = error or _notice_str(notice.get("error")) or None
+        response = HTMLResponse(
+            render_login(
+                mail=mail,
+                error=error,
+                retry_after=_notice_int(notice.get("retry_after")),
+            )
+        )
+        response.delete_cookie(LOGIN_NOTICE_COOKIE, path="/")
+        return response
 
     @app.post("/login")
-    def login_request(mail: str = Form(default="")) -> RedirectResponse:
+    def login_request(mail: str = Form(default="")) -> Response:
         """Запросить код на адрес и увести на экран ввода кода.
 
         Код шлёт `AuthMail` внутри `SignInService`; роут только переводит отказ
         в состояние экрана. `RateLimited` (слишком частая отправка) не сводится
-        к общему отказу: у него есть срок ожидания, и экран показывает число.
+        к общему отказу: у него есть срок ожидания, и экран показывает число —
+        живым отсчётом (`_login_refusal` кладёт и текст, и секунды в cookie).
         """
         address = mail.strip().lower()
         if not address:
-            return _redirect_login_error(LOGIN_MAIL_REQUIRED, mail=mail)
+            return _login_refusal(LOGIN_MAIL_REQUIRED, mail=mail)
         try:
             signin.request_mail_code(address)
         except RateLimited as exc:
-            return _redirect_login_error(
-                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds), mail=address
+            return _login_refusal(
+                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
+                mail=address,
+                retry_after=exc.retry_after_seconds,
             )
         except (SignInError, AuthMailError):
             # Один текст на «адрес пуст», «письмо не ушло» и прочие отказы: не
             # выдаём, кто зарегистрирован (§3.3).
-            return _redirect_login_error(LOGIN_MAIL_ERROR, mail=address)
-        # Адрес уводим в query, а не в cookie: его знает только этот переход,
-        # и хранить его между запросами незачем.
+            return _login_refusal(LOGIN_MAIL_ERROR, mail=address)
+        # Успех: адрес уходит в query — его знает только этот переход, и
+        # хранить его между запросами незачем. Отказ так не делается: там
+        # ссылка обязана остаться голой (issue #55).
         return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
 
     @app.get("/login/waiting", response_class=HTMLResponse)
-    def login_waiting(mail: str = Query(default=""), error: str | None = None) -> str:
-        """Экран ввода кода из письма."""
-        return render_login_waiting(mail=mail, error=error)
+    def login_waiting(
+        request: Request,
+        mail: str = Query(default=""),
+        error: str | None = None,
+    ) -> Response:
+        """Экран ввода кода из письма.
+
+        Отказ кода приходит тем же одноразовым способом, что на входе: cookie
+        читается и гасится здесь, поэтому перезагрузка не повторяет «код не
+        подошёл» (issue #55).
+        """
+        notice = _take_login_notice(request)
+        mail = mail or _notice_str(notice.get("mail"))
+        error = error or _notice_str(notice.get("error")) or None
+        response = HTMLResponse(
+            render_login_waiting(
+                mail=mail,
+                error=error,
+                retry_after=_notice_int(notice.get("retry_after")),
+            )
+        )
+        response.delete_cookie(LOGIN_NOTICE_COOKIE, path="/")
+        return response
 
     @app.post("/login/waiting")
     def login_verify(
@@ -567,18 +620,18 @@ def _add_login_routes(
         try:
             result = signin.sign_in_with_mail(mail, code)
         except MailSignInError:
-            return _redirect_waiting_error(CODE_ERROR, mail=mail)
+            return _waiting_refusal(CODE_ERROR, mail=mail)
         except SignInError:
             # Не отказ кода, а расхождение состояния — тот же экран, но текст
             # про сбой, а не про цифры.
-            return _redirect_waiting_error(LOGIN_MAIL_ERROR, mail=mail)
+            return _waiting_refusal(LOGIN_MAIL_ERROR, mail=mail)
         except BotUnreachable:
             # Код верен, а аккаунт прочитать не у кого: `sign_in_with_mail` ищет
             # его у бота (`find_by_mail`) и там же заводит. Недоступность бота —
             # не «код не подошёл» и не сбой сервера (#49). На форму входа, а не
             # на экран кода: код уже погашен проверкой, и держать поле ввода
             # значило бы предложить ввести то, что не примут (`LOGIN_BOT_UNREACHABLE`).
-            return _redirect_login_error(LOGIN_BOT_UNREACHABLE, mail=mail)
+            return _login_refusal(LOGIN_BOT_UNREACHABLE, mail=mail)
 
         response = RedirectResponse("/subscriptions", status_code=303)
         _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
@@ -610,15 +663,17 @@ def _add_login_routes(
         """
         address = mail.strip().lower()
         if not address:
-            return _redirect_login_error(LOGIN_MAIL_REQUIRED, mail=mail)
+            return _waiting_refusal(LOGIN_MAIL_REQUIRED, mail=mail)
         try:
             signin.request_mail_code(address)
         except RateLimited as exc:
-            return _redirect_waiting_error(
-                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds), mail=address
+            return _waiting_refusal(
+                RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
+                mail=address,
+                retry_after=exc.retry_after_seconds,
             )
         except (SignInError, AuthMailError):
-            return _redirect_waiting_error(LOGIN_MAIL_ERROR, mail=address)
+            return _waiting_refusal(LOGIN_MAIL_ERROR, mail=address)
         return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
 
     @app.get("/login/telegram", response_class=HTMLResponse)
@@ -741,16 +796,86 @@ def _add_login_routes(
         return response
 
 
-def _redirect_login_error(message: str, *, mail: str) -> RedirectResponse:
-    """Вернуть на форму входа с текстом отказа и сохранённым адресом."""
-    return RedirectResponse(f"/login?error={quote(message)}&mail={quote(mail)}", status_code=303)
+def _login_refusal(
+    message: str, *, mail: str = "", retry_after: int | None = None
+) -> RedirectResponse:
+    """Увести на форму входа с отказом — адрес остаётся голым `/login`.
+
+    Текст отказа едет не в ссылке, а в одноразовой cookie (issue #55): ссылка с
+    `error=` показывала бы старый отказ при каждой перезагрузке и дублировала
+    почту в адресной строке. Адрес в cookie — чтобы человек не набирал его
+    заново; он гасится тем же GET, что показывает отказ.
+    """
+    response = RedirectResponse("/login", status_code=303)
+    _set_login_notice(response, error=message, mail=mail, retry_after=retry_after)
+    return response
 
 
-def _redirect_waiting_error(message: str, *, mail: str) -> RedirectResponse:
-    """Вернуть на экран кода с текстом отказа."""
-    return RedirectResponse(
-        f"/login/waiting?error={quote(message)}&mail={quote(mail)}", status_code=303
+def _waiting_refusal(
+    message: str, *, mail: str = "", retry_after: int | None = None
+) -> RedirectResponse:
+    """Увести на экран кода с отказом — тем же одноразовым способом.
+
+    Адрес экрана — без `error=`: и «код не подошёл», и отказ лимита на повторную
+    отправку — состояние экрана, а не ссылка. Адрес почты остаётся в cookie,
+    чтобы поле и шаг не терялись между переходами.
+    """
+    response = RedirectResponse("/login/waiting", status_code=303)
+    _set_login_notice(response, error=message, mail=mail, retry_after=retry_after)
+    return response
+
+
+def _set_login_notice(
+    response: Response,
+    *,
+    error: str,
+    mail: str = "",
+    retry_after: int | None = None,
+) -> None:
+    """Положить отказ экрана входа в одноразовую cookie.
+
+    Значение — JSON, закодированный `quote`: в cookie недопустимы `;`, `,`,
+    пробел и кавычки, а текст отказа и адрес их содержат. `HttpOnly` — значение
+    не секрет, но и разметке в нём делать нечего; `Max-Age` короткий, потому что
+    это состояние одного перехода, а не данные.
+    """
+    payload = {"error": error, "mail": mail, "retry_after": retry_after}
+    response.set_cookie(
+        LOGIN_NOTICE_COOKIE,
+        quote(json.dumps(payload, ensure_ascii=False)),
+        max_age=LOGIN_NOTICE_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        path="/",
     )
+
+
+def _take_login_notice(request: Request) -> dict[str, object]:
+    """Прочитать отказ с прошлого перехода. Разбор терпим к мусору.
+
+    Cookie приходит из браузера, и её содержимое может оказаться чем угодно
+    (старый формат, обрезанное значение). Отказ — состояние экрана, а не данные:
+    непонятное значение читаем как «отказа нет», а не роняем GET. Так же
+    поступает `SessionService.resolve` с пустым токеном.
+    """
+    raw = request.cookies.get(LOGIN_NOTICE_COOKIE)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(unquote(raw))
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _notice_str(value: object) -> str:
+    """Значение cookie строкой. Не строка — пустая: экран не выдумывает текст."""
+    return value if isinstance(value, str) else ""
+
+
+def _notice_int(value: object) -> int | None:
+    """Секунды ожидания числом или `None`. Ноль и мусор — не отсчёт."""
+    return value if isinstance(value, int) and value > 0 else None
 
 
 def _telegram_retry(challenge: Challenge, public_code: str, message: str) -> HTMLResponse:

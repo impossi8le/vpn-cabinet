@@ -114,7 +114,10 @@ def test_empty_address_returns_to_form_without_sending(
     response = client.post("/login", data={"mail": "   "}, follow_redirects=False)
 
     assert response.status_code == 303
-    assert "/login?" in response.headers["location"]
+    # Адрес остаётся голым: текст отказа едет одноразовой cookie, а не в ссылке
+    # (issue #55). Раньше здесь стоял `"/login?"` — то есть проверка на то, что
+    # отказ уехал в адрес; от неё и был дефект.
+    assert response.headers["location"] == "/login"
     assert fake_mail_sender.outbox == []
 
 

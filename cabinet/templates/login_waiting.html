@@ -22,6 +22,11 @@
   </div>
 
   <form method="post" action="{{ form_action }}">
+    {# Адрес едет скрытым полем, как `public_code` на экране Telegram: роут
+       проверки читает адрес **из формы**, и без поля сервер получает пустой
+       адрес и отвергает любой код (issue #55). Из адресной строки поле в
+       запрос не попадает — именно на этом вход по почте не работал вовсе. #}
+    <input type="hidden" name="mail" value="{{ mail }}">
     <label class="field-label" for="code">Код из письма</label>
     {# Допускаются только цифры, максимум 6. Ограничение задано и в разметке,
        и скриптом: с одной разметкой вставка из буфера протащила бы буквы. #}
@@ -35,7 +40,15 @@
   </form>
 
   <form method="post" action="{{ resend_action }}">
-    <button class="btn btn-g btn-sm" type="submit">Отправить код ещё раз</button>
+    {# Адрес — скрытым полем: повтор шлёт письмо на тот же ящик, а не теряет
+       адрес (без поля экран отвечал «Мы отправили код на .», issue #55). #}
+    <input type="hidden" name="mail" value="{{ mail }}">
+    {# Повторная отправка отвергнута лимитом: тот же отсчёт и та же гаснущая
+       кнопка, что на экране входа (issue #55). #}
+    {% if retry_after %}
+    <p class="error" role="alert" data-resend-wait="{{ retry_after }}">{{ rate_limit_html }}</p>
+    {% endif %}
+    <button class="btn btn-g btn-sm" type="submit"{% if retry_after %} data-resend-target{% endif %}>Отправить код ещё раз</button>
   </form>
 </div>
 
@@ -57,4 +70,5 @@
     if (seconds === 0) clearInterval(tick);
   }, 1000);
 </script>
+{% include "_resend_wait.html" %}
 {% endblock %}
