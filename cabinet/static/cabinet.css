@@ -283,3 +283,23 @@ a.btn { text-decoration: none; }
    снимает страх «спишет сразу» и «нужна карта». Тише основного текста — это
    пояснение к действию, а не само действие. */
 .micro { margin-top: 10px; color: var(--ash); font-size: 12px; line-height: 1.5; text-align: center; }
+
+/* Юридический документ: условия и приватность. Читается как документ, а не как
+   экран кабинета — свой ритм абзацев, заголовки разделов, таблица. Текст в нём
+   исходный (перенесён дословно), поэтому стили подстраиваются под него, а не
+   наоборот. */
+.doc { color: var(--text-secondary); font-size: 13.5px; line-height: 1.65; }
+.doc h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--bone); }
+.doc .updated { margin: 6px 0 16px; color: var(--ash); font-size: 12px; }
+.doc h2 { margin: 18px 0 6px; font-size: 15px; font-weight: 590; color: var(--bone); }
+.doc p { margin-bottom: 8px; }
+.doc b { color: var(--mist); font-weight: 590; }
+.doc ul { margin: 0 0 10px 18px; }
+.doc li { margin-bottom: 4px; }
+.doc a { color: var(--ice); }
+.doc table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; }
+.doc th, .doc td {
+  padding: 6px 8px; text-align: left; font-size: 12.5px;
+  border-bottom: 0.5px solid var(--hairline);
+}
+.doc th { color: var(--mist); font-weight: 590; }

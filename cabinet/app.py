@@ -97,6 +97,7 @@ from cabinet.render import (
     render_buy_done,
     render_buy_pay,
     render_buy_servers,
+    render_legal,
     render_linking,
     render_login,
     render_login_telegram,
@@ -667,6 +668,23 @@ def _add_login_routes(
         редирект через `/` только запутал бы адресную строку.
         """
         return RedirectResponse("/subscriptions", status_code=303)
+
+    @app.get("/terms", response_class=HTMLResponse)
+    def terms_page() -> Response:
+        """Условия сервиса — тот документ, с которым соглашается человек.
+
+        Экран входа говорит: «нажимая кнопку, вы соглашаетесь с условиями». Это
+        обещание выполнимо, только если условия **открываются**. До этой правки
+        ссылка вела в 404: живая проверка нашла это на боевом кабинете, и
+        нашлась она потому, что рядом появилась гарантия возврата — обещать
+        возврат и не показывать его условия значит обещать чужое.
+        """
+        return HTMLResponse(render_legal("terms"))
+
+    @app.get("/privacy", response_class=HTMLResponse)
+    def privacy_page() -> Response:
+        """Политика конфиденциальности — вторая ссылка с экрана входа."""
+        return HTMLResponse(render_legal("privacy"))
 
     @app.get("/login", response_class=HTMLResponse)
     def login_form(

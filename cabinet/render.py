@@ -604,6 +604,17 @@ BUY_MICROCOPY = "Без карты на входе. Оплата — после 
 SERVERS_MICROCOPY = "Оплата картой через ЮKassa. Автопродления нет."
 CONFIRM_MICROCOPY = "Дальше — выбор серверов, оплата последним шагом."
 
+# Гарантия возврата — рядом с кнопкой оплаты (§4 и §6 п. 6 дока). Слова взяты
+# **из опубликованных условий** (§3 «Возврат средств») и не переписаны: обещание
+# на экране оплаты должно совпадать с документом, с которым человек соглашается.
+# Вторая формулировка разошлась бы с первой при первой правке.
+PAY_GUARANTEE_TITLE = "Возврат средств"
+PAY_GUARANTEE_NOTE = (
+    "Если сервис не работает по нашей вине и мы не смогли решить проблему, "
+    "напишите в поддержку — вернём деньги за неиспользованный период."
+)
+PAY_GUARANTEE_LINK_LABEL = "Условия"
+
 # Бесплатный доступ — отдельным блоком и **выше** платных тарифов (§1, §6 п. 2).
 # Он ведёт в тот же путь, но с бесплатной парой; право на него проверяет
 # следующий экран, и обещать здесь успех нечем.
@@ -993,6 +1004,13 @@ def render_buy_servers(
         pay_url=_order_url(BUY_PAY_URL, days, devices, picked, free=free),
         pay_label=SERVERS_FREE_CTA if free else "Перейти к оплате",
         pay_microcopy=SERVERS_FREE_MICROCOPY if free else SERVERS_MICROCOPY,
+        # Гарантия — рядом с кнопкой оплаты, где решение и принимается (§4 дока).
+        # На бесплатном пути её нет: возвращать нечего, и обещание возврата в
+        # месте, где денег не берут, читалось бы как условие бесплатности.
+        guarantee_title=None if free else PAY_GUARANTEE_TITLE,
+        guarantee_note=None if free else PAY_GUARANTEE_NOTE,
+        guarantee_link=TERMS_URL,
+        guarantee_link_label=PAY_GUARANTEE_LINK_LABEL,
     )
 
 
@@ -1200,6 +1218,28 @@ def render_buy_done(
         total=_rubles(order.amount_rub) if order is not None else None,
         refresh_url=refresh_url,
     )
+
+
+# --- юридические документы ----------------------------------------------
+#
+# Тексты перенесены **дословно** из опубликованных документов сервиса (шаблоны
+# `legal_terms.html`, `legal_privacy.html`). Экран входа обещает человеку, что,
+# нажимая кнопку, он соглашается с условиями, — и обещание выполнимо только если
+# эти условия открываются. До этого их не было в кабинете вовсе: ссылки со
+# входа вели в 404 (нашла живая проверка).
+
+LEGAL_TEMPLATES = {
+    "terms": "legal_terms.html",
+    "privacy": "legal_privacy.html",
+}
+
+
+def render_legal(page: str) -> str:
+    """Юридический документ кабинета. Слова — исходные, вёрстка — кабинетная."""
+    template = LEGAL_TEMPLATES.get(page)
+    if template is None:  # pragma: no cover - недостижимо: имена страниц в LEGAL_TEMPLATES
+        raise KeyError(f"неизвестный документ: {page}")
+    return _ENV.get_template(template).render(**_base_context())
 
 
 # --- связывание способов входа (W5.3) ------------------------------------
