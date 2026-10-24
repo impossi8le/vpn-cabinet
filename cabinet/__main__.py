@@ -42,6 +42,7 @@ from cabinet.bot_client import (
     TelegramAuthClient,
 )
 from cabinet.mail_sender import MailConfigError, MailSender
+from cabinet.payments import build_payments
 
 # Интерфейс и порт по умолчанию. Порт — настройка развёртывания, поэтому
 # берётся из окружения; значение по умолчанию существует лишь чтобы
@@ -100,6 +101,11 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
         store=store,
         mail_sender=MailSender.from_env(source),
         telegram_auth=TelegramAuthClient.from_env(source),
+        # Магазин ЮKassa. Неполный конфиг не роняет запуск кабинета (оплата — одна
+        # из возможностей, а вход и подписки работают и без неё), но и не
+        # подменяется выдуманным платежом: `build_payments` отдаёт отказывающую
+        # заглушку, и экран оплаты честно говорит, что оплата недоступна.
+        payments=build_payments(source),
     )
 
 

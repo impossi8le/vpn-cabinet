@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="nav">
+  <a class="back" href="/subscriptions">‹ Подписки</a>
+  <span class="t">Заказ</span>
+  <span class="side"></span>
+</div>
+
+{# Возврат с оплаты. «Оплачено» стоит здесь только когда так говорит заказ, а
+   не потому что человек вернулся на страницу: возврат подделывается, а
+   подтверждение приходит вебхуком (спека §3). Про письмо с конфигом здесь не
+   сказано намеренно — доставка письма отдельная работа, и обещать её нечем. #}
+<h1>{{ title }}</h1>
+<p class="lead">{{ note }}</p>
+
+{% if total %}
+{# Сводка заказа: сумма — из заказа, того же числа, что ушло в платёж. Тон
+   нейтральный: сумма о защите не говорит (§7). #}
+<div class="card money-card">
+  <div class="rows">
+    {%- if days_label %}
+    <div class="row"><dt>Срок</dt><dd>{{ days_label }}</dd></div>
+    {%- endif %}
+    {%- if devices_label %}
+    <div class="row"><dt>Устройства</dt><dd>{{ devices_label }}</dd></div>
+    {%- endif %}
+  </div>
+  <div class="money-row">
+    <span class="money-k">Сумма</span>
+    <span class="money-v">{{ total }}</span>
+  </div>
+</div>
+{% endif %}
+
+{% if refresh_url %}
+{# Обновление — тот же экран: подтверждение может прийти через секунды, и
+   человеку есть куда вернуться, не начиная покупку заново. #}
+<a class="btn btn-p" href="{{ refresh_url }}">Обновить</a>
+{% endif %}
+{% endblock %}

@@ -25,7 +25,18 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from cabinet.accounts import Account
-from cabinet.bot_client import Server, TrialEligibility
+from cabinet.bot_client import (
+    ORDER_CANCELLED,
+    ORDER_COMPLETED,
+    ORDER_PENDING,
+    BotError,
+    Order,
+    OrderConfig,
+    OrderIssue,
+    OrderPaid,
+    Server,
+    TrialEligibility,
+)
 from cabinet.bot_client import Subscription as ClientSubscription
 from cabinet.mail_sender import Attachment
 
@@ -118,6 +129,40 @@ class VpnConfig:
 
 
 @dataclass
+class FakeOrder:
+    """Строка хранилища заказов подставного бота (шаг 5 покупки, #59).
+
+    Это **не** форма ответа бота: здесь `account_id` — служебное поле мока для
+    поиска, а наружу заказ отдаётся полями контракта (`to_api`). Сумма — целые
+    рубли, как её считает `pricing` и как её хранит бот: суммы в копейках в
+    проекте нет, и сравнивать «сколько просили» с «сколько пришло» надо в одной
+    единице. Заказ живёт на `account_id`, а не на `chat_id`: конфиг выдаётся
+    Telegram-аккаунту, но покупка заводится на аккаунт (граница сервиса).
+    """
+
+    order_id: str
+    account_id: int
+    days: int
+    devices: int
+    servers: list[str]
+    amount_rub: int
+    status: str = ORDER_PENDING
+    configs: list[OrderConfig] = field(default_factory=list)
+
+    def to_api(self) -> dict:
+        """Заказ в форме ответа бота — та же, что разбирает `Order.from_api`."""
+        return {
+            "order_id": self.order_id,
+            "status": self.status,
+            "amount_rub": self.amount_rub,
+            "days": self.days,
+            "devices": self.devices,
+            "servers": list(self.servers),
+            "configs": [{"id": c.id, "name": c.name} for c in self.configs],
+        }
+
+
+@dataclass
 class FakeApi:
     """Подставной бот. Одно поле — один «эндпоинт» живого `/internal/*`.
 
@@ -134,12 +179,16 @@ class FakeApi:
     # Ответы про право на триал, которые тест задаёт сам. Пусто — считается по
     # общей логике (триал живёт на `chat_id`, как у бота).
     trial_overrides: dict[int, TrialEligibility] = field(default_factory=dict)
+    # Заказы кабинета (шаг 5). Пусто по умолчанию: заказ заводит тот же тест,
+    # что проверяет экран оплаты.
+    orders: list[FakeOrder] = field(default_factory=list)
     # Журнал вызовов: тест может утверждать, что кабинет ходил ровно туда,
     # куда должен, и не ходил лишний раз.
     calls: list[tuple[str, dict]] = field(default_factory=list)
     _next_account_id: int = 1
     _next_subscription_id: int = 1
     _next_config_id: int = 1
+    _next_order_id: int = 1
 
     # --- служебное -------------------------------------------------------
 
@@ -387,6 +436,91 @@ class FakeApi:
         if account.chat_id is None:
             return TrialEligibility(eligible=False, reason="telegram_required")
         return TrialEligibility(eligible=True, reason=None)
+
+    # --- заказы кабинета (шаг 5 покупки, #59) ----------------------------
+
+    def _find_order(self, order_id: str) -> FakeOrder:
+        for order in self.orders:
+            if order.order_id == order_id:
+                return order
+        # Тот же код, что у живого бота: «заказа нет» — осмысленный отказ, по
+        # которому экран возврата показывает «заказ не найден», а не сбой.
+        raise BotError("order_not_found", "заказ не найден", status=404)
+
+    def create_order(
+        self,
+        *,
+        account_id: int,
+        days: int,
+        devices: int,
+        servers: list[str],
+        amount_rub: int,
+    ) -> Order:
+        """Заказ на аккаунт. Аккаунту без Telegram — отказ `telegram_required`.
+
+        Это повторяет код бота (`_subscription_rows` возвращает пустой список для
+        аккаунта без `chat_id`): продавать нечего, конфиг выдать некуда. Отказ
+        приходит `BotError` — так же, как от живого роутера, — и экран оплаты
+        ветвится по коду.
+        """
+        self._log("create_order", account_id=account_id, days=days, devices=devices)
+        account = self._by_id(account_id)
+        if account.chat_id is None:
+            raise BotError("telegram_required", "конфиг выдаётся Telegram-аккаунту")
+        order = FakeOrder(
+            order_id=f"ord-{self._next_order_id}",
+            account_id=account_id,
+            days=days,
+            devices=devices,
+            servers=list(servers),
+            amount_rub=amount_rub,
+        )
+        self._next_order_id += 1
+        self.orders.append(order)
+        return Order.from_api(order.to_api())
+
+    def get_order(self, order_id: str) -> Order:
+        """Заказ по номеру или отказ `order_not_found`."""
+        self._log("get_order", order_id=order_id)
+        return Order.from_api(self._find_order(order_id).to_api())
+
+    def mark_order_paid(self, order_id: str) -> OrderPaid:
+        """Отметить оплаченным. `changed=false` на повторе — как у бота.
+
+        `changed` и есть идемпотентность вебхука: `true` только на первом
+        подтверждении, по нему кабинет решает, слать ли письмо.
+        """
+        self._log("mark_order_paid", order_id=order_id)
+        order = self._find_order(order_id)
+        changed = order.status != ORDER_COMPLETED
+        order.status = ORDER_COMPLETED
+        return OrderPaid(order_id=order.order_id, status=order.status, changed=changed)
+
+    def cancel_order(self, order_id: str) -> Order:
+        """Отменить заказ."""
+        self._log("cancel_order", order_id=order_id)
+        order = self._find_order(order_id)
+        order.status = ORDER_CANCELLED
+        return Order.from_api(order.to_api())
+
+    def issue_order(self, order_id: str) -> OrderIssue:
+        """Выдать конфиги по заказу. Повтор — `already=true`, без второго комплекта.
+
+        Один конфиг на выбранный сервер: так повторная выдача не создаёт второй
+        комплект, а `already` это подтверждает.
+        """
+        self._log("issue_order", order_id=order_id)
+        order = self._find_order(order_id)
+        already = bool(order.configs)
+        if not already:
+            order.configs = [
+                OrderConfig(id=f"cfg-{i + 1}", name=code) for i, code in enumerate(order.servers)
+            ]
+        return OrderIssue(
+            order_id=order.order_id,
+            configs=tuple(order.configs),
+            already=already,
+        )
 
 
 @dataclass
