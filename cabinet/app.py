@@ -1265,10 +1265,15 @@ def _add_subscription_routes(
         `ValueError`, и чужая опечатка в ссылке не должна валить страницу. Ноль
         на неизвестный срок тоже не показывается — это продало бы подписку даром.
         """
-        if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
             return RedirectResponse("/login", status_code=303)
         visitor, is_new = _visitor_of(request)
-        _record_event(store, visitor=visitor, step="buy_shown")
+        # Аккаунт передаём там, где сессия уже есть: иначе шаг «открыл тарифы»
+        # остался бы без владельца, и выборка «все события этого аккаунта»
+        # потеряла бы его — при том что человек в этот момент уже вошёл. Нашла
+        # живая проверка: у соседнего `confirm_shown` аккаунт был, здесь нет.
+        _record_event(store, visitor=visitor, step="buy_shown", account_id=view.account_id)
         response = HTMLResponse(
             render_buy(
                 days=days if days in PRICES else DEFAULT_BUY_DAYS,

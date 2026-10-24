@@ -181,12 +181,21 @@ def test_anonymous_steps_share_one_visitor_and_have_no_account() -> None:
 
 
 def test_identified_steps_carry_account_and_order() -> None:
-    """Шаги после входа называют человека и заказ — по ним бот и строит воронку."""
+    """Шаги после входа называют человека и заказ — по ним бот и строит воронку.
+
+    Проверяются **все** шаги после входа, а не пара: правило простое — сессия
+    есть, значит аккаунт пишется. Без этого выборка «все события этого аккаунта»
+    теряла бы шаги, а человек в тот момент уже вошёл. Нашла живая проверка: у
+    `confirm_shown` владелец был, а у соседнего `buy_shown` — нет, хотя обе
+    страницы открываются только с сессией.
+    """
     api = FakeApi()
     _paid_journey(api)
     events = {event["step"]: event for event in api.events}
 
     assert events["signed_in"]["account_id"] == api.accounts[0].id
+    for step in ("signed_in", "buy_shown", "confirm_shown", "pay_started", "paid", "issued"):
+        assert events[step]["account_id"] == api.accounts[0].id, f"шаг {step} без владельца"
     order_id = events["pay_started"]["order_id"]
     assert order_id, "у шага оплаты нет номера заказа"
     # Вебхук — та же покупка: `paid` и `issued` несут тот же заказ и человека.
