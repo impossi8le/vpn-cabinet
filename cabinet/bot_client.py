@@ -36,6 +36,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -48,6 +49,9 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_PUBLIC_BASE",
     "NETWORK_ERROR_CODE",
+    "ORDER_CANCELLED",
+    "ORDER_COMPLETED",
+    "ORDER_PENDING",
     "POLL_CONFIRMED",
     "POLL_DENIED",
     "POLL_PENDING",
@@ -64,6 +68,10 @@ __all__ = [
     "IssuedSession",
     "LoginLink",
     "LoginPoll",
+    "Order",
+    "OrderConfig",
+    "OrderIssue",
+    "OrderPaid",
     "PromoValidation",
     "Referral",
     "Server",
@@ -431,6 +439,138 @@ class TrialEligibility:
         return cls(eligible=bool(raw.get("eligible", False)), reason=raw.get("reason"))
 
 
+# --- заказы кабинета (шаг 5 покупки, #59) ---------------------------------
+#
+# Заказ создаётся **до** платежа и хранится у бота со статусом (спека §3.3):
+# `pending` → `completed` / `cancelled`. Кабинет его не хранит вовсе — заказ
+# живёт на `account_id` в базе бота, и это тот же выбор, что у прочих данных
+# кабинета: SQL и схемы в публичный репозиторий не попадают (CLAUD.md,
+# «Границы сервиса»). Сумма приходит в заказ из `cabinet.pricing` и оттуда же
+# попадает в платёж: цена считается в одном месте, а не в двух.
+
+# Статусы заказа — имена контракта бота, а не подписи: ветвиться по ним, а не по
+# тексту. `cancelled` отделён от `completed` намеренно: «человек отказался» и
+# «деньги пришли» — разные состояния, и свести их к «не pending» значило бы
+# потерять разницу там, где она решает, выдавать ли конфиг.
+ORDER_PENDING = "pending"
+ORDER_COMPLETED = "completed"
+ORDER_CANCELLED = "cancelled"
+
+# Путь заказов кабинета у бота. Отдельная таблица, а не `pending_payments`: у
+# последней `chat_id NOT NULL`, а заказ кабинета живёт на `account_id` (план,
+# «Контракты»).
+ORDERS_PATH = f"{BOT_PATH}/cabinet-orders"
+
+
+@dataclass(frozen=True)
+class OrderConfig:
+    """Конфиг, выданный по заказу: `{"id", "name"}`.
+
+    `id` нужен, чтобы скачать `.ovpn` существующей ручкой; `name` — чтобы
+    человеку было что показать. Поля читаются через `.get`: ответ приходит
+    извне этого репозитория, и пропавшее поле не должно ронять разбор.
+    """
+
+    id: str
+    name: str
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> OrderConfig:
+        return cls(id=str(raw.get("id", "")), name=str(raw.get("name", "")))
+
+
+@dataclass(frozen=True)
+class Order:
+    """Заказ кабинета, каким его отдаёт бот.
+
+    `create_order` отвечает кратко (`order_id`, `status`, `amount_rub`), а
+    `get_order` — полно (с `days`, `devices`, `servers`, `configs`). Один разбор
+    на обе формы: поля читаются через `.get`, и «создать» не требует того, что
+    приходит только при чтении.
+
+    `amount_rub` — целые рубли из `pricing`, записанные в заказ. Сумма платежа
+    берётся отсюда, а не из запроса браузера: подмена цены в адресе иначе
+    продала бы подписку за рубль (Review Focus плана).
+    """
+
+    order_id: str
+    status: str
+    amount_rub: int
+    days: int = 0
+    devices: int = 0
+    servers: tuple[str, ...] = ()
+    configs: tuple[OrderConfig, ...] = ()
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> Order:
+        """Собрать заказ, не доверяя форме ответа.
+
+        Ответ приходит из другого репозитория, поэтому числа читаются через
+        `_optional_int`-подобное приведение: пропавшее поле не должно ронять
+        экран `KeyError`-ом, а незнакомое значение — превращаться в исключение.
+        """
+        return cls(
+            order_id=str(raw.get("order_id", "")),
+            status=str(raw.get("status", "")),
+            amount_rub=_int_or_zero(raw.get("amount_rub")),
+            days=_int_or_zero(raw.get("days")),
+            devices=_int_or_zero(raw.get("devices")),
+            servers=tuple(str(item) for item in (raw.get("servers") or [])),
+            configs=tuple(OrderConfig.from_api(item) for item in (raw.get("configs") or [])),
+        )
+
+
+@dataclass(frozen=True)
+class OrderPaid:
+    """Ответ `POST /internal/cabinet-orders/{id}/paid`.
+
+    `changed` — ключ идемпотентности вебхука: `true` на первом подтверждении и
+    `false` на повторе. По нему кабинет решает, слать ли письмо с конфигом, —
+    один заказ, одно письмо. Без `changed` повтор вебхука слал бы письмо снова.
+    """
+
+    order_id: str
+    status: str
+    changed: bool
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> OrderPaid:
+        return cls(
+            order_id=str(raw.get("order_id", "")),
+            status=str(raw.get("status", "")),
+            changed=bool(raw.get("changed", False)),
+        )
+
+
+@dataclass(frozen=True)
+class OrderIssue:
+    """Ответ `POST /internal/cabinet-orders/{id}/issue` — выдача конфигов.
+
+    Идемпотентна: повтор не создаёт второй комплект (`already=true`). Файлы
+    кабинет скачивает существующей ручкой `/internal/accounts/{id}/configs/{id}`.
+    """
+
+    order_id: str
+    configs: tuple[OrderConfig, ...]
+    already: bool
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> OrderIssue:
+        return cls(
+            order_id=str(raw.get("order_id", "")),
+            configs=tuple(OrderConfig.from_api(item) for item in (raw.get("configs") or [])),
+            already=bool(raw.get("already", False)),
+        )
+
+
+def _int_or_zero(value: Any) -> int:
+    """Целое из ответа бота или `0`. Нечисловое — `0`, а не исключение."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _bearer(token: str) -> dict[str, str]:
     """Заголовок с токеном сессии.
 
@@ -682,6 +822,74 @@ class BotClient:
         """
         data = await self._request("GET", f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
         return TrialEligibility.from_api(data)
+
+    # ---------- Заказы кабинета (шаг 5 покупки, #59) -----------------
+
+    async def create_order(
+        self,
+        *,
+        account_id: int,
+        days: int,
+        devices: int,
+        servers: list[str],
+        amount_rub: int,
+    ) -> Order:
+        """Создать заказ на аккаунт (`POST /internal/cabinet-orders`).
+
+        `amount_rub` — цена из `cabinet.pricing`, посчитанная вызывающим. Кабинет
+        передаёт её боту, а не считает дважды: платёж потом берёт сумму **из
+        заказа**, и заказ — единственное место, где сумма записана.
+
+        Аккаунт без привязанного Telegram бот отказывается продавать — конфиг
+        выдать некуда (`_subscription_rows` возвращает пустой список). Отказ
+        приходит `BotError` с кодом `telegram_required`, и экран оплаты ветвится
+        по нему, а не по тексту: это граница сервиса, а не сбой.
+        """
+        data = await self._request(
+            "POST",
+            ORDERS_PATH,
+            json={
+                "account_id": account_id,
+                "days": days,
+                "devices": devices,
+                "servers": list(servers),
+                "amount_rub": amount_rub,
+            },
+        )
+        return Order.from_api(data)
+
+    async def get_order(self, order_id: str) -> Order:
+        """Прочитать заказ (`GET /internal/cabinet-orders/{order_id}`).
+
+        Нужен экрану возврата: «оплачено» он говорит **по заказу**, а не потому,
+        что человек вернулся на страницу. Неизвестный заказ бот отдаёт
+        `404 order_not_found` — осмысленный отказ, по которому экран показывает
+        «заказ не найден», а не сбой связи.
+        """
+        data = await self._request("GET", f"{ORDERS_PATH}/{quote(order_id)}")
+        return Order.from_api(data)
+
+    async def mark_order_paid(self, order_id: str) -> OrderPaid:
+        """Отметить заказ оплаченным (`POST .../{order_id}/paid`).
+
+        Идемпотентно: `changed=false` на повторе. Вебхук зовёт это после
+        перезапроса платежа; по `changed` решается, слать ли письмо.
+        """
+        data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid")
+        return OrderPaid.from_api(data)
+
+    async def cancel_order(self, order_id: str) -> Order:
+        """Отменить заказ (`POST .../{order_id}/cancel`)."""
+        data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/cancel")
+        return Order.from_api(data)
+
+    async def issue_order(self, order_id: str) -> OrderIssue:
+        """Выдать конфиги по заказу (`POST .../{order_id}/issue`).
+
+        Идемпотентна: повтор возвращает тот же комплект с `already=true`.
+        """
+        data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/issue")
+        return OrderIssue.from_api(data)
 
     # ---------- Сессии (§4) ----------
 
@@ -1040,6 +1248,60 @@ class BotStore:
         """
         data = self._get(f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
         return TrialEligibility.from_api(data)
+
+    # ---------- заказы кабинета (шаг 5 покупки, #59) -----------------
+    #
+    # Синхронные двойники методов `BotClient`: роуты кабинета синхронные, а
+    # заказ создания/чтения зовут именно они. Формы — из контракта плана
+    # («Бот: заказы кабинета»), не из удобства.
+
+    def create_order(
+        self,
+        *,
+        account_id: int,
+        days: int,
+        devices: int,
+        servers: list[str],
+        amount_rub: int,
+    ) -> Order:
+        """Создать заказ (`POST /internal/cabinet-orders`).
+
+        Отказ «нет Telegram» приходит `409 code: telegram_required` — это
+        **осмысленный отказ**, а не сбой, и он не превращается здесь ни во что
+        другое: экран оплаты ветвится по коду и показывает своё состояние.
+        """
+        data = self._request(
+            "POST",
+            ORDERS_PATH,
+            json={
+                "account_id": account_id,
+                "days": days,
+                "devices": devices,
+                "servers": list(servers),
+                "amount_rub": amount_rub,
+            },
+        )
+        return Order.from_api(data)
+
+    def get_order(self, order_id: str) -> Order:
+        """Прочитать заказ (`GET /internal/cabinet-orders/{order_id}`) — экран возврата."""
+        data = self._get(f"{ORDERS_PATH}/{quote(order_id)}")
+        return Order.from_api(data)
+
+    def mark_order_paid(self, order_id: str) -> OrderPaid:
+        """Отметить оплаченным (`POST .../{order_id}/paid`). `changed=false` на повторе."""
+        data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid")
+        return OrderPaid.from_api(data)
+
+    def cancel_order(self, order_id: str) -> Order:
+        """Отменить заказ (`POST .../{order_id}/cancel`)."""
+        data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/cancel")
+        return Order.from_api(data)
+
+    def issue_order(self, order_id: str) -> OrderIssue:
+        """Выдать конфиги (`POST .../{order_id}/issue`). Повтор — `already=true`."""
+        data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/issue")
+        return OrderIssue.from_api(data)
 
     # ---------- транспорт ----------
 

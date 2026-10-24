@@ -18,7 +18,15 @@ from markupsafe import Markup
 
 from cabinet import pricing, theme
 from cabinet.accounts import Account
-from cabinet.bot_client import Balance, Referral, Server, TrialEligibility
+from cabinet.bot_client import (
+    ORDER_CANCELLED,
+    ORDER_COMPLETED,
+    Balance,
+    Order,
+    Referral,
+    Server,
+    TrialEligibility,
+)
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -39,6 +47,8 @@ from cabinet.subscriptions import (
 
 __all__ = [
     "BUY_CONFIRM_URL",
+    "BUY_DONE_URL",
+    "BUY_PAY_URL",
     "BUY_SERVERS_URL",
     "CONFIG_DOWNLOAD_BASE",
     "CONFIG_ERRORS",
@@ -48,6 +58,16 @@ __all__ = [
     "LINK_MAIL_ACTION",
     "LINK_MAIL_CONFIRM_ACTION",
     "LINK_TELEGRAM_ACTION",
+    "PAY_BOT_UNREACHABLE_NOTE",
+    "PAY_DONE_CANCELLED_NOTE",
+    "PAY_DONE_NOT_FOUND_NOTE",
+    "PAY_DONE_PAID_NOTE",
+    "PAY_DONE_PENDING_NOTE",
+    "PAY_DONE_UNREACHABLE_NOTE",
+    "PAY_FAILED_NOTE",
+    "PAY_INCOMPLETE_NOTE",
+    "PAY_ORDER_REJECTED_NOTE",
+    "PAY_TELEGRAM_REQUIRED_NOTE",
     "RATE_LIMIT_ERROR",
     "STATIC_DIR",
     "TELEGRAM_ATTEMPTS_EXCEEDED",
@@ -67,6 +87,8 @@ __all__ = [
     "render_login_waiting",
     "render_buy",
     "render_buy_confirm",
+    "render_buy_done",
+    "render_buy_pay",
     "render_buy_servers",
     "render_subscriptions",
 ]
@@ -689,6 +711,11 @@ def render_buy(
 BUY_SERVERS_URL = "/buy/servers"
 # Адрес шага 3: с выбора серверов есть возврат к подтверждению.
 BUY_CONFIRM_URL = "/buy/confirm"
+# Шаг 5: экран оплаты и экран возврата. Оплата идёт по адресу с выбранным
+# набором (`?days=&devices=&pick=`), возврат — по номеру заказа (`?order_id=`),
+# как его подставит ЮKassa в `return_url`.
+BUY_PAY_URL = "/buy/pay"
+BUY_DONE_URL = "/buy/done"
 
 # Тексты права на триал на шаге подтверждения. Проверка здесь уже сделана, и
 # «доступен» — факт, а не обещание; но и он не значит «выдан»: оформление —
@@ -807,17 +834,25 @@ def _pluralize_servers(count: int) -> str:
     return f"{count} серверов"
 
 
-def _servers_url(days: int, devices: int, picks: list[str]) -> str:
-    """Адрес выбора серверов с текущим набором в query.
+def _order_url(base: str, days: int, devices: int, picks: list[str]) -> str:
+    """Адрес шага покупки с текущим набором в query.
 
     Выбор выражается **адресом**, а не скрытым состоянием: так экран работает
     без JavaScript, а набор восстанавливается из ссылки. Один сервер может
     стоять несколько раз (комплект из одинаковых), поэтому повторяется
     параметр `pick`, а не счётчик — порядок и повторы сохраняются.
+
+    Один сборщик на выбор серверов и на оплату: оба адреса несут один и тот же
+    набор, и вторая копия формата разошлась бы при первой правке.
     """
     parts = [f"days={days}", f"devices={devices}"]
     parts.extend(f"pick={quote(code)}" for code in picks)
-    return f"{BUY_SERVERS_URL}?{'&'.join(parts)}"
+    return f"{base}?{'&'.join(parts)}"
+
+
+def _servers_url(days: int, devices: int, picks: list[str]) -> str:
+    """Адрес выбора серверов — тот же сборщик, что у оплаты (`_order_url`)."""
+    return _order_url(BUY_SERVERS_URL, days, devices, picks)
 
 
 def render_buy_servers(
@@ -881,6 +916,9 @@ def render_buy_servers(
         remaining=devices - total_picked,
         complete=complete,
         back_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}",
+        # Ссылка на оплату — только когда набор полон: «Готово» и есть то
+        # состояние, в котором шаг 5 достижим. Сам адрес несёт выбранный набор.
+        pay_url=_order_url(BUY_PAY_URL, days, devices, picked),
     )
 
 
@@ -895,6 +933,181 @@ def _without_one(picks: list[str], code: str) -> list[str]:
     if code in result:
         result.remove(code)
     return result
+
+
+# --- покупка: оплата и возврат (шаг 5, #61) ------------------------------
+#
+# Два экрана одного шага. «Оплата» — короткий развилочный экран: увести на
+# страницу ЮKassa или честно сказать, почему не увезли. «Возврат» — состояние
+# **заказа**, и «оплачено» на нём стоит только когда так говорит заказ, а не
+# потому что человек вернулся на страницу: возврат подделывается, подтверждение
+# приходит вебхуком (спека §3).
+#
+# Тон у обоих нейтральный (§7): оплата — ни подтверждённая защита, ни опасность,
+# и зелёного на этих экранах нет. Тексты вынесены в константы — их сверяет тест
+# по имени, и так строка живёт в одном месте.
+
+# Аккаунт без Telegram. Это **граница сервиса**, а не сбой: конфиг выдаётся
+# Telegram-аккаунту (`_subscription_rows` бота), и продавать нечего. Сказано, что
+# именно делать (привязать Telegram), а не «оплата недоступна» без выхода.
+PAY_TELEGRAM_REQUIRED_NOTE = (
+    "Оплата доступна аккаунту с привязанным Telegram: конфиг выдаётся "
+    "Telegram-аккаунту, и выдать его на одну почту некуда. Привяжите Telegram "
+    "и вернитесь к оплате."
+)
+# Набор серверов не собран. Это не «ошибка оплаты»: до оплаты дело не дошло,
+# и человек возвращается ровно на тот шаг, который не закончен.
+PAY_INCOMPLETE_NOTE = (
+    "Выбор серверов не закончен: серверов должно быть ровно столько, "
+    "сколько устройств. Вернитесь к выбору серверов."
+)
+# Бот не ответил. Отдельное состояние, а не «ошибка оплаты»: причина не в
+# человеке и не в оплате, и действие другое — повторить позже.
+PAY_BOT_UNREACHABLE_NOTE = (
+    "Сервис сейчас не отвечает — оформить заказ не удалось. Повторите чуть позже."
+)
+# Бот отказал по другой причине (не «нет Telegram»). Общий текст с действием в
+# заказе, а не в оплате: к оплате человека ещё не подвели.
+PAY_ORDER_REJECTED_NOTE = (
+    "Не удалось оформить заказ. Вернитесь к выбору и попробуйте ещё раз; "
+    "если не помогает — повторите позже."
+)
+# Платёж не создан: провайдер не ответил или магазин не настроен. Это **не** то
+# же, что недоступность бота, и текст у него свой — иначе «оплата не началась»
+# читалось бы как «это вы сделали что-то не так».
+PAY_FAILED_NOTE = (
+    "Не удалось перейти к оплате. Заказ создан, но страница оплаты не выдана — "
+    "попробуйте ещё раз чуть позже."
+)
+
+# Тексты экрана возврата. «Оплачено» — факт из заказа, а не догадка: заказ
+# говорит `completed`, и только тогда это слово стоит на экране.
+PAY_DONE_PAID_NOTE = "Оплата прошла. Заказ оплачен."
+# Подтверждение приходит вебхуком, и это может занять секунды: «ещё не оплачено»
+# и «оплата не прошла» — разные вещи, и экран говорит первое честно, не обещая
+# и не пугая.
+PAY_DONE_PENDING_NOTE = (
+    "Оплата ещё не подтверждена. Подтверждение приходит отдельным сообщением от "
+    "платёжного сервиса и может занять несколько секунд — обновите страницу чуть позже."
+)
+PAY_DONE_CANCELLED_NOTE = "Заказ отменён."
+PAY_DONE_NOT_FOUND_NOTE = "Заказ не найден. Возможно, ссылка устарела."
+PAY_DONE_UNREACHABLE_NOTE = (
+    "Не удалось узнать состояние заказа: сервис не отвечает. Обновите страницу позже."
+)
+
+
+def render_buy_pay(
+    *,
+    state: str,
+    days: int = DEFAULT_BUY_DAYS,
+    devices: int = DEFAULT_BUY_DEVICES,
+    back_url: str | None = None,
+    retry_url: str | None = None,
+) -> str:
+    """Шаг 5: экран оплаты в состояниях, когда увести на оплату нельзя.
+
+    Успешный путь на этом экране не рисуется вовсе: он **редирект** на страницу
+    ЮKassa, и рендерить там нечего. Сюда попадают только отказы, и каждый — своё
+    состояние со своим текстом и **своим действием**: «нет Telegram» ведёт
+    привязать Telegram, «набор не собран» — назад к серверам, «бот молчит» —
+    повторить. Свести их к одному «оплата не удалась» значило бы отнять у
+    человека единственную подсказку, что делать.
+
+    `state` — имя состояния (`telegram_required`, `incomplete`, `bot_unreachable`,
+    `rejected`, `payment_failed`). Разметка берёт по нему текст и действие, а не
+    ветвится по сырым строкам на месте.
+    """
+    states: dict[str, dict[str, str | None]] = {
+        "telegram_required": {
+            "title": "Оплата недоступна",
+            "note": PAY_TELEGRAM_REQUIRED_NOTE,
+            "action_url": "/account",
+            "action_label": "Привязать Telegram",
+        },
+        "incomplete": {
+            "title": "Выбор не закончен",
+            "note": PAY_INCOMPLETE_NOTE,
+            "action_url": back_url,
+            "action_label": "Выбрать серверы",
+        },
+        "bot_unreachable": {
+            "title": "Сервис не отвечает",
+            "note": PAY_BOT_UNREACHABLE_NOTE,
+            "action_url": retry_url,
+            "action_label": "Повторить",
+        },
+        "rejected": {
+            "title": "Заказ не оформлен",
+            "note": PAY_ORDER_REJECTED_NOTE,
+            "action_url": back_url,
+            "action_label": "Вернуться к выбору",
+        },
+        "payment_failed": {
+            "title": "Оплата не начата",
+            "note": PAY_FAILED_NOTE,
+            "action_url": retry_url,
+            "action_label": "Повторить",
+        },
+    }
+    context = states.get(state, states["payment_failed"])
+    return _ENV.get_template("buy_pay.html").render(
+        **_base_context(),
+        days_label=_pluralize_days(days),
+        devices_label=_pluralize_devices(devices),
+        state=state,
+        title=context["title"],
+        note=context["note"],
+        action_url=context["action_url"],
+        action_label=context["action_label"],
+    )
+
+
+def render_buy_done(
+    *,
+    order: Order | None = None,
+    unreachable: bool = False,
+    not_found: bool = False,
+    refresh_url: str | None = None,
+) -> str:
+    """Экран возврата: состояние **заказа**, как его отдаёт бот.
+
+    «Оплачено» стоит здесь только когда заказ говорит `completed`. Заказ ещё
+    `pending` — экран честно говорит, что подтверждение не пришло: вебхук может
+    дойти через секунды после возврата, и объявлять оплату по возврату значило бы
+    выдать подделываемый переход за подтверждение (спека §3).
+
+    Про письмо здесь **не сказано** намеренно: доставка письма — отдельная
+    работа, и обещать её, пока её нет, нечем.
+
+    Три состояния разведены: заказ прочитан (`order`), заказ не найден
+    (`not_found`) и «состояние неизвестно» (`unreachable` — бот не ответил).
+    Свести последние два значило бы прочитать недоступность сервиса как «заказа
+    нет».
+    """
+    if not_found:
+        title, note, tone = "Заказ не найден", PAY_DONE_NOT_FOUND_NOTE, "refused"
+    elif unreachable:
+        title, note, tone = "Состояние неизвестно", PAY_DONE_UNREACHABLE_NOTE, "unreachable"
+    elif order is not None and order.status == ORDER_COMPLETED:
+        title, note, tone = "Оплачено", PAY_DONE_PAID_NOTE, "paid"
+    elif order is not None and order.status == ORDER_CANCELLED:
+        title, note, tone = "Заказ отменён", PAY_DONE_CANCELLED_NOTE, "refused"
+    else:
+        title, note, tone = "Оплата не подтверждена", PAY_DONE_PENDING_NOTE, "pending"
+    return _ENV.get_template("buy_done.html").render(
+        **_base_context(),
+        state=tone,
+        title=title,
+        note=note,
+        order_id=order.order_id if order is not None else None,
+        days_label=_pluralize_days(order.days) if order is not None and order.days else None,
+        devices_label=(
+            _pluralize_devices(order.devices) if order is not None and order.devices else None
+        ),
+        total=_rubles(order.amount_rub) if order is not None else None,
+        refresh_url=refresh_url,
+    )
 
 
 # --- связывание способов входа (W5.3) ------------------------------------

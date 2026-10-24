@@ -72,8 +72,9 @@ from cabinet.configs import (
 )
 from cabinet.linking import Linking, LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailSender
+from cabinet.payments import Payments, PaymentsError, UnconfiguredPayments
 from cabinet.pending_mail import PendingMail
-from cabinet.pricing import PRICES
+from cabinet.pricing import PRICES, calculate_price
 from cabinet.render import (
     DEFAULT_BUY_DAYS,
     DEFAULT_BUY_DEVICES,
@@ -83,6 +84,8 @@ from cabinet.render import (
     TELEGRAM_CHECK_LABEL,
     render_buy,
     render_buy_confirm,
+    render_buy_done,
+    render_buy_pay,
     render_buy_servers,
     render_linking,
     render_login,
@@ -228,6 +231,18 @@ def _default_mail_sender() -> MailSender:
     return MailSender(sender=DEFAULT_SENDER, transport=FakeMailSender())
 
 
+def _default_payments() -> Payments:
+    """Магазин ЮKassa по умолчанию — отказывающая заглушка.
+
+    Умолчание для тестов и стенда, как `_default_store` и `_default_mail_sender`:
+    запуск без магазина не должен падать на старте, но и изображать оплату нельзя.
+    Заглушка отказывает на использовании (`UnconfiguredPayments`), и экран оплаты
+    показывает это отдельным состоянием. Боевой клиент собирается из окружения
+    (`cabinet.payments.build_payments`) и передаётся в `build_app` из `__main__`.
+    """
+    return UnconfiguredPayments()
+
+
 async def _maybe_await(value: object) -> object:
     """Дождаться значения, если оно ожидаемое, иначе вернуть как есть.
 
@@ -304,6 +319,23 @@ BOT_UNREACHABLE_ERROR = "Сервис сейчас не отвечает, дан
 # факт от бота, а здесь факта не было вовсе. Текст говорит, что делать, а не
 # выдаёт сбой за состояние.
 BUY_SERVERS_ERROR = "Список серверов не получен. Обновите страницу позже."
+
+# Описание платежа на странице ЮKassa. Короткое и без внутренних деталей: его
+# видит покупатель, а репозиторий публичный. Названия серверов и адресов в
+# описание не попадают.
+BUY_PAY_DESCRIPTION = "Подписка VPN"
+
+
+def _purchase_query(days: int, devices: int, picks: list[str]) -> str:
+    """Общая часть адресов покупки: `days`, `devices` и повторяющиеся `pick`.
+
+    Один сборщик на экран оплаты, возврат к серверам и повтор: набор у них один,
+    и вторая копия формата разошлась бы при первой правке.
+    """
+    parts = [f"days={days}", f"devices={devices}"]
+    parts.extend(f"pick={quote(code)}" for code in picks)
+    return "&".join(parts)
+
 
 # Бот недоступен на **входе**, и текст здесь свой — не по недосмотру. Код к этому
 # моменту уже проверен и погашен (он одноразовый, `AuthMail.verify`), поэтому
@@ -434,6 +466,7 @@ def build_app(
     now: Callable[[], datetime] | None = None,
     config_source: ConfigSource | None = None,
     telegram_auth: TelegramAuthClient | None = None,
+    payments: Payments | None = None,
 ) -> FastAPI:
     """Собрать приложение, приняв зависимости параметрами.
 
@@ -448,6 +481,7 @@ def build_app(
     """
     store = store if store is not None else _default_store()
     mail_sender = mail_sender if mail_sender is not None else _default_mail_sender()
+    payments = payments if payments is not None else _default_payments()
     clock = now if now is not None else (lambda: datetime.now(UTC))
     # Клиент входа по Telegram — отдельная зависимость, а не часть хранилища: это
     # **другой** сервис бота (публичный API), другой адрес и без общего секрета.
@@ -500,6 +534,7 @@ def build_app(
     app.state.configs = configs
     app.state.telegram_auth = telegram_auth
     app.state.telegram_login = telegram_login
+    app.state.payments = payments
 
     _add_login_routes(
         app,
@@ -515,6 +550,7 @@ def build_app(
         sessions=sessions,
         clock=clock,
         configs=configs,
+        payments=payments,
     )
     _add_account_routes(
         app,
@@ -973,8 +1009,9 @@ def _add_subscription_routes(
     sessions: SessionService,
     clock: Callable[[], datetime],
     configs: ConfigService,
+    payments: Payments,
 ) -> None:
-    """Роут подписок и скачивание конфига. Экран один, но он же — вход в кабинет."""
+    """Роуты подписок, покупки и оплаты. Экран подписок — он же вход в кабинет."""
 
     @app.get("/subscriptions", response_class=HTMLResponse)
     def subscriptions_page(request: Request) -> Response:
@@ -1127,6 +1164,127 @@ def _add_subscription_routes(
                 error=error,
             )
         )
+
+    def _pay_screen(state: str, days: int, devices: int, picks: list[str] | None) -> HTMLResponse:
+        """Экран отказа на шаге оплаты: текст и действие по состоянию.
+
+        Оба адреса (повтор и возврат к серверам) собираются из того же набора,
+        что пришёл: набор у них один, и вторую копию формата держать незачем.
+        """
+        query = _purchase_query(days, devices, list(picks or []))
+        return HTMLResponse(
+            render_buy_pay(
+                state=state,
+                days=days,
+                devices=devices,
+                back_url=f"/buy/servers?{query}",
+                retry_url=f"/buy/pay?{query}",
+            )
+        )
+
+    @app.get("/buy/pay", response_class=HTMLResponse)
+    def buy_pay_page(
+        request: Request,
+        days: int | None = Query(default=None),
+        devices: int | None = Query(default=None),
+        pick: Annotated[list[str] | None, Query()] = None,
+    ) -> Response:
+        """Шаг 5: собрать заказ, создать платёж и увести на страницу оплаты.
+
+        **Цена не читается из адреса.** Её считает `calculate_price` по паре
+        `days`/`devices`, она же записывается в заказ бота, и платёж берёт сумму
+        **из заказа** (`order.amount_rub`). Взятая от браузера сумма позволила бы
+        купить за рубль — это первый пункт Review Focus плана.
+
+        Состояния разведены и не смешиваются: нет сессии — на вход; у аккаунта
+        нет Telegram — бот отказывает `telegram_required`, и экран объясняет, что
+        конфиг выдаётся Telegram-аккаунту (граница сервиса, а не сбой); бот не
+        ответил — своё состояние; платёж не создан — своё. Успех — **редирект** на
+        страницу ЮKassa, а не экран.
+        """
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
+            return RedirectResponse("/login", status_code=303)
+        chosen_days = days if days in PRICES else DEFAULT_BUY_DAYS
+        chosen_devices = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
+
+        try:
+            servers = store.list_servers()
+        except (BotError, BotUnreachable):
+            return _pay_screen("bot_unreachable", chosen_days, chosen_devices, pick)
+        # Набор сверяется со списком, который кабинет получил: код, которого в
+        # списке нет, пришёл из чужой или устаревшей ссылки, и оформить на него
+        # заказ значило бы записать несуществующий сервер. Неполный набор — не
+        # ошибка оплаты, а незаконченный шаг 4: возвращаем к выбору.
+        known = {server.code for server in servers}
+        picks = [code for code in (pick or []) if code in known][:chosen_devices]
+        if len(picks) != chosen_devices:
+            return _pay_screen("incomplete", chosen_days, chosen_devices, picks)
+
+        amount = calculate_price(chosen_days, chosen_devices).final_price
+        try:
+            order = store.create_order(
+                account_id=view.account_id,
+                days=chosen_days,
+                devices=chosen_devices,
+                servers=picks,
+                amount_rub=amount,
+            )
+        except BotError as exc:
+            # `telegram_required` — своё состояние (граница сервиса), прочие
+            # отказы бота — общий текст с действием в заказе, не в оплате.
+            state = "telegram_required" if exc.code == "telegram_required" else "rejected"
+            return _pay_screen(state, chosen_days, chosen_devices, picks)
+        except BotUnreachable:
+            return _pay_screen("bot_unreachable", chosen_days, chosen_devices, picks)
+
+        try:
+            payment = payments.create_payment(
+                order_id=order.order_id,
+                amount_rub=order.amount_rub,
+                description=BUY_PAY_DESCRIPTION,
+                return_url=payments.return_url(order.order_id),
+            )
+        except PaymentsError:
+            # Магазин не настроен, провайдер недоступен или отказал — всё это
+            # «оплата не начата», и это **не** то же, что недоступность бота:
+            # заказ уже создан, а страница оплаты не выдана.
+            return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
+        if not payment.confirmation_url:
+            return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
+        return RedirectResponse(payment.confirmation_url, status_code=303)
+
+    @app.get("/buy/done", response_class=HTMLResponse)
+    def buy_done_page(
+        request: Request,
+        order_id: str | None = Query(default=None),
+    ) -> Response:
+        """Возврат с оплаты: состояние **заказа**, как его отдаёт бот.
+
+        «Оплачено» экран говорит только потому, что так сказал заказ, а не
+        потому что человек вернулся на страницу: возврат подделывается,
+        подтверждение приходит вебхуком (спека §3). Заказ ещё `pending` — экран
+        честно говорит, что подтверждение не пришло (вебхук может дойти через
+        секунды), а не объявляет оплату по переходу.
+
+        Без `order_id` показывать нечего; неизвестный заказ (`404 order_not_found`)
+        — состояние экрана, а не сбой; недоступность бота — тоже своё состояние.
+        Свести их значило бы прочитать недоступность сервиса как «заказа нет».
+        """
+        if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
+            return RedirectResponse("/login", status_code=303)
+        if not order_id:
+            return HTMLResponse(render_buy_done(not_found=True))
+        refresh = f"/buy/done?order_id={quote(order_id)}"
+        try:
+            order = store.get_order(order_id)
+        except BotError as exc:
+            if exc.code == "order_not_found" or exc.status == 404:
+                return HTMLResponse(render_buy_done(not_found=True))
+            return HTMLResponse(render_buy_done(unreachable=True, refresh_url=refresh))
+        except BotUnreachable:
+            return HTMLResponse(render_buy_done(unreachable=True, refresh_url=refresh))
+        return HTMLResponse(render_buy_done(order=order, refresh_url=refresh))
 
     @app.get("/subscriptions/{subscription_id}/config")
     async def subscription_config(request: Request, subscription_id: str) -> Response:

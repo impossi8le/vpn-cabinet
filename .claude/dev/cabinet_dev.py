@@ -41,13 +41,49 @@ if str(_ROOT) not in sys.path:
 
 import uvicorn  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from fastapi.responses import RedirectResponse  # noqa: E402
+from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 
 from cabinet.app import COOKIE_NAME, DEFAULT_SENDER, build_app  # noqa: E402
 from cabinet.mail_sender import MailSender  # noqa: E402
+from cabinet.payments import Payment  # noqa: E402
 from tests.fakes import FakeApi  # noqa: E402
 
 PORT = 8111
+
+
+class StubPayments:
+    """Подставная ЮKassa для стенда: платёж не создаётся у провайдера, а ведёт
+    на внутреннюю страницу стенда `/dev/pay/{id}`.
+
+    Нужна, чтобы по флоу можно было дойти до «страницы оплаты» без магазина и без
+    сети. Это **не** часть кабинета: в бою клиент — `cabinet.payments.PaymentClient`.
+    Сумма приходит аргументом и сохраняется как есть: стенд не считает денег, он
+    только показывает, что платёж создан на ту сумму, что записал заказ.
+    """
+
+    def __init__(self) -> None:
+        self.created: dict[str, dict] = {}
+        self._next = 1
+
+    def return_url(self, order_id: str) -> str:
+        return f"http://127.0.0.1:{PORT}/buy/done?order_id={order_id}"
+
+    def create_payment(
+        self, *, order_id: str, amount_rub: int, description: str, return_url: str
+    ) -> Payment:
+        payment_id = f"pay-{self._next}"
+        self._next += 1
+        self.created[payment_id] = {"order_id": order_id, "amount_rub": amount_rub}
+        return Payment(
+            id=payment_id,
+            status="pending",
+            amount_rub=amount_rub,
+            confirmation_url=f"/dev/pay/{payment_id}",
+        )
+
+    def get_payment(self, payment_id: str) -> Payment:
+        info = self.created[payment_id]
+        return Payment(id=payment_id, status="pending", amount_rub=info["amount_rub"])
 
 
 class PrintingMail:
@@ -89,9 +125,11 @@ def seeded_api() -> FakeApi:
 
 
 def build() -> FastAPI:
+    payments = StubPayments()
     app = build_app(
         store=seeded_api(),
         mail_sender=MailSender(sender=DEFAULT_SENDER, transport=PrintingMail()),
+        payments=payments,
     )
 
     @app.get("/dev/as/{account_id}", include_in_schema=False)
@@ -101,6 +139,24 @@ def build() -> FastAPI:
         response = RedirectResponse("/account", status_code=303)
         response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", path="/")
         return response
+
+    @app.get("/dev/pay/{payment_id}", include_in_schema=False)
+    def dev_pay(payment_id: str) -> HTMLResponse:
+        """Подставная «страница оплаты ЮKassa».
+
+        Куда кабинет уводит человека после создания платежа. Ничего не списывает:
+        показывает номер и сумму и ведёт на экран возврата — чтобы флоу покупки
+        был проходим до конца без живого магазина.
+        """
+        info = payments.created.get(payment_id)
+        if info is None:
+            return HTMLResponse("<h1>Платёж не найден</h1>", status_code=404)
+        done = f"/buy/done?order_id={info['order_id']}"
+        return HTMLResponse(
+            "<h1>Подставная страница оплаты</h1>"
+            f"<p>Платёж {payment_id}, сумма {info['amount_rub']} ₽.</p>"
+            f'<p><a href="{done}">Вернуться в кабинет</a></p>'
+        )
 
     return app
 
