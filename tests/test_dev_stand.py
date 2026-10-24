@@ -160,3 +160,54 @@ def test_stand_does_not_start_a_server_on_import() -> None:
     stand = _stand()
 
     assert callable(stand.build)
+
+
+def test_stand_confirms_the_bot_challenge_so_link_can_be_walked_live() -> None:
+    """Служебный роут стенда имитирует подтверждение в боте.
+
+    Без него флоу привязки Telegram в браузере не пройти: подтверждение делает
+    бот в Telegram, а живого бота рядом нет. Роут обязан быть, и он обязан
+    действительно подтверждать челлендж в подставном боте — тест зовёт его как
+    кнопку и проверяет, что следующий опрос отдаёт `confirmed`.
+    """
+    from fastapi.testclient import TestClient
+
+    stand = _stand()
+    app = stand.build()
+    # Тот самый подставной бот, которым собран стенд: роут подтверждения держит
+    # его в замыкании, поэтому подменить `app.state` недостаточно.
+    bot = app.state.telegram_auth  # type: ignore[attr-defined]
+
+    addresses = {getattr(route, "path", "") for route in app.routes}
+    assert "/dev/tg-confirm/{public_code}" in addresses, "нет роута подтверждения в боте"
+
+    client = TestClient(app, raise_server_exceptions=False)
+    link = bot.start_login("code-1", "hash", mode="link")
+    assert link.deep_link.endswith("/dev/tg/code-1"), "ссылка стенда ведёт на страницу «бота»"
+
+    response = client.get("/dev/tg-confirm/code-1", follow_redirects=False)
+
+    assert response.status_code == 303
+    poll = bot.poll_login("code-1", "secret", "123456")
+    assert poll.status == "confirmed"
+    assert poll.chat_id is not None
+
+
+def test_stand_fake_bot_matches_the_real_client_shape() -> None:
+    """Подставной публичный API стенда принимает те же вызовы, что живой клиент.
+
+    Стенд подставляет `FakeTelegramAuth` вместо `TelegramAuthClient`. Если у
+    одного из них параметр разойдётся (`mode`, `device_nonce`), флоу на стенде
+    упадёт `TypeError` — ровно тем же классом поломки, что нашёл `PrintingMail`.
+    Сверяются подписи, а не только имена: имя метода было, а параметра не было —
+    и это как раз случай с `attachments`.
+    """
+    import inspect
+
+    from cabinet.bot_client import TelegramAuthClient
+    from tests.fakes import FakeTelegramAuth
+
+    problems = _incompatibilities(FakeTelegramAuth, TelegramAuthClient)
+    assert problems == []
+    # И обратная сторона: `mode` у старта — часть формы, а не украшение.
+    assert "mode" in inspect.signature(FakeTelegramAuth.start_login).parameters

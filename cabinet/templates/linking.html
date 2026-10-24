@@ -164,10 +164,44 @@
     <p class="sub-unusable">Это единственный способ входа. Сначала привяжите почту — без неё отвязывать Telegram нельзя.</p>
     {%- endif %}
   {% else %}
+    {%- if telegram_link_pending %}
+    {# Челлендж привязки начат: показываем ссылку в бота и шаг ввода кода —
+       как на экране входа, и по той же причине. Вернуться к стартовой кнопке
+       значило бы начать второй челлендж, а первый остался бы висеть.
+
+       Ссылка открывается **новой вкладкой**: челлендж начат здесь, а код из
+       бота вводят здесь же по возвращении. Переход в той же вкладке унёс бы
+       экран, и история браузера запросила бы страницу заново — а это уже
+       другой челлендж. `noopener` не даёт открытой странице подменить вкладку
+       кабинета через `window.opener`; `noreferrer` не отдаёт боту адрес
+       кабинета заголовком `Referer`. #}
+    <p class="sub-note">Откройте Telegram — бот пришлёт <b>код подтверждения</b>. Введите его здесь, чтобы завершить привязку.</p>
+    {%- if telegram_link_url %}
+    <a class="btn btn-g" href="{{ telegram_link_url }}" target="_blank"
+       rel="noopener noreferrer">Открыть Telegram</a>
+    {%- endif %}
+    <form method="post" action="{{ link_telegram_verify_action }}">
+      {# Код начатого челленджа — не секрет (он и так в ссылке у человека); по
+         нему кабинет находит у себя секрет. `chat_id` здесь нет и быть не
+         может: личность заявляет только бот (§3.3). #}
+      <input type="hidden" name="public_code" value="{{ telegram_link_code }}">
+      <label class="field-label" for="tg-code">Код из бота</label>
+      <input class="field" id="tg-code" name="code" type="text" inputmode="numeric"
+             autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"
+             autofocus>
+      <button class="btn btn-p btn-sm" type="submit">Проверить привязку</button>
+    </form>
+    {# Начать заново — тем же адресом, что и старт: новый код и секрет, старый
+       челлендж гасит бот своим сроком. #}
+    <form method="post" action="{{ link_telegram_action }}">
+      <button class="btn btn-g btn-sm" type="submit">Начать заново</button>
+    </form>
+    {%- else %}
     <p class="sub-note">Привязка идёт через бота сервиса: он подтвердит, что Telegram действительно ваш.</p>
     <form method="post" action="{{ link_telegram_action }}">
       <button class="btn btn-p btn-sm" type="submit">Привязать Telegram</button>
     </form>
+    {%- endif %}
   {% endif %}
 </div>
 {% endblock %}

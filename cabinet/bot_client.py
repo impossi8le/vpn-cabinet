@@ -43,6 +43,8 @@ import httpx
 from cabinet.accounts import Account
 
 __all__ = [
+    "AUTH_MODE_LINK",
+    "AUTH_MODE_LOGIN",
     "BOT_BASE_URL_ENV",
     "BOT_PUBLIC_BASE_ENV",
     "BOT_SECRET_ENV",
@@ -123,6 +125,21 @@ BOT_PUBLIC_BASE_ENV = "BOT_PUBLIC_BASE"
 
 AUTH_LINK_PATH = "/api/v1/auth/link"
 AUTH_POLL_PATH = "/api/v1/auth/poll"
+
+# Режим челленджа (§5 контракта). Один флоу обслуживает две операции, и различие
+# между ними — ровно в том, что происходит на подтверждении:
+#
+# - `login` — бот находит или **заводит** аккаунт под подтверждённый `chat_id` и
+#   в ответе опроса отдаёт `account_id` рядом с токеном;
+# - `link` — бот подтверждает `chat_id`, **не заводя** аккаунт: ответ опроса —
+#   `{"status": "confirmed", "chat_id": <id>}` без `session_token` и без
+#   `account_id`. Привязка к уже существующему аккаунту кабинета — это второе,
+#   и свежий `chat_id` в режиме `login` занял бы новый аккаунт, после чего
+#   привязка конфликтовала бы сама с собой (issue #65).
+#
+# Имена — часть контракта бота, а не подписи: ветвиться по ним, а не по тексту.
+AUTH_MODE_LOGIN = "login"
+AUTH_MODE_LINK = "link"
 
 # Статусы опроса (§5 публичного контракта). Имена — часть контракта бота, а не
 # подписи: ветвиться по ним, а не по тексту.
@@ -1567,6 +1584,12 @@ class LoginPoll:
     `retry_after_ms` приходит только с `pending`: сколько ждать до следующего
     опроса. Читается через `.get`, потому что ответ приходит из другого
     репозитория, и пропавшее поле не должно ронять разбор.
+
+    Тот же разбор обслуживает **режим привязки** (issue #65): там на
+    `confirmed` бот отдаёт только `chat_id`, без `session_token` и без
+    `account_id` — привязка не создаёт аккаунт и не выдаёт сессию. `account_id`
+    тогда `None`, а личность — это подтверждённый `chat_id`; вторая форма не
+    заводится отдельным типом, потому что поле одно и то же.
     """
 
     status: str
@@ -1739,19 +1762,30 @@ class TelegramAuthClient:
         """
         return cls(base_url=source.get(BOT_PUBLIC_BASE_ENV, "").strip() or None)
 
-    def start_login(self, public_code: str, secret_hash_value: str) -> LoginLink:
-        """Начать челлендж: `public_code` + `secret_hash` → ссылка `deep_link`.
+    def start_login(
+        self,
+        public_code: str,
+        secret_hash_value: str,
+        *,
+        mode: str = AUTH_MODE_LOGIN,
+    ) -> LoginLink:
+        """Начать челлендж: `public_code` + `secret_hash` (+ `mode`) → `deep_link`.
 
         Ссылку строит бот: именем бота владеет он, и собранная кабинетом ссылка
         однажды разошлась бы с настоящей. Возвращается ссылка и её срок — больше
         экрану показывать нечего, а срок нужен, чтобы гасить протухшие челленджи
         в памяти.
+
+        `mode` выбирает операцию: `login` (по умолчанию — вход, как было) или
+        `link` (привязка `chat_id` к существующему аккаунту без его создания,
+        issue #65). Умолчание — `login`: вторая операция не должна подменять
+        первую у вызывающих, которые о режиме не знают.
         """
         return LoginLink.from_api(
             self._request(
                 "POST",
                 AUTH_LINK_PATH,
-                json={"public_code": public_code, "secret_hash": secret_hash_value},
+                json={"public_code": public_code, "secret_hash": secret_hash_value, "mode": mode},
             )
         )
 

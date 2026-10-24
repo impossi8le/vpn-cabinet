@@ -58,6 +58,7 @@ __all__ = [
     "LINK_MAIL_ACTION",
     "LINK_MAIL_CONFIRM_ACTION",
     "LINK_TELEGRAM_ACTION",
+    "LINK_TELEGRAM_VERIFY_ACTION",
     "PAY_BOT_UNREACHABLE_NOTE",
     "PAY_DONE_CANCELLED_NOTE",
     "PAY_DONE_NOT_FOUND_NOTE",
@@ -326,6 +327,10 @@ LINK_MAIL_ACTION = "/account/link/mail"
 # скрытого поля-признака, и тогда отправку кода нельзя было бы повторить, не
 # рискуя заодно проверить его.
 LINK_MAIL_CONFIRM_ACTION = "/account/link/mail/confirm"
+# Проверка привязки Telegram после подтверждения в боте: отдельный шаг того же
+# сценария, что `LINK_TELEGRAM_ACTION`. Начать привязку и проверить её на одном
+# адресе не различить без скрытого признака — как и у привязки почты.
+LINK_TELEGRAM_VERIFY_ACTION = "/account/link/telegram/verify"
 UNLINK_TELEGRAM_ACTION = "/account/unlink/telegram"
 UNLINK_MAIL_ACTION = "/account/unlink/mail"
 
@@ -1402,8 +1407,11 @@ def render_linking(
     notice: str | None = None,
     notice_tone: str = "neutral",
     mail_pending: str | None = None,
+    telegram_link_url: str | None = None,
+    telegram_link_code: str | None = None,
     unlink_previews: dict[str, object] | None = None,
     link_telegram_action: str = LINK_TELEGRAM_ACTION,
+    link_telegram_verify_action: str = LINK_TELEGRAM_VERIFY_ACTION,
     link_mail_action: str = LINK_MAIL_ACTION,
     link_mail_confirm_action: str = LINK_MAIL_CONFIRM_ACTION,
     unlink_telegram_action: str = UNLINK_TELEGRAM_ACTION,
@@ -1422,6 +1430,14 @@ def render_linking(
     отправленный код проверить нечем. Адрес здесь нужен ещё и потому, что
     человек должен видеть, на **какой** ящик ушло письмо, — он мог ввести
     другой.
+
+    `telegram_link_code` — начатый челлендж привязки Telegram: код, по которому
+    кабинет находит у себя секрет. Заданный код переключает карточку Telegram на
+    шаг подтверждения: кнопку «Открыть Telegram» (ссылка `telegram_link_url` из
+    `deep_link`) и поле кода из бота. `None` — привязка не начата, карточка
+    показывает кнопку «Привязать Telegram». Тем же приёмом, что у почты: показать
+    стартовую кнопку на начатом челлендже значило бы начать второй и потерять
+    первый. `public_code` — **не секрет**: он и так у человека в ссылке.
 
     `unlink_previews` — по записи на способ (`mail`/`telegram`) с числом
     затронутых конфигов и остающимся ключом, как их отдаёт бот (§4а). Экран
@@ -1442,6 +1458,10 @@ def render_linking(
         telegram_id=_mask_telegram(account.chat_id) if account.chat_id is not None else None,
         mail=account.mail,
         mail_pending=mail_pending,
+        # Шаг подтверждения привязки Telegram активен, пока есть начатый челлендж.
+        telegram_link_pending=bool(telegram_link_code),
+        telegram_link_url=telegram_link_url,
+        telegram_link_code=telegram_link_code,
         can_link_telegram=account.can_link_telegram(),
         can_link_mail=account.can_link_mail(),
         # Отвязка возможна, только если останется другой способ входа.
@@ -1450,6 +1470,7 @@ def render_linking(
         unlink_mail_note=notes.get("mail"),
         unlink_telegram_note=notes.get("telegram"),
         link_telegram_action=link_telegram_action,
+        link_telegram_verify_action=link_telegram_verify_action,
         link_mail_action=link_mail_action,
         link_mail_confirm_action=link_mail_confirm_action,
         unlink_telegram_action=unlink_telegram_action,

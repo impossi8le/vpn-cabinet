@@ -174,11 +174,14 @@ def test_start_shows_the_bot_link_and_keeps_the_secret_out_of_the_page() -> None
     response = client.get("/login/telegram")
 
     assert response.status_code == 200
-    # Бот получил ровно код и хеш секрета — ни `chat_id`, ни аккаунта, ни самого
-    # секрета: начало входа ничего о человеке не заявляет (§3.3).
+    # Бот получил ровно код, хеш секрета и режим — ни `chat_id`, ни аккаунта, ни
+    # самого секрета: начало входа ничего о человеке не заявляет (§3.3). `mode`
+    # здесь `login`: тот же флоу обслуживает и привязку (`link`, #65), и вход
+    # обязан просить именно вход, иначе бот не завёл бы аккаунт.
     assert len(bot.link_calls) == 1
     sent = bot.link_calls[0]
-    assert set(sent) == {"public_code", "secret_hash"}
+    assert set(sent) == {"public_code", "secret_hash", "mode"}
+    assert sent["mode"] == "login"
     # Код берём у бота, а не со страницы: тест обязан упасть на утечке секрета, а
     # не на том, что поле подменилось. Иначе «секрет в разметке» упал бы
     # `KeyError`-ом по чужому ключу и спрятал бы настоящую причину.
