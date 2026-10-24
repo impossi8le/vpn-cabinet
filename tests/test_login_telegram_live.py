@@ -36,8 +36,14 @@ from fastapi.testclient import TestClient
 
 from cabinet import app as app_module
 from cabinet import render
+from cabinet.accounts import Account
 from cabinet.app import COOKIE_NAME, build_app
-from cabinet.bot_client import TelegramAuthClient, public_code_and_secret, secret_hash
+from cabinet.bot_client import (
+    BotUnreachable,
+    TelegramAuthClient,
+    public_code_and_secret,
+    secret_hash,
+)
 from cabinet.mail_sender import MailSender
 from tests.fakes import STATUS_ACTIVE, FakeApi, FakeMailSender
 
@@ -442,13 +448,22 @@ def test_confirmed_without_account_id_is_a_refusal_not_a_sign_in() -> None:
     assert COOKIE_NAME not in response.cookies
 
 
-def test_unreachable_bot_on_start_and_poll_is_honest_not_a_500() -> None:
-    """Недоступность бота — честный экран, а не 500 и не «вход отклонён».
+# --- недоступность бота: три разных ветки, каждая своим тестом ------------
+#
+# Сбой сети — не отказ человека: пятисотка показала бы сбой сервиса внутренним
+# устройством, а «вход отклонён» свалил бы на человека то, чего он не делал
+# (#49). Ветки три, и они не сводятся одна к другой: падение на **начале**
+# (ссылки нет вовсе), на **опросе живого челленджа** (ссылка есть, человек может
+# повторить) и **после подтверждения** (бот подтвердил, а аккаунт прочитать не
+# удалось — сессии быть не должно). Тест обязан держать именно ту ветку, о
+# которой говорит; поэтому у каждой свой.
 
-    Сбой сети и отказ человека — разные состояния, и текст у них разный: здесь
-    надо повторить позже, там — идти в Telegram. Пятисотка показала бы сбой
-    сервиса внутренним устройством, а «вход отклонён» свалил бы на человека то,
-    чего он не делал (#49).
+
+def test_unreachable_bot_on_start_is_honest_not_a_500() -> None:
+    """Бот не ответил на старте: честный экран и **без** кнопки «Открыть Telegram».
+
+    Ссылки нет вовсе — начать не удалось, — и рисовать кнопку в никуда значило бы
+    обещать переход, которого сервис не сделал.
     """
     api = FakeApi()
     _account_with_subscription(api)
@@ -457,19 +472,107 @@ def test_unreachable_bot_on_start_and_poll_is_honest_not_a_500() -> None:
 
     bot.fail_with = httpx.ConnectError("бот не отвечает")
     start = client.get("/login/telegram")
+
     assert start.status_code == 200
     assert app_module.LOGIN_TELEGRAM_BOT_UNREACHABLE in start.text
+    assert app_module.LOGIN_TELEGRAM_DENIED not in start.text
+    assert "https://example.invalid/bot?start=login_" not in start.text
     assert COOKIE_NAME not in start.cookies
 
-    # Начать челлендж не удалось — но форма опроса всё равно отвечает честно.
-    poll = client.post(
+
+def test_unreachable_bot_during_poll_keeps_the_challenge_and_gives_no_session() -> None:
+    """Сбой на опросе **живого** челленджа: экран про сервис, сессии нет.
+
+    Это ветка, ради которой стоит вся защита: челлендж уже начат и лежит в
+    памяти, человек подтвердил вход, а бот перестал отвечать. Сказать ему «вход
+    отклонён» или «вход не начат» значило бы соврать, а пятисотка — показать
+    сбой сервиса внутренним устройством. Челлендж при этом не теряется:
+    «Проверить вход» должна работать снова, как только бот вернётся.
+
+    Проверка опирается на **начатое состояние** (`telegram_login.get` не `None`):
+    без него POST упирается в «челленджа нет» и до сбоя транспорта не доходит —
+    то есть тест прошёл бы и без обработчика недоступности вовсе.
+    """
+    api = FakeApi()
+    _account_with_subscription(api)
+    bot = FakePublicBot(api)
+    client = _client(bot, api)
+
+    # Челлендж начинается по-настоящему: сначала бот отвечает, потом падает.
+    public_code = _public_code_from(client.get("/login/telegram").text)
+    assert client.app.state.telegram_login.get(public_code) is not None  # type: ignore[attr-defined]
+
+    bot.fail_with = httpx.ConnectError("бот не отвечает")
+    response = client.post(
         "/login/telegram/verify",
-        data={"public_code": "что-угодно", "code": "123456"},
+        data={"public_code": public_code, "code": "123456"},
         follow_redirects=False,
     )
-    assert poll.status_code == 200
-    assert poll.status_code != 500
-    assert COOKIE_NAME not in poll.cookies
+
+    assert response.status_code == 200
+    assert app_module.LOGIN_TELEGRAM_BOT_UNREACHABLE in response.text
+    # Не подменяем причину: это не отказ человека и не «вход не начат».
+    assert app_module.LOGIN_TELEGRAM_DENIED not in response.text
+    assert app_module.LOGIN_TELEGRAM_NOT_STARTED not in response.text
+    assert COOKIE_NAME not in response.cookies
+    # Челлендж не потерян — иначе повторить опрос было бы нечем.
+    assert client.app.state.telegram_login.get(public_code) is not None  # type: ignore[attr-defined]
+
+
+class _AccountReadsFail:
+    """Хранилище, у которого чтение аккаунта обрывается сбоем бота.
+
+    Нужен ровно для одной ветки: бот подтвердил вход и назвал `account_id`, а
+    следующий же его ответ (чтение аккаунта) потерялся. `FakeApi` так не умеет —
+    он читает из памяти, — и подделывать ради этого бот нельзя: подставной бот,
+    разрешающий больше живого, делает тесты бесполезными. Обёртка над `FakeApi`
+    воспроизводит только недоступность, ничего больше не меняя.
+    """
+
+    def __init__(self, api: FakeApi) -> None:
+        self._api = api
+        self.fail = False
+
+    def find_by_id(self, account_id: int) -> Account | None:
+        if self.fail:
+            raise BotUnreachable("аккаунт не прочитать: бот не отвечает")
+        return self._api.find_by_id(account_id)
+
+    def subscriptions_for(self, account_id: int) -> list[object]:
+        return self._api.subscriptions_for(account_id)
+
+
+def test_unreachable_bot_after_confirmation_gives_no_session_and_no_false_denial() -> None:
+    """Бот подтвердил вход, но аккаунт прочитать не удалось: сессии нет.
+
+    Подтверждение состоялось — код верен, человек в Telegram нажал «войти», — а
+    дальше бот пропал на чтении аккаунта. Сессии здесь быть не должно: обещать
+    вход, которого не вышло, значит отдать человеку билет в никуда. И сказать
+    «вход отклонён» тоже нельзя: отказ пришёл не от человека.
+    """
+    api = FakeApi()
+    account_id = _account_with_subscription(api)
+    store = _AccountReadsFail(api)
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "confirmed", "account_id": account_id}]
+    client = _client(bot, store)  # type: ignore[arg-type]
+
+    # Челлендж начат обычным путём, пока бот ещё отвечает.
+    public_code = _public_code_from(client.get("/login/telegram").text)
+    # Дальше отвечает бот — но уже не хранилище: оно обрывается на чтении аккаунта.
+    store.fail = True
+
+    response = client.post(
+        "/login/telegram/verify",
+        data={"public_code": public_code, "code": "123456"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert app_module.LOGIN_TELEGRAM_BOT_UNREACHABLE in response.text
+    # Ложного «вход отклонён» быть не должно: подтверждение состоялось.
+    assert app_module.LOGIN_TELEGRAM_DENIED not in response.text
+    assert COOKIE_NAME not in response.cookies
 
 
 def test_restart_returns_to_a_fresh_challenge() -> None:
@@ -500,7 +603,6 @@ def test_telegram_screen_offers_a_button_that_works_without_javascript() -> None
     api = FakeApi()
     _account_with_subscription(api)
     bot = FakePublicBot(api)
-    bot.poll_script = [{"status": "confirmed", "account_id": 1}]
     client = _client(bot, api)
 
     html = client.get("/login/telegram").text
