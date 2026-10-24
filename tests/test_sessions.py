@@ -317,13 +317,14 @@ def test_repeated_token_from_the_source_is_refused(fake_api: FakeApi, account_em
         service.sign_in(account_email_only.id)
 
 
-def test_resolution_marks_activity_without_extending_the_session(
-    fake_api: FakeApi, account_email_only: Account
-):
-    """Активность отмечается, но срок не продлевается.
+def test_resolution_extends_the_session(fake_api: FakeApi, account_email_only: Account):
+    """Успешная проверка продлевает срок на полный TTL от текущего момента.
 
-    Иначе сессия была бы вечной: достаточно заходить раз в месяц, чтобы
-    `expires_at` уезжал вперёд бесконечно, и срок перестал бы что-либо значить.
+    Кабинет открывают редко — раз в недели или месяцы. Срок, который не едет
+    вперёд, ронял бы вход у человека, который как раз вернулся: он заходил бы
+    ровно перед истечением и всё равно оказывался на экране входа. Продление —
+    не «вечная сессия»: забытый человек, не заглянувший дольше TTL, входа не
+    сохраняет, а угнанный токен перестаёт работать сам.
     """
     moment = [NOW]
     store = SingleSessionStore()
@@ -334,15 +335,90 @@ def test_resolution_marks_activity_without_extending_the_session(
         now=lambda: moment[0],
     )
     view = service.sign_in(account_email_only.id)
-    expires_at = view.expires_at
+    first_expires = view.expires_at
 
     moment[0] = NOW + timedelta(hours=6)
-    service.resolve(view.token)
+    resolved = service.resolve(view.token)
 
+    assert resolved is not None
+    assert resolved.expires_at == moment[0] + timedelta(days=1)
+    assert resolved.expires_at > first_expires
     session = store.find(hash_token(view.token))
     assert session is not None
     assert session.last_seen_at == moment[0]
-    assert session.expires_at == expires_at
+    assert session.expires_at == moment[0] + timedelta(days=1)
+
+
+def test_session_outlives_the_former_month_limit(fake_api: FakeApi, account_email_only: Account):
+    """Сессия редкого посетителя живёт дольше месяца.
+
+    Проверяется срок, а не статус: часы уезжают за то, что давал прежний срок
+    (тридцать дней), и сессия обязана остаться живой — иначе редкий заход
+    разваливался бы ровно на этом рубеже.
+    """
+    moment = [NOW]
+    service = SessionService(
+        store=SingleSessionStore(),
+        accounts=fake_api,
+        now=lambda: moment[0],
+    )
+    view = service.sign_in(account_email_only.id)
+
+    assert timedelta(days=180) <= DEFAULT_SESSION_TTL
+
+    moment[0] = NOW + timedelta(days=60)
+
+    assert service.resolve(view.token) is not None
+
+
+def test_resolution_does_not_extend_an_expired_session(
+    fake_api: FakeApi, account_email_only: Account
+):
+    """Истёкшую сессию продление не воскрешает.
+
+    Продление — свойство живой сессии. Истёкшая гасится, и продлевать нечего:
+    иначе одним запросом с мёртвым токеном срок возвращался бы вперёд, и
+    истечение перестало бы что-либо значить.
+    """
+    moment = [NOW]
+    store = SingleSessionStore()
+    service = SessionService(
+        store=store,
+        accounts=fake_api,
+        ttl=timedelta(hours=1),
+        now=lambda: moment[0],
+    )
+    view = service.sign_in(account_email_only.id)
+
+    moment[0] = NOW + timedelta(hours=2)
+    assert service.resolve(view.token) is None
+    assert store.sessions == {}
+
+
+def test_revoked_session_stays_refused_and_is_not_renewed(
+    fake_api: FakeApi, account_email_only: Account
+):
+    """Отозванную сессию продление не возвращает.
+
+    Отзыв — это выход: токен обязан быть мёртв. Запрос с ним не может ни
+    пройти, ни завести запись заново — иначе длинный срок превращался бы в
+    способ обойти выход, а отозванный токен жил бы дальше.
+    """
+    moment = [NOW]
+    store = SingleSessionStore()
+    service = SessionService(
+        store=store,
+        accounts=fake_api,
+        ttl=timedelta(days=1),
+        now=lambda: moment[0],
+    )
+    view = service.sign_in(account_email_only.id)
+
+    service.sign_out(view.token)
+    moment[0] = NOW + timedelta(minutes=1)
+
+    assert service.resolve(view.token) is None
+    assert store.sessions == {}
 
 
 # --- отказы --------------------------------------------------------------

@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from cabinet.app import COOKIE_NAME, build_app
 from cabinet.auth_mail import CODE_LENGTH
 from cabinet.mail_sender import MailSender
+from cabinet.sessions import DEFAULT_SESSION_TTL
 from tests.fakes import FakeApi, FakeMailSender
 
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
@@ -141,6 +142,27 @@ def test_entering_code_signs_in_with_cookie(
     assert cookie
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "samesite=lax" in response.headers["set-cookie"].lower()
+
+
+def test_session_cookie_outlives_the_browser(
+    client: TestClient, fake_mail_sender: FakeMailSender
+) -> None:
+    """Cookie сессии несёт срок — иначе закрытие браузера разлогинивало бы.
+
+    Без `Max-Age` cookie живёт до закрытия браузера, а кабинет открывают раз в
+    недели: серверная сессия оставалась бы живой, а человек каждый раз видел бы
+    форму входа. `Max-Age` обязан совпасть с серверным TTL — разойдись они, и
+    cookie жила бы дольше или меньше самой сессии.
+    """
+    client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    code = _code_from(fake_mail_sender)
+
+    response = client.post(
+        "/login/waiting", data={"mail": MAIL, "code": code}, follow_redirects=False
+    )
+
+    header = response.headers["set-cookie"].lower()
+    assert f"max-age={int(DEFAULT_SESSION_TTL.total_seconds())}" in header
 
 
 def test_wrong_code_keeps_you_on_the_waiting_screen(

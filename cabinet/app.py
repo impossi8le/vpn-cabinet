@@ -20,6 +20,14 @@
   на экране входа с уже действующей сессией. Lax пропускает навигацию верхнего
   уровня и при этом не отдаёт cookie сторонним POST — то есть закрывает CSRF
   на изменяющих запросах.
+- **`Max-Age`** — cookie переживает закрытие браузера. Это не удобство, а
+  главный случай проекта: кабинет открывают раз в недели или месяцы, и
+  сессионная cookie умирала бы вместе с браузером раньше, чем серверная сессия
+  успевала пригодиться. Срок берётся из `SessionService.ttl` — один на cookie и
+  на запись в хранилище. Долгая cookie — долгий доступ, поэтому она не отменяет
+  ничего из своего же устройства: срок **скользит** (`SessionService.resolve`
+  продлевает живую сессию), истекает у забытой, а `HttpOnly` и `SameSite` держат
+  токен вне JS и вне сторонних POST.
 
 Границ сервиса это не пересекает: кабинет по-прежнему не ходит в базу
 (CLAUDE.md), а говорит с хранилищем через те же протоколы, что и модули.
@@ -29,7 +37,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from urllib.parse import quote
 
@@ -568,7 +576,7 @@ def _add_login_routes(
             return _redirect_login_error(LOGIN_BOT_UNREACHABLE, mail=mail)
 
         response = RedirectResponse("/subscriptions", status_code=303)
-        _set_session_cookie(response, result.session.token)
+        _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
         return response
 
     @app.post("/login/verify")
@@ -724,7 +732,7 @@ def _add_login_routes(
             return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
 
         response = RedirectResponse("/subscriptions", status_code=303)
-        _set_session_cookie(response, result.session.token)
+        _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
         return response
 
 
@@ -762,11 +770,18 @@ def _telegram_retry(challenge: Challenge, public_code: str, message: str) -> HTM
     )
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -> None:
     """Положить токен сессии в cookie так, чтобы JS до него не дотянулся.
 
     `httponly` — токен не читается из разметки; `samesite="lax"` — переход по
-    ссылке из письма сохраняет сессию, а сторонний POST её не получает;
+    ссылке из письма сохраняет сессию, а сторонний POST её не получает.
+
+    `max_age` — срок, который переживает закрытие браузера. Без него cookie была
+    бы сессионной и умирала бы вместе с браузером, а серверная сессия оставалась
+    бы живой: кабинет открывают раз в недели, и человек каждый раз возвращался бы
+    к форме входа. Срок приходит из `SessionService.ttl` — cookie и серверная
+    запись считают его одним местом, а не двумя.
+
     `secure` здесь **не** ставится: кабинет на этой волне запускается по
     `http://127.0.0.1`, и `Secure`-cookie браузер по http не отправил бы вовсе.
     Боевой кабинет стоит за nginx с TLS, и там флаг выставляется — но это
@@ -775,6 +790,7 @@ def _set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         COOKIE_NAME,
         token,
+        max_age=int(max_age.total_seconds()),
         httponly=True,
         samesite="lax",
         path="/",
