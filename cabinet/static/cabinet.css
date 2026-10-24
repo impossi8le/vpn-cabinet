@@ -28,7 +28,10 @@ body {
   padding: 2px 0 18px;
 }
 .nav .t { font-size: 16.5px; font-weight: 590; letter-spacing: -0.015em; }
-.nav .back { color: var(--ice); font-size: 14.5px; text-decoration: none; }
+/* `.back` — возврат, `.link` — переход вперёд: вид у них один, и это один
+   смысл «ссылка в шапке», поэтому правило общее. Разные имена — чтобы в
+   разметке было видно, куда ссылка ведёт. */
+.nav .back, .nav .link { color: var(--ice); font-size: 14.5px; text-decoration: none; }
 .nav .side { width: 48px; }
 
 .mid {

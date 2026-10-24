@@ -286,3 +286,29 @@ def test_subscriptions_screen_links_to_buy() -> None:
     html = _signed_in().get("/subscriptions").text
 
     assert 'href="/buy"' in html
+
+
+def test_subscriptions_screen_links_to_the_account_screen() -> None:
+    """С главного экрана есть вход в способы входа.
+
+    Экран аккаунта со всей привязкой и отвязкой почты и Telegram существовал, а
+    ссылки на него не было нигде, кроме углового состояния оплаты: попасть туда
+    можно было только зная адрес. Нашёл сквозной прогон
+    (`test_e2e_journey.py`) — на этом тесты экранов бессильны, каждый из них
+    зелёный в отдельности.
+    """
+    html = _signed_in().get("/subscriptions").text
+
+    assert 'href="/account"' in html
+
+
+def test_buy_screen_leads_to_the_confirmation_step() -> None:
+    """С шага «тариф и устройства» есть переход на подтверждение — с той же парой.
+
+    Без него шаги 3–5 существуют, а путь обрывается: человек выбирает тариф и
+    дальше попадает только по прямому адресу. Адрес перехода несёт выбранную
+    пару, иначе подтверждение показало бы не то, что человек выбрал.
+    """
+    html = _signed_in().get("/buy?days=180&devices=2").text
+
+    assert 'href="/buy/confirm?days=180&amp;devices=2"' in html

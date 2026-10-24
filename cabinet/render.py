@@ -697,6 +697,10 @@ def render_buy(
         periods=_buy_periods(days, devices, calculator),
         device_options=_buy_devices(days, devices, calculator),
         total=_rubles(calculator(days, devices).final_price),
+        # Переход на шаг подтверждения — с той же парой. Без него шаги 3–5
+        # существовали, а путь обрывался: человек выбирал тариф и дальше мог
+        # попасть только зная адрес. Нашёл сквозной прогон.
+        confirm_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}",
     )
 
 
