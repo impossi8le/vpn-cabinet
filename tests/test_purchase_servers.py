@@ -249,3 +249,36 @@ def test_servers_screen_has_no_green() -> None:
     html = _signed_in().get("/buy/servers").text
 
     assert COLORS.green.upper() not in _markup_without_palette(html).upper()
+
+
+# --- чужой выбор в адресе -------------------------------------------------
+
+
+def test_unknown_server_code_in_the_url_is_not_counted_as_chosen() -> None:
+    """Чужой код сервера в адресе не считается выбором: состояние не выдумывается.
+
+    Выбор живёт **только** в адресе, поэтому адрес же — единственное, что можно
+    подделать. `?devices=2&pick=<чужой>&pick=<чужой>` давал «Готово: выбрано
+    ровно столько» при пустом экране: число повторов считалось выбором, а коды
+    со списком, который кабинет сам получил, не сверялись.
+
+    Адрес берётся из разметки — ссылка «Добавить», — а меняется в нём только код
+    сервера. Так проверяется сверка со списком, а не формат ссылки: собери тест
+    адрес руками, он зеленел бы и на выдуманном формате.
+    """
+    client = _signed_in()
+    real_add = _hrefs(client.get("/buy/servers?days=30&devices=2").text, "Добавить")[0]
+    params = real_add.split("pick=")[0]
+
+    # Оба вхождения — чужой код: вдвоём они всё ещё не выбор.
+    forged = client.get(f"{params}pick=нет-такого&pick=нет-такого").text
+
+    assert "Готово" not in forged
+    assert "Выбрано 0 из 2" in forged
+
+    # Один настоящий и один чужой — ровно один выбор, а не два.
+    real_code = real_add.split("pick=")[1]
+    mixed = client.get(f"{params}pick={real_code}&pick=нет-такого").text
+
+    assert "Готово" not in mixed
+    assert "Выбрано 1 из 2" in mixed

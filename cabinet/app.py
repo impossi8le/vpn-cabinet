@@ -1106,12 +1106,18 @@ def _add_subscription_routes(
         if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
             return RedirectResponse("/login", status_code=303)
         chosen = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
-        picks = list(pick or [])[:chosen]
         try:
             servers = store.list_servers()
             error: str | None = None
         except (BotError, BotUnreachable):
             servers, error = [], BUY_SERVERS_ERROR
+        # Выбор сверяется со списком, который кабинет получил: код, которого в
+        # списке нет, пришёл из чужой или устаревшей ссылки, и считать его
+        # выбранным значило бы показать состояние, которого нет, — «Готово:
+        # выбрано ровно столько» при пустом экране. Обрезка по числу устройств
+        # остаётся: сверх нужного выбирать нечего.
+        known = {server.code for server in servers}
+        picks = [code for code in (pick or []) if code in known][:chosen]
         return HTMLResponse(
             render_buy_servers(
                 days=days if days in PRICES else DEFAULT_BUY_DAYS,
