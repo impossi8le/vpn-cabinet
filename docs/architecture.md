@@ -173,8 +173,16 @@ loopback. Коды ошибок — в теле (`error.code`) и в HTTP-ста
 
 | Адрес | Принимает | Отдаёт |
 |---|---|---|
-| `POST /api/v1/auth/link` | `public_code`, `secret_hash` | `deep_link` для бота; секрет хранится ботом хешем |
-| `POST /api/v1/auth/poll` | `public_code`, `secret`, `device_nonce` | `pending` / `denied` / `session_token` + `account_id` |
+| `POST /api/v1/auth/link` | `public_code`, `secret_hash`, `mode?` | `deep_link` для бота; секрет хранится ботом хешем |
+| `POST /api/v1/auth/poll` | `public_code`, `secret`, `device_nonce` | `pending` / `denied` / `session_token` + `account_id`, а в режиме привязки — только `chat_id` |
+
+**Два режима одного флоу** (issue #65). `mode=login` (по умолчанию) — вход: бот
+находит или заводит аккаунт для подтверждённого `chat_id` и отдаёт сессию.
+`mode=link` — **привязка Telegram к аккаунту кабинета**: аккаунт не создаётся
+вовсе (иначе свежий Telegram занял бы новым аккаунтом то самое место, которое
+кабинет собирается заполнить), сессия не выдаётся, а в ответе приходит только
+подтверждённый `chat_id` — его кабинет и привязывает, в пустое место. Подробности
+— в [контракте §5.1](2026-10-17-backend-contract.md).
 
 **Направление доверия.** `chat_id` появляется у кабинета **только** из ответа
 бота, который проверил человека в Telegram. Кабинет не принимает `chat_id` ни из
