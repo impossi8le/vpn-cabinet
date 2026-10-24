@@ -38,7 +38,7 @@ from cabinet.app import (
     UNLINK_LAST_METHOD_ERROR,
     build_app,
 )
-from cabinet.bot_client import SECRET_HEADER, BotClient, BotStore
+from cabinet.bot_client import EVENTS_PATH, SECRET_HEADER, BotClient, BotStore
 from cabinet.linking import LinkRefused, UnlinkRefused
 from cabinet.mail_sender import MailSender
 from tests.fakes import CollisionError, FakeApi, FakeMailSender
@@ -318,9 +318,12 @@ def test_signin_with_unknown_mail_creates_account_against_the_live_store() -> No
     assert created.mail == MAIL
     assert created.mail_verified_at is not None
     # Поиск, создание и чтение аккаунта на выдаче сессии — те самые маршруты §1.
-    assert paths[0] == "/internal/accounts/by-mail"
-    assert "/internal/accounts" in paths
-    assert f"/internal/accounts/{created.id}" in paths
+    # Записи шагов воронки (issue #64) сюда не входят: они идут своим путём и
+    # проверяются своим тестом, а здесь речь о контракте входа.
+    contract_paths = [p for p in paths if p != EVENTS_PATH]
+    assert contract_paths[0] == "/internal/accounts/by-mail"
+    assert "/internal/accounts" in contract_paths
+    assert f"/internal/accounts/{created.id}" in contract_paths
 
 
 def test_signin_with_known_mail_reuses_the_account_and_creates_no_second() -> None:
@@ -346,8 +349,10 @@ def test_signin_with_known_mail_reuses_the_account_and_creates_no_second() -> No
     assert len(api.accounts) == 1
     assert api.accounts[0].id == existing.id
     # Создания не было вовсе: в журнале есть поиск, но нет `POST /internal/accounts`.
-    assert paths[0] == "/internal/accounts/by-mail"
-    assert "/internal/accounts" not in paths
+    # Путь записи воронки (issue #64) отброшен — он о другом и проверяется отдельно.
+    contract_paths = [p for p in paths if p != EVENTS_PATH]
+    assert contract_paths[0] == "/internal/accounts/by-mail"
+    assert "/internal/accounts" not in contract_paths
 
 
 # --- 2. привязка: занятое место — отказ, который ждут роуты ---------------

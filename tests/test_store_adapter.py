@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 
 from cabinet.accounts import Account
 from cabinet.app import COOKIE_NAME, build_app
-from cabinet.bot_client import SECRET_HEADER, BotClient, BotStore
+from cabinet.bot_client import EVENTS_PATH, SECRET_HEADER, BotClient, BotStore
 from cabinet.mail_sender import MailSender
 from tests.fakes import STATUS_ACTIVE, FakeApi, FakeMailSender
 
@@ -313,4 +313,6 @@ def test_buy_confirm_shows_trial_right_through_the_live_client() -> None:
     assert "Пробный период выдаётся по Telegram" in response.text
     assert "telegram_required" not in response.text
     base = f"/internal/accounts/{account.id}"
-    assert paths == [base, f"{base}/trial-eligibility"]
+    # Между чтением аккаунта и проверкой права лежит запись шага воронки
+    # (`confirm_shown`, issue #64) — тот же живой клиент, свой путь контракта.
+    assert paths == [base, EVENTS_PATH, f"{base}/trial-eligibility"]
