@@ -525,7 +525,6 @@ def _add_login_routes(
     def login_form(
         request: Request,
         mail: str | None = Query(default=None),
-        error: str | None = None,
     ) -> Response:
         """Форма входа: почта или Telegram.
 
@@ -537,14 +536,19 @@ def _add_login_routes(
         гасится** (`_take_login_notice`): адрес остаётся `/login`, а
         перезагрузка отказ не повторяет (issue #55). Cookie читается до рендера
         и удаляется в ответе — тем же движением.
+
+        Параметра `error` здесь нет намеренно (issue #58). Читатель без писателя
+        — не безобидный мусор: `GET /login?error=<текст>` показывал этот текст
+        на нашей странице, и ссылку с чужим текстом можно было выдать за нашу.
+        Текст отказа существует ровно одним путём — одноразовой cookie, которую
+        ставит сам кабинет.
         """
         notice = _take_login_notice(request)
         mail = mail or _notice_str(notice.get("mail")) or None
-        error = error or _notice_str(notice.get("error")) or None
         response = HTMLResponse(
             render_login(
                 mail=mail,
-                error=error,
+                error=_notice_str(notice.get("error")) or None,
                 retry_after=_notice_int(notice.get("retry_after")),
             )
         )
@@ -584,21 +588,22 @@ def _add_login_routes(
     def login_waiting(
         request: Request,
         mail: str = Query(default=""),
-        error: str | None = None,
     ) -> Response:
         """Экран ввода кода из письма.
 
         Отказ кода приходит тем же одноразовым способом, что на входе: cookie
         читается и гасится здесь, поэтому перезагрузка не повторяет «код не
         подошёл» (issue #55).
+
+        Параметра `error` нет по той же причине, что у формы входа (issue #58):
+        текст отказа — состояние перехода, а не адрес.
         """
         notice = _take_login_notice(request)
         mail = mail or _notice_str(notice.get("mail"))
-        error = error or _notice_str(notice.get("error")) or None
         response = HTMLResponse(
             render_login_waiting(
                 mail=mail,
-                error=error,
+                error=_notice_str(notice.get("error")) or None,
                 retry_after=_notice_int(notice.get("retry_after")),
             )
         )

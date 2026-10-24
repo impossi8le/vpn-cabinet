@@ -33,7 +33,10 @@
     <input class="field" id="code" name="code" type="text" inputmode="numeric"
            autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"
            autofocus required>
-    <p class="error" role="alert">{{ error or '' }}</p>
+    {# Отказ показывается один раз. Отказ по лимиту живёт ниже — у формы
+       повторной отправки, живым отсчётом; замороженная копия здесь читалась бы
+       как второй отказ, расходящийся с первым числом (issue #58). #}
+    <p class="error" role="alert">{{ '' if retry_after else (error or '') }}</p>
     <button class="btn btn-p" type="submit" {{ 'disabled' if busy else '' }}>
       {{ 'Проверяем…' if busy else 'Подтвердить' }}
     </button>

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -219,7 +220,11 @@ class AuthMail:
             if since_last < RESEND_INTERVAL_SECONDS:
                 raise RateLimited(
                     "слишком частая отправка на адрес",
-                    retry_after_seconds=int(RESEND_INTERVAL_SECONDS - since_last),
+                    # `ceil`, а не `int` (issue #58): остаток меньше секунды
+                    # `int` превратил бы в ноль, и экран сказал бы «Повторите
+                    # через 0 с», хотя лимит ещё действует. Округление вверх
+                    # честнее — обещает не меньше, чем придётся ждать.
+                    retry_after_seconds=math.ceil(RESEND_INTERVAL_SECONDS - since_last),
                 )
 
     # --- проверка --------------------------------------------------------

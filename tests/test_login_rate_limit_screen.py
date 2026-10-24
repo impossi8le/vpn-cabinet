@@ -18,6 +18,12 @@
 Часы — зависимость (`build_app(now=…)`), поэтому ни один тест не спит: время
 идёт сдвигом `Clock`, как в `test_auth_mail`. Почта — `FakeMailSender`: письма
 не уходят наружу, код читается из `outbox`.
+
+Раздел 6 добавлен позже, по ревью (issue #58): у #55 остались три места, и
+одно из них — того же класса, что сама #55. Читатель `error=` в адресе уцелел
+без писателя (ссылка с чужим текстом показывала этот текст на нашей странице),
+экран кода показывал отказ по лимиту дважды, а остаток меньше секунды давал
+«Повторите через 0 с», хотя лимит ещё действовал.
 """
 
 from __future__ import annotations
@@ -50,7 +56,7 @@ class Clock:
     def __call__(self) -> datetime:
         return self._moment
 
-    def advance(self, seconds: int = 0) -> None:
+    def advance(self, seconds: float = 0) -> None:
         self._moment += timedelta(seconds=seconds)
 
 
@@ -284,3 +290,70 @@ def test_send_works_again_once_the_wait_elapses(
     assert again.status_code == 303
     assert again.headers["location"].startswith("/login/waiting")
     assert len(sender.sent_to(MAIL)) == 2
+
+
+# --- 6. остатки #55 (issue #58) -------------------------------------------
+
+
+def test_refusal_text_from_the_url_is_not_shown(client: TestClient) -> None:
+    """Текст отказа из адреса не показывается: у читателя нет писателя.
+
+    До #55 отказ ездил ссылкой, и параметр `error` был писателем. После #55
+    писателя убрали, а читателя оставили — и `GET /login?error=<чужой текст>`
+    показывал этот текст на нашей странице. Автоэкранирование от XSS спасало,
+    но не от подделки: ссылку с чужим текстом можно выдать за нашу.
+
+    Проверка именно на **чтение**: параметр в адресе не должен ничего менять.
+    Текст взят заведомо чужой — такой, какого кабинет сам не пишет никогда.
+    """
+    forged = "Свяжитесь с поддержкой по телефону +7 000 000 00 00"
+
+    assert forged not in client.get("/login", params={"error": forged}).text
+    assert forged not in client.get("/login/waiting", params={"error": forged}).text
+
+
+def test_rate_limit_text_appears_once_on_the_code_screen(
+    client: TestClient, sender: FakeMailSender
+) -> None:
+    """Отказ по лимиту на экране кода читается **один** раз, а не дважды.
+
+    `_waiting_refusal` кладёт и готовую фразу, и число секунд. Экран показывал
+    фразу замороженной (в отказе кода) **и** ту же фразу живым отсчётом — рядом,
+    и они расходились числом. Фраза должна остаться в одном месте: там, где
+    рядом отсчёт, то есть у формы повторной отправки.
+    """
+    client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    refused = client.post("/login/resend", data={"mail": MAIL}, follow_redirects=False)
+
+    screen = _refusal_screen(client, refused)
+    assert screen.count(RATE_LIMITED_PREFIX) == 1
+    assert screen.count("Повторите через") == 1
+    # Отсчёт ровно один. Считается открывающая метка самого числа, а не имя
+    # атрибута: строка `data-resend-countdown` встречается ещё и в скрипте,
+    # который по нему ищет метку, и по ней две штуки получились бы и на верной
+    # странице. Два отсчёта — это два расходящихся числа, и их быть не должно.
+    assert screen.count('<b class="mono" data-resend-countdown') == 1
+
+
+def test_wait_is_never_zero_seconds(
+    client: TestClient, sender: FakeMailSender, clock: Clock
+) -> None:
+    """Остаток меньше секунды показывается как «1 с», а не как «0 с».
+
+    `int()` от остатка 0.5 давал ноль, а ноль — это уже «ждать не надо»,
+    которого на экране не должно быть, пока отправка отвергается: человек либо
+    читает «Повторите через 0 с» и не понимает, почему снова отказ, либо (с
+    `_notice_int`, который ноль считает отсутствием отсчёта) теряет отсчёт
+    вовсе. Округление вверх оставляет ожидание и видимым, и конечным.
+    """
+    client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    # Тот край окна, где `int` отдавал ноль: до конца интервала — полсекунды.
+    clock.advance(RESEND_INTERVAL_SECONDS - 0.5)
+
+    refused = client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    screen = client.get(refused.headers["location"]).text
+
+    assert 'data-resend-wait="1"' in screen
+    assert "Повторите через 0" not in screen
+    # Письма не прибавилось: отказ остался отказом, а не превратился в отправку.
+    assert len(sender.sent_to(MAIL)) == 1
