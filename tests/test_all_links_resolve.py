@@ -89,7 +89,9 @@ def _crawl(client: TestClient, *starts: str) -> dict[str, int]:
         location = response.headers.get("location", "")
         if response.status_code in (301, 302, 303, 307) and location.startswith("/"):
             queue.append(location)
-        if response.status_code != 200 or "text/html" not in response.headers.get("content-type", ""):
+        if response.status_code != 200 or "text/html" not in response.headers.get(
+            "content-type", ""
+        ):
             continue
         for href, _label in links(response.text):
             if _internal(href):
