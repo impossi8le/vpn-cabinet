@@ -37,6 +37,7 @@ from tests.fakes import FakeApi, FakeMailSender
 
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
 CHAT_ID = 123_456_789
+MAIL = "buyer@example.com"
 
 
 def _client(api: FakeApi, account_id: int) -> TestClient:
@@ -195,6 +196,29 @@ def test_done_screen_does_not_promise_an_email() -> None:
     html = _client(api, account_id).get(f"/buy/done?order_id={order_id}").text
 
     assert "письм" not in html.lower()
+
+
+def test_free_order_is_not_called_paid() -> None:
+    """Заказ с нулевой суммой — пробный период, и «оплата прошла» здесь неправда.
+
+    Ничего не платили: доступ выдан по праву на триал. Экран, который говорит
+    «Оплачено» и «Сумма 0 ₽», противоречит сам себе, и человек ищет списание,
+    которого не было. Нашёл живой прогон бесплатного пути.
+    """
+    api = FakeApi()
+    account = api.create_account(mail=MAIL, mail_verified_at=NOW, chat_id=CHAT_ID)
+    order = api.create_order(
+        account_id=account.id, days=30, devices=1, servers=["nl-1"], amount_rub=0
+    )
+    api.mark_order_paid(order.order_id, amount_rub=0)
+    client = _client(api, account.id)
+
+    html = client.get(f"/buy/done?order_id={order.order_id}").text
+
+    assert "Доступ выдан" in html
+    assert "Бесплатно" in html
+    assert "Оплата прошла" not in html
+    assert "0\xa0₽" not in html
 
 
 def test_paid_screen_leads_to_the_configs_and_mentions_the_letter() -> None:

@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -44,7 +45,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 
 from cabinet.app import COOKIE_NAME, DEFAULT_SENDER, build_app  # noqa: E402
-from cabinet.mail_sender import MailSender  # noqa: E402
+from cabinet.mail_sender import Attachment, MailSender  # noqa: E402
 from cabinet.payments import Payment  # noqa: E402
 from tests.fakes import FakeApi  # noqa: E402
 
@@ -94,8 +95,31 @@ class PrintingMail:
     Здесь письмо уходит в stdout, а читает его тот, кто смотрит на экран.
     """
 
-    def send(self, *, to: str, subject: str, body: str) -> None:
-        print(f"\n=== ПИСЬМО для {to} ===\n{body}=== конец письма ===\n", flush=True)
+    def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment] = (),
+    ) -> None:
+        """Напечатать письмо в лог — вместе с тем, что приложено.
+
+        `attachments` здесь не для красоты: транспорт, не принимающий вложения,
+        роняет всю страницу, когда письмо с конфигом уходит после оплаты. Именно
+        так и случилось — заглушка стенда отстала от интерфейса, и **бесплатный
+        путь падал с 500** на письме. Живой прогон в браузере это нашёл, тесты —
+        нет: тесты пользуются своим подставным транспортом, который обновили.
+
+        Печатаем имена вложений, а не содержимое: конфиг в логе стенда не нужен,
+        а видеть, что файл приложен, — нужно.
+        """
+        names = ", ".join(name for name, _content, _mime in attachments) or "нет"
+        print(
+            f"\n=== ПИСЬМО для {to} ===\nТема: {subject}\nВложения: {names}\n{body}"
+            "=== конец письма ===\n",
+            flush=True,
+        )
 
 
 def seeded_api() -> FakeApi:

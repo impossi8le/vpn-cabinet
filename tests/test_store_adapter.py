@@ -310,7 +310,11 @@ def test_buy_confirm_shows_trial_right_through_the_live_client() -> None:
     response = _client_over(api, account_id=account.id, paths=paths).get("/buy/confirm")
 
     assert response.status_code == 200
-    assert "Пробный период выдаётся по Telegram" in response.text
+    # Формулировка начинается со «Выдаётся», а не с «Пробный период»: на экране
+    # перед ней стоит метка «Пробный период.», и повтор читался бы как сбой
+    # страницы (нашёл живой прогон в браузере).
+    assert "Выдаётся по Telegram" in response.text
+    assert "Пробный период. Пробный период" not in response.text
     assert "telegram_required" not in response.text
     base = f"/internal/accounts/{account.id}"
     # Между чтением аккаунта и проверкой права лежит запись шага воронки

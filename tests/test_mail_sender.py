@@ -414,3 +414,39 @@ def test_send_code_still_delivers_without_attachments():
     assert len(sent) == 1
     assert "654321" in sent[0]["body"]
     assert sent[0]["attachments"] == []
+
+
+def test_config_letter_for_a_paid_order_says_payment_passed():
+    """После оплаты письмо так и говорит: оплата прошла, конфиги во вложении."""
+    mail = FakeMailSender()
+    sender = MailSender(sender="cabinet@example.com", transport=mail)
+
+    sender.send_configs(
+        "user@example.com", attachments=[("nl.ovpn", b"client\n", "application/x-openvpn-profile")]
+    )
+
+    sent = mail.sent_to("user@example.com")[0]
+    assert "Оплата прошла" in sent["body"]
+    assert sent["attachments"]
+
+
+def test_config_letter_for_a_free_order_does_not_claim_payment():
+    """За пробный период письмо **не** говорит «оплата прошла»: не платили.
+
+    Ничего не списывали, доступ выдан по праву на триал. Слово «оплата» здесь —
+    та же неправда, что «Оплачено» на экране с суммой «0 ₽»: человек идёт искать
+    списание, которого не было. Нашёл живой прогон бесплатного пути.
+    """
+    mail = FakeMailSender()
+    sender = MailSender(sender="cabinet@example.com", transport=mail)
+
+    sender.send_configs(
+        "user@example.com",
+        attachments=[("nl.ovpn", b"client\n", "application/x-openvpn-profile")],
+        paid=False,
+    )
+
+    sent = mail.sent_to("user@example.com")[0]
+    assert "Оплата прошла" not in sent["body"]
+    assert "Доступ готов" in sent["body"]
+    assert sent["attachments"], "вложение должно ехать и на бесплатном пути"

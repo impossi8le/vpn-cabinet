@@ -540,7 +540,9 @@ def _fulfil_paid_order(
         return
 
     try:
-        mail_sender.send_configs(recipient, attachments=attachments)
+        # Нулевая сумма — пробный период: в письме не должно быть слова «оплата»,
+        # потому что денег не было. Одно слово, а человек по нему ищет списание.
+        mail_sender.send_configs(recipient, attachments=attachments, paid=order.amount_rub > 0)
     except MailError as exc:
         logger.warning("заказ %s: письмо не ушло: %r", order_id, exc)
 
