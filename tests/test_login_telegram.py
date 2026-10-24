@@ -10,7 +10,9 @@
 требование клиента то же (`it.filter(Char::isDigit).take(6)`). Разница в
 источнике кода и в текстах, и тест берёт их **дословно из клиента**
 (`implemented-ui-spec.md`, раздел LoginWaiting): «Откройте Telegram — бот пришлёт
-код подтверждения», «Открыть Telegram ещё раз». Сочинённый текст разошёлся бы с
+код подтверждения». Подпись кнопки входа — «Открыть Telegram»: тем же текстом её
+называет план входа (`docs/plans/2026-10-24-telegram-login.md`), и это дорога **в**
+бота на первом заходе, а не только повтор. Сочинённый текст разошёлся бы с
 приложением, и человек, перешедший из app на сайт, увидел бы другой продукт.
 
 **Честность состояний** — правило проекта, а не украшение. Ссылка на бота ещё не
@@ -90,30 +92,46 @@ def test_body_text_names_the_bot_as_the_code_source(telegram_html: str) -> None:
 
 
 def test_reopen_button_opens_the_bot_again(telegram_html: str) -> None:
-    """Есть кнопка «Открыть Telegram ещё раз», ведущая в бот входа.
+    """Есть кнопка «Открыть Telegram», ведущая в бот входа.
 
     Это требование клиента (`LOGIN_WAITING_REOPEN_TAG`): ссылка открывает бота
     **входа** по `deep_link` из `/auth/link`, а не бота поддержки — в
     поддержке нет кнопки «Подтвердить вход», и вход там завершить нельзя.
+    Подпись — «Открыть Telegram», а не «…ещё раз»: это дорога **в** бота на
+    первом заходе, а не только повтор уже пройденного.
     """
-    assert "Открыть Telegram ещё раз" in telegram_html
+    # Подпись дословно и целиком: «Открыть Telegram» — префикс старой «Открыть
+    # Telegram ещё раз», и проверка вхождения пропустила бы возврат к ней.
+    assert ">Открыть Telegram</a>" in telegram_html
     assert BOT_LINK in telegram_html
 
 
 def test_reopen_link_is_a_link_not_a_form(telegram_html: str) -> None:
-    """«Открыть Telegram ещё раз» — ссылка: адрес открывается переходом, не POST.
+    """«Открыть Telegram» — ссылка: адрес открывается переходом, не POST.
 
     Передавать в переход нечего, а форма отправила бы запрос туда, где ждут
     страницу.
     """
-    assert f'<a class="btn btn-g" href="{BOT_LINK}">' in telegram_html
+    assert f'<a class="btn btn-g" href="{BOT_LINK}" target="_blank"' in telegram_html
+
+
+def test_reopen_link_opens_in_a_new_tab_and_isolates_the_bot_page(telegram_html: str) -> None:
+    """Ссылка в бота — новой вкладкой и без доступа назад в кабинет.
+
+    Челлендж начат в кабинете и завершается в нём же: переход в этой вкладке
+    унёс бы экран с полем кода, а возврат историей начал бы **другой** челлендж,
+    и код на руках перестал бы подходить. `rel` обязан нести `noopener`: иначе
+    страница бота через `window.opener` подменит адрес вкладки кабинета.
+    """
+    assert 'target="_blank"' in telegram_html
+    assert 'rel="noopener noreferrer"' in telegram_html
 
 
 # --- честность неготовой ссылки ------------------------------------------
 
 
 def test_missing_link_is_stated_honestly_not_shown_as_empty_button() -> None:
-    """Ссылки нет — сказано прямо, и кнопки «Открыть Telegram ещё раз» нет.
+    """Ссылки нет — сказано прямо, и кнопки «Открыть Telegram» нет.
 
     Пустая кнопка обещала бы переход, которого сервис не сделал. Клиент в этом
     состоянии честен («Ссылка на вход ещё не готова»), и сайт обязан быть
@@ -121,7 +139,7 @@ def test_missing_link_is_stated_honestly_not_shown_as_empty_button() -> None:
     """
     html = render_login_telegram(telegram_url=None)
     assert render.TELEGRAM_LINK_NOT_READY in html
-    assert "Открыть Telegram ещё раз" not in html
+    assert ">Открыть Telegram</a>" not in html
 
 
 def test_ready_link_drops_the_not_ready_note(telegram_html: str) -> None:

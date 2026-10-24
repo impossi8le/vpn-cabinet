@@ -190,6 +190,49 @@ def test_start_shows_the_bot_link_and_keeps_the_secret_out_of_the_page() -> None
     assert _challenge_secret(client, public_code) not in response.text
 
 
+def _bot_anchor(html: str, link: str) -> str:
+    """Тег `<a>`, ведущий в бота, — только он, без соседних кнопок.
+
+    Атрибуты проверяются на самом теге, а не на всей странице: `target="_blank"`
+    на любой другой ссылке экрана ничего не говорил бы о ссылке в бота, и тест
+    прошёл бы, оставшись слепым к тому, ради чего написан.
+    """
+    match = re.search(rf'<a\b[^>]*href="{re.escape(link)}"[^>]*>', html)
+    assert match is not None, "на экране нет ссылки в бота"
+    return match.group(0)
+
+
+def test_bot_link_opens_in_a_new_tab_and_keeps_the_cabinet_tab_alive() -> None:
+    """Ссылка в бота открывается новой вкладкой и не получает доступ назад.
+
+    Челлендж начат **здесь**, а завершается после возвращения из Telegram: код
+    вводят на этой странице. Переход в той же вкладке унёс бы экран челленджа, и
+    единственной дорогой назад осталась бы история браузера — а она запрашивает
+    страницу заново и начинает **другой** челлендж, так что код на руках перестал
+    бы подходить. Новая вкладка оставляет челлендж целым.
+
+    `rel="noopener"` — не украшение: без него открытая страница может через
+    `window.opener` подменить адрес вкладки кабинета. `noreferrer` заодно не
+    отдаёт боту адрес кабинета заголовком `Referer`.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    client = _client(bot, api)
+
+    response = client.get("/login/telegram")
+
+    assert response.status_code == 200
+    public_code = _public_code_from(response.text)
+    deep_link = f"https://example.invalid/bot?start=login_{public_code}"
+    anchor = _bot_anchor(response.text, deep_link)
+
+    assert 'target="_blank"' in anchor
+    rel = re.search(r'rel="([^"]*)"', anchor)
+    assert rel is not None and "noopener" in rel.group(1)
+    # Текст входа, а не только повтор: это дорога **в** бота на первом заходе.
+    assert ">Открыть Telegram</a>" in response.text
+
+
 def test_public_code_and_secret_are_random_and_differ() -> None:
     """Код и секрет челленджа — случайные и разные строки достаточной длины.
 
