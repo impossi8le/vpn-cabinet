@@ -153,6 +153,10 @@ class FakeOrder:
         """Заказ в форме ответа бота — та же, что разбирает `Order.from_api`."""
         return {
             "order_id": self.order_id,
+            # Владелец едет наружу вместе с заказом: без него кабинет не может
+            # проверить, чей заказ ему показывают, и подделка, отдающая заказы
+            # без владельца, разрешала бы открыть чужой (см. `/buy/done`).
+            "account_id": self.account_id,
             "status": self.status,
             "amount_rub": self.amount_rub,
             "days": self.days,
@@ -484,14 +488,20 @@ class FakeApi:
         self._log("get_order", order_id=order_id)
         return Order.from_api(self._find_order(order_id).to_api())
 
-    def mark_order_paid(self, order_id: str) -> OrderPaid:
+    def mark_order_paid(self, order_id: str, *, amount_rub: int | None = None) -> OrderPaid:
         """Отметить оплаченным. `changed=false` на повторе — как у бота.
 
         `changed` и есть идемпотентность вебхука: `true` только на первом
         подтверждении, по нему кабинет решает, слать ли письмо.
+
+        `amount_rub` сверяется с суммой заказа, как это делает настоящая ручка:
+        подделка, которая просто принимает сумму на слово, пропускала бы и
+        расхождение — то есть тест на «сумма не сошлась» был бы пустым.
         """
-        self._log("mark_order_paid", order_id=order_id)
+        self._log("mark_order_paid", order_id=order_id, amount_rub=amount_rub)
         order = self._find_order(order_id)
+        if amount_rub is not None and amount_rub != order.amount_rub:
+            raise BotError("amount_mismatch", "сумма не совпала с заказом", status=409)
         changed = order.status != ORDER_COMPLETED
         order.status = ORDER_COMPLETED
         return OrderPaid(order_id=order.order_id, status=order.status, changed=changed)
@@ -521,6 +531,15 @@ class FakeApi:
             configs=tuple(order.configs),
             already=already,
         )
+
+    def get_ovpn(self, account_id: int, config_id: str) -> bytes:
+        """Файл конфигурации `.ovpn` — телом, как его отдаёт бот.
+
+        Содержимое простое и предсказуемое: письмо после оплаты проверяется по
+        вложению, и тесту нужно сверить именно байты, а не факт «что-то пришло».
+        """
+        self._log("get_ovpn", account_id=account_id, config_id=config_id)
+        return f"client\nremote {config_id}\n".encode()
 
 
 @dataclass

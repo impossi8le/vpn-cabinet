@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ __all__ = [
     "RETURN_PATH",
     "SECRET_KEY_ENV",
     "SHOP_ID_ENV",
+    "TRUSTED_NOTIFICATION_NETWORKS",
     "Payment",
     "PaymentClient",
     "Payments",
@@ -60,6 +62,7 @@ __all__ = [
     "PaymentsTransportError",
     "UnconfiguredPayments",
     "build_payments",
+    "is_trusted_notification_ip",
     "return_url",
 ]
 
@@ -92,6 +95,45 @@ PAYMENT_STATUS_CANCELED = "canceled"
 
 # Сетевые сбои httpx, которые для модуля означают одно: ЮKassa не ответила.
 _NETWORK_ERRORS = (httpx.HTTPError, OSError)
+
+# Откуда ЮKassa присылает уведомления. Список — из официального SDK
+# (`yookassa.domain.common.SecurityHelper.YOOKASSA_NETWORKS`, десять записей
+# IPv4/IPv6), потому что своего способа убедиться в подлинности у уведомлений
+# нет: подписи современный API не ставит.
+#
+# Это **фильтр, а не доказательство** (план, «Вебхук: что именно проверяется»).
+# Список стареет: YooKassa добавит сеть — и настоящие уведомления начнут
+# приходить «не оттуда». Поэтому несовпадение адреса не отказ, а повод записать
+# в лог и всё равно перепроверить платёж у провайдера: доказательство — ответ
+# API, а не адрес отправителя.
+TRUSTED_NOTIFICATION_NETWORKS: tuple[str, ...] = (
+    "77.75.153.0/25",
+    "77.75.156.11",
+    "77.75.156.35",
+    "77.75.154.128/25",
+    "185.71.76.0/27",
+    "185.71.77.0/27",
+    "2a02:5180:0:1509::/64",
+    "2a02:5180:0:2655::/64",
+    "2a02:5180:0:1533::/64",
+    "2a02:5180:0:2669::/64",
+)
+_NETWORKS = tuple(ipaddress.ip_network(network) for network in TRUSTED_NOTIFICATION_NETWORKS)
+
+
+def is_trusted_notification_ip(ip: str | None) -> bool:
+    """Пришёл ли запрос из сетей ЮKassa. Пустое и мусор — нет.
+
+    Разбор адреса отделён от решения: `ip_address` на мусоре бросает, а вебхук
+    не должен падать от чужого заголовка — он должен сказать «не из сети».
+    """
+    if not ip:
+        return False
+    try:
+        address = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return False
+    return any(address in network for network in _NETWORKS)
 
 
 class PaymentsError(Exception):
@@ -194,6 +236,11 @@ class Payment:
     amount_rub: int
     confirmation_url: str | None = None
     paid: bool = False
+    # Заказ из `metadata`, как его помнит **провайдер** (а не тело уведомления).
+    # На этом держится привязка «какой заказ оплачен»: `metadata.order_id`
+    # ставит только кабинет при создании платежа, и потому ответ ЮKassa — это
+    # единственное место, где связь платежа и заказа нельзя подделать.
+    order_id: str | None = None
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> Payment:
@@ -203,12 +250,15 @@ class Payment:
         confirmation_url = (
             confirmation.get("confirmation_url") if isinstance(confirmation, dict) else None
         )
+        metadata = raw.get("metadata")
+        order_id = metadata.get("order_id") if isinstance(metadata, dict) else None
         return cls(
             id=str(raw.get("id", "")),
             status=str(raw.get("status", "")),
             amount_rub=amount_rub,
             confirmation_url=str(confirmation_url) if confirmation_url else None,
             paid=bool(raw.get("paid", False)),
+            order_id=str(order_id) if order_id else None,
         )
 
 

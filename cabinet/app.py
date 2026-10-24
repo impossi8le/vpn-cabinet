@@ -37,13 +37,14 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 from urllib.parse import quote, unquote
 
-from fastapi import FastAPI, Form, Query, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Body, FastAPI, Form, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from cabinet.accounts import Account
@@ -56,6 +57,7 @@ from cabinet.bot_client import (
     BotError,
     BotUnreachable,
     Challenge,
+    Order,
     Referral,
     TelegramAuthClient,
     TelegramLogin,
@@ -71,8 +73,15 @@ from cabinet.configs import (
     DownloadLimiter,
 )
 from cabinet.linking import Linking, LinkRefused, UnlinkRefused
-from cabinet.mail_sender import MailSender
-from cabinet.payments import Payments, PaymentsError, UnconfiguredPayments
+from cabinet.mail_sender import MailError, MailSender
+from cabinet.payments import (
+    PAYMENT_STATUS_SUCCEEDED,
+    Payments,
+    PaymentsError,
+    PaymentsTransportError,
+    UnconfiguredPayments,
+    is_trusted_notification_ip,
+)
 from cabinet.pending_mail import PendingMail
 from cabinet.pricing import PRICES, calculate_price
 from cabinet.render import (
@@ -459,6 +468,65 @@ def _unreachable_screen(message: str) -> HTMLResponse:
     return HTMLResponse(render_subscriptions([], error=message))
 
 
+# Журнал вебхука. Он появился ради оплаты: подтверждение приходит извне, никем не
+# подписано, и то, что мы отклонили, обязано быть видно — иначе подделка или
+# настоящий платёж с устаревшим адресом исчезнут бесследно. Ни суммы, ни тела
+# уведомления, ни ключей в записи не попадает: журнал читают шире, чем задумано,
+# а репозиторий и развёртывание — публичные.
+logger = logging.getLogger(__name__)
+
+
+def _fulfil_paid_order(
+    store: AccountStore, mail_sender: MailSender, order: Order, order_id: str
+) -> None:
+    """Выдать конфиги по оплаченному заказу и отправить их письмом.
+
+    Вызывается **только** на первом подтверждении (`changed`): повтор уведомления
+    не должен выдать второй комплект и не должен отправить второе письмо.
+
+    Сбой здесь не отменяет оплату и не превращается в ошибку вебхука: деньги
+    приняты и записаны, конфиги выдает бот — а провайдеру, который повторит
+    уведомление, повторять уже нечего (заказ отмечен оплаченным). Поэтому всё
+    исключение остаётся в журнале, а человек всё равно получает доступ: конфиги
+    лежат в подписках кабинета, и экран возврата туда и ведёт.
+    """
+    try:
+        issued = store.issue_order(order_id)
+    except (BotError, BotUnreachable) as exc:
+        logger.warning("заказ %s оплачен, выдача не прошла: %r", order_id, exc)
+        return
+
+    try:
+        account = store.find_by_id(order.account_id)
+    except (BotError, BotUnreachable) as exc:
+        logger.warning("заказ %s: аккаунт не прочитан: %r", order_id, exc)
+        return
+    recipient = (account.mail if account else None) or ""
+    if not recipient:
+        # Аккаунт, вошедший только через Telegram, письма не ждёт: адреса нет.
+        # Это не сбой — ему доступен кабинет, и подписки там же. Пишем, чтобы
+        # отсутствие письма не выглядело потерянным.
+        logger.info("заказ %s: адреса для письма нет, конфиги только в кабинете", order_id)
+        return
+
+    attachments: list[tuple[str, bytes, str]] = []
+    for config in issued.configs:
+        try:
+            content = store.get_ovpn(order.account_id, config.id)
+        except (BotError, BotUnreachable) as exc:
+            logger.warning("заказ %s: конфиг %s не скачан: %r", order_id, config.id, exc)
+            continue
+        attachments.append((f"{config.id}.ovpn", content, "application/x-openvpn-profile"))
+    if not attachments:
+        logger.warning("заказ %s: ни одного файла для письма, письмо не отправлено", order_id)
+        return
+
+    try:
+        mail_sender.send_configs(recipient, attachments=attachments)
+    except MailError as exc:
+        logger.warning("заказ %s: письмо не ушло: %r", order_id, exc)
+
+
 def build_app(
     *,
     store: AccountStore | None = None,
@@ -551,6 +619,7 @@ def build_app(
         clock=clock,
         configs=configs,
         payments=payments,
+        mail_sender=mail_sender,
     )
     _add_account_routes(
         app,
@@ -1010,8 +1079,14 @@ def _add_subscription_routes(
     clock: Callable[[], datetime],
     configs: ConfigService,
     payments: Payments,
+    mail_sender: MailSender,
 ) -> None:
-    """Роуты подписок, покупки и оплаты. Экран подписок — он же вход в кабинет."""
+    """Роуты подписок, покупки и оплаты. Экран подписок — он же вход в кабинет.
+
+    `mail_sender` нужен именно здесь, а не только на входе: после подтверждения
+    оплаты конфигурации уходят **письмом** (вебхук), и это единственная доставка
+    для человека, который не может открыть Telegram.
+    """
 
     @app.get("/subscriptions", response_class=HTMLResponse)
     def subscriptions_page(request: Request) -> Response:
@@ -1271,7 +1346,8 @@ def _add_subscription_routes(
         — состояние экрана, а не сбой; недоступность бота — тоже своё состояние.
         Свести их значило бы прочитать недоступность сервиса как «заказа нет».
         """
-        if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
             return RedirectResponse("/login", status_code=303)
         if not order_id:
             return HTMLResponse(render_buy_done(not_found=True))
@@ -1284,7 +1360,105 @@ def _add_subscription_routes(
             return HTMLResponse(render_buy_done(unreachable=True, refresh_url=refresh))
         except BotUnreachable:
             return HTMLResponse(render_buy_done(unreachable=True, refresh_url=refresh))
+        # Чужой заказ показывается как несуществующий. Номер заказа — случайный,
+        # но это единственное, что его охраняет: подтверждать, что заказ с таким
+        # номером есть, значит отдавать чужую покупку за знание номера.
+        if order.account_id != view.account_id:
+            return HTMLResponse(render_buy_done(not_found=True))
         return HTMLResponse(render_buy_done(order=order, refresh_url=refresh))
+
+    @app.post("/payments/webhook/yookassa")
+    def yookassa_webhook(
+        request: Request,
+        # `Annotated`, а не `= Body(...)`: ruff справедливо не считает вызов
+        # функции в значении по умолчанию неизменным (`B008`), и у соседних
+        # роутов та же форма записи.
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> JSONResponse:
+        """Уведомление ЮKassa — единственное основание выдать оплаченное.
+
+        Тело уведомления **не авторитетно**: подписи у уведомлений современного
+        API нет (issue #61), поэтому «оплачено» берётся не отсюда, а из ответа
+        ЮKassa на перезапрос платежа. Порядок:
+
+        1. событие — только `payment.succeeded`, остальные игнорируются;
+        2. адрес источника сверяется с сетями ЮKassa, но по нему **не отказываем**:
+           список стареет, и отказ по устаревшему списку стоил бы настоящих
+           покупок. Несовпадение — строка в журнале, проверка идёт дальше;
+        3. платёж перезапрашивается у провайдера, и заказ берётся из **его**
+           `metadata`: так подделанное уведомление не может подменить заказ,
+           потому что `metadata.order_id` ставит только кабинет;
+        4. статус (`succeeded`) и сумма сверяются с заказом;
+        5. заказ отмечается оплаченным — и **только на первом** переходе
+           выдаются конфиги и уходит письмо. Повтор уведомления не создаёт ни
+           второго комплекта, ни второго письма.
+
+        Коды ответа — часть договора с провайдером: ЮKassa повторяет уведомление,
+        если ответ не 2xx. Поэтому **200** там, где повтор не поможет (чужое
+        событие, уже отмечено, сумма не сошлась, заказа нет), и **503** там, где
+        повтор нужен: не дозвонились до ЮKassa или до бота. Ответ 200 в этом
+        случае «съел» бы оплату — уведомление больше не придёт, а заказ остался
+        бы неоплаченным навсегда.
+
+        IP берётся из `X-Real-IP`. Это заголовок, а не адрес соединения, и верить
+        ему можно потому, что кабинет слушает loopback за нашим nginx, который
+        перезаписывает его своим `$remote_addr`; `X-Forwarded-For` для этого не
+        годится — nginx его **дополняет** присланным клиентом.
+        """
+        data = payload or {}
+        if str(data.get("event") or "") != "payment.succeeded":
+            return JSONResponse({"ok": True})
+        payment_id = str((data.get("object") or {}).get("id") or "")
+        if not payment_id:
+            return JSONResponse({"ok": True})
+
+        source = request.headers.get("x-real-ip")
+        if not is_trusted_notification_ip(source):
+            logger.warning("вебхук: адрес источника вне сетей ЮKassa (%r), проверяю платёж", source)
+
+        try:
+            payment = payments.get_payment(payment_id)
+        except PaymentsTransportError:
+            # Провайдер недоступен: уведомление стоит повторить.
+            return JSONResponse({"ok": False}, status_code=503)
+        except PaymentsError:
+            # Провайдер ответил отказом — повтор ничего не изменит.
+            logger.warning("вебхук: платёж %s не прочитан у провайдера", payment_id)
+            return JSONResponse({"ok": True})
+
+        if payment.status != PAYMENT_STATUS_SUCCEEDED:
+            return JSONResponse({"ok": True})
+        order_id = payment.order_id or ""
+        if not order_id:
+            # Платёж без нашего заказа в метаданных: чужой или созданный не нами.
+            logger.warning("вебхук: у платежа %s нет order_id в метаданных", payment_id)
+            return JSONResponse({"ok": True})
+
+        try:
+            order = store.get_order(order_id)
+        except BotUnreachable:
+            return JSONResponse({"ok": False}, status_code=503)
+        except BotError:
+            logger.warning("вебхук: заказ %s не найден", order_id)
+            return JSONResponse({"ok": True})
+
+        if payment.amount_rub != order.amount_rub:
+            logger.warning(
+                "вебхук: сумма платежа %s не совпала с суммой заказа %s", payment_id, order_id
+            )
+            return JSONResponse({"ok": True})
+
+        try:
+            paid = store.mark_order_paid(order_id, amount_rub=payment.amount_rub)
+        except BotUnreachable:
+            return JSONResponse({"ok": False}, status_code=503)
+        except BotError as exc:
+            logger.warning("вебхук: заказ %s не отмечен оплаченным: %r", order_id, exc)
+            return JSONResponse({"ok": True})
+
+        if paid.changed:
+            _fulfil_paid_order(store, mail_sender, order, order_id)
+        return JSONResponse({"ok": True})
 
     @app.get("/subscriptions/{subscription_id}/config")
     async def subscription_config(request: Request, subscription_id: str) -> Response:

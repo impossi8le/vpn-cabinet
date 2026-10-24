@@ -500,6 +500,10 @@ class Order:
     devices: int = 0
     servers: tuple[str, ...] = ()
     configs: tuple[OrderConfig, ...] = ()
+    # Владелец заказа. Номер заказа приходит из адреса, и без владельца экран
+    # возврата показал бы чужой заказ любому, кто знает номер: `order_id` —
+    # случайный, но полагаться на незнание чужого номера нельзя.
+    account_id: int = 0
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> Order:
@@ -513,6 +517,7 @@ class Order:
             order_id=str(raw.get("order_id", "")),
             status=str(raw.get("status", "")),
             amount_rub=_int_or_zero(raw.get("amount_rub")),
+            account_id=_int_or_zero(raw.get("account_id")),
             days=_int_or_zero(raw.get("days")),
             devices=_int_or_zero(raw.get("devices")),
             servers=tuple(str(item) for item in (raw.get("servers") or [])),
@@ -869,13 +874,19 @@ class BotClient:
         data = await self._request("GET", f"{ORDERS_PATH}/{quote(order_id)}")
         return Order.from_api(data)
 
-    async def mark_order_paid(self, order_id: str) -> OrderPaid:
+    async def mark_order_paid(self, order_id: str, *, amount_rub: int | None = None) -> OrderPaid:
         """Отметить заказ оплаченным (`POST .../{order_id}/paid`).
 
         Идемпотентно: `changed=false` на повторе. Вебхук зовёт это после
         перезапроса платежа; по `changed` решается, слать ли письмо.
+
+        `amount_rub` — сумма, которую подтвердил **провайдер**. Бот сверит её с
+        суммой заказа и откажет при расхождении: это вторая проверка той же пары
+        чисел, и она дешёвая. Первая — в вебхуке, до вызова, и без неё сюда не
+        попадают.
         """
-        data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid")
+        body = {"amount_rub": amount_rub} if amount_rub is not None else None
+        data = await self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid", json=body)
         return OrderPaid.from_api(data)
 
     async def cancel_order(self, order_id: str) -> Order:
@@ -1288,9 +1299,13 @@ class BotStore:
         data = self._get(f"{ORDERS_PATH}/{quote(order_id)}")
         return Order.from_api(data)
 
-    def mark_order_paid(self, order_id: str) -> OrderPaid:
-        """Отметить оплаченным (`POST .../{order_id}/paid`). `changed=false` на повторе."""
-        data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid")
+    def mark_order_paid(self, order_id: str, *, amount_rub: int | None = None) -> OrderPaid:
+        """Отметить оплаченным (`POST .../{order_id}/paid`). `changed=false` на повторе.
+
+        `amount_rub` — подтверждённая провайдером сумма: бот сверит её с заказом.
+        """
+        body = {"amount_rub": amount_rub} if amount_rub is not None else None
+        data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid", json=body)
         return OrderPaid.from_api(data)
 
     def cancel_order(self, order_id: str) -> Order:
