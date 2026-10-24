@@ -73,6 +73,11 @@ def _transport(api: FakeApi, paths: list[str]) -> httpx.MockTransport:
             return _error("invalid_secret", 401)
 
         paths.append(request.url.path)
+        # Список серверов — общая ручка, не на аккаунт (шаг 4 покупки).
+        if request.method == "GET" and request.url.path == "/internal/servers":
+            return httpx.Response(
+                200, json={"servers": [{"code": s.code, "name": s.name} for s in api.servers]}
+            )
         parts = request.url.path.strip("/").split("/")
         if request.method != "GET" or parts[:2] != ["internal", "accounts"] or len(parts) < 3:
             return _error("not_found", 404)
@@ -97,6 +102,8 @@ def _transport(api: FakeApi, paths: list[str]) -> httpx.MockTransport:
             return _balance(account)
         if rest == ["referral"]:
             return _referral(account)
+        if rest == ["trial-eligibility"]:
+            return _trial_eligibility(api, account)
         if rest == ["unlink-preview"]:
             return _unlink_preview(account, request.url.params["method"])
         return _error("not_found", 404)
@@ -123,6 +130,17 @@ def _referral(account: Account) -> httpx.Response:
         200,
         json={"referral_code": "CAB-9f2a", "invited_count": 3, "rub_earned": 150},
     )
+
+
+def _trial_eligibility(api: FakeApi, account: Account) -> httpx.Response:
+    """`GET /internal/accounts/{id}/trial-eligibility` — право на триал (шаг 3).
+
+    Форма — пара `eligible`/`reason`, как у бота: отказ приходит `200` с
+    `eligible=False` и кодом в `reason`, а не отдельным статусом. Ответ берётся
+    у подставного бота, чтобы логика (триал живёт на `chat_id`) была одна.
+    """
+    result = api.trial_eligibility(account.id)
+    return httpx.Response(200, json={"eligible": result.eligible, "reason": result.reason})
 
 
 def _unlink_preview(account: Account, method: str) -> httpx.Response:
@@ -256,3 +274,43 @@ def test_missing_account_reads_as_none_not_as_an_error() -> None:
     store = _store_over(FakeApi())
 
     assert store.find_by_id(999) is None
+
+
+def test_buy_servers_screen_shows_servers_through_the_live_client() -> None:
+    """Шаг 4: список серверов доезжает от бота через живой адаптер (issue #46).
+
+    Проверяются и имя на экране, и **точный путь** контракта (`/internal/servers`):
+    расхождение имён в этом проекте уже стоило зелёного теста, который ничего не
+    защищал.
+    """
+    api = FakeApi()
+    account = api.create_account(mail=MAIL, mail_verified_at=NOW)
+    api.add_server("nl-1", "Нидерланды · Амстердам")
+    paths: list[str] = []
+
+    response = _client_over(api, account_id=account.id, paths=paths).get(
+        "/buy/servers?days=30&devices=1"
+    )
+
+    assert response.status_code == 200
+    assert "Нидерланды · Амстердам" in response.text
+    assert paths == [f"/internal/accounts/{account.id}", "/internal/servers"]
+
+
+def test_buy_confirm_shows_trial_right_through_the_live_client() -> None:
+    """Шаг 3: право на триал приходит по своему пути контракта, а не выдумано.
+
+    Аккаунт без Telegram: бот отвечает `eligible=False, reason='telegram_required'`,
+    и экран показывает русскую формулировку, а не код.
+    """
+    api = FakeApi()
+    account = api.create_account(mail=MAIL, mail_verified_at=NOW)
+    paths: list[str] = []
+
+    response = _client_over(api, account_id=account.id, paths=paths).get("/buy/confirm")
+
+    assert response.status_code == 200
+    assert "Пробный период выдаётся по Telegram" in response.text
+    assert "telegram_required" not in response.text
+    base = f"/internal/accounts/{account.id}"
+    assert paths == [base, f"{base}/trial-eligibility"]

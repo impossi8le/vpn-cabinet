@@ -39,7 +39,7 @@ import inspect
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Annotated, Protocol
 from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, Form, Query, Request, Response
@@ -59,6 +59,7 @@ from cabinet.bot_client import (
     Referral,
     TelegramAuthClient,
     TelegramLogin,
+    TrialEligibility,
     public_code_and_secret,
     secret_hash,
 )
@@ -81,6 +82,8 @@ from cabinet.render import (
     STATIC_DIR,
     TELEGRAM_CHECK_LABEL,
     render_buy,
+    render_buy_confirm,
+    render_buy_servers,
     render_linking,
     render_login,
     render_login_telegram,
@@ -169,6 +172,32 @@ def _account_money(
     except (BotError, BotUnreachable):
         referral = None
     return balance, referral, False
+
+
+def _trial_eligibility(
+    store: AccountStore, account_id: int
+) -> tuple[TrialEligibility | None, bool]:
+    """Право на триал для шага подтверждения: ответ бота или «не проверено».
+
+    Возвращается пара «ответ, недоступность». Разведены они не для удобства, а
+    по смыслу: `TrialEligibility` — **проверенный факт** (доступен или причина
+    отказа), `unreachable=True` — бот не ответил, и о человеке это не говорит
+    ничего. Свести второе к «недоступен» значило бы выдать сбой сервиса за
+    решение о человеке — ровно та ошибка, от которой сторожит экран.
+
+    Хранилище может не уметь эту ручку (старый подставной бот): отсутствие
+    метода — тот же «не проверено», что и недоступность, а не сбой экрана.
+    Причина отказа приходит `200` с `eligible=False` и кодом в `reason`, поэтому
+    `BotError` здесь — не ожидаемое «не положен», а расхождение: считаем его
+    недоступностью проверки.
+    """
+    check = getattr(store, "trial_eligibility", None)
+    if check is None:
+        return None, True
+    try:
+        return check(account_id), False
+    except (BotError, BotUnreachable):
+        return None, True
 
 
 def _default_store() -> AccountStore:
@@ -270,6 +299,11 @@ SUBSCRIPTIONS_ERROR = "Не удалось получить список под�
 # никогда: человек никуда не выходил, и уводить его на вход значило бы выдать
 # сбой сети за расхождение состояния.
 BOT_UNREACHABLE_ERROR = "Сервис сейчас не отвечает, данные не получены. Обновите страницу позже."
+
+# Список серверов не получен. Отдельно от «серверов нет»: пустой список — это
+# факт от бота, а здесь факта не было вовсе. Текст говорит, что делать, а не
+# выдаёт сбой за состояние.
+BUY_SERVERS_ERROR = "Список серверов не получен. Обновите страницу позже."
 
 # Бот недоступен на **входе**, и текст здесь свой — не по недосмотру. Код к этому
 # моменту уже проверен и погашен (он одноразовый, `AuthMail.verify`), поэтому
@@ -1011,6 +1045,80 @@ def _add_subscription_routes(
             render_buy(
                 days=days if days in PRICES else DEFAULT_BUY_DAYS,
                 devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
+            )
+        )
+
+    @app.get("/buy/confirm", response_class=HTMLResponse)
+    def buy_confirm_page(
+        request: Request,
+        days: int | None = Query(default=None),
+        devices: int | None = Query(default=None),
+    ) -> Response:
+        """Шаг 3 покупки: сводка заказа и честное право на триал.
+
+        Цену на экран кладёт рендер — из калькулятора, не из адреса: адрес
+        называет выбор, а не сумму, и принятая из адреса цена позволила бы
+        купить за рубль.
+
+        Право на триал спрашивается у бота (`trial-eligibility`) **здесь**, а не
+        на шаге 1–2: на этом шаге проверка делается, и её ответ — факт, а не
+        оговорка. Недоступность бота (`_trial_eligibility`) даёт отдельное
+        состояние экрана: сбой сервиса не должен читаться как «триал вам не
+        положен».
+
+        Без сессии — редирект на вход, как у соседних экранов: это обычное
+        состояние первого захода, а не сбой. Аккаунт нужен именно для проверки
+        права: триал привязан к человеку, а не к паре «срок + устройства».
+        """
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
+            return RedirectResponse("/login", status_code=303)
+        trial, trial_unreachable = _trial_eligibility(store, view.account_id)
+        return HTMLResponse(
+            render_buy_confirm(
+                days=days if days in PRICES else DEFAULT_BUY_DAYS,
+                devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
+                trial=trial,
+                trial_unreachable=trial_unreachable,
+            )
+        )
+
+    @app.get("/buy/servers", response_class=HTMLResponse)
+    def buy_servers_page(
+        request: Request,
+        days: int | None = Query(default=None),
+        devices: int | None = Query(default=None),
+        # `Annotated`, а не `= Query(...)`: список в значении по умолчанию
+        # изменяем, и ruff справедливо не считает его неизменным (`B008`).
+        pick: Annotated[list[str] | None, Query()] = None,
+    ) -> Response:
+        """Шаг 4 покупки: выбрать ровно столько серверов, сколько устройств.
+
+        Выбор приходит в адресе повторяющимся `pick` (`?pick=fi&pick=fi` —
+        комплект из одинаковых), поэтому экран работает без JavaScript и без
+        черновика на сервере: набор восстанавливается из ссылки. Набор
+        обрезается по числу устройств — сверх нужного выбирать нечего, и
+        чужая ссылка с лишним `pick` не должна показывать невозможное состояние.
+
+        Список серверов берётся у бота. Недоступность бота — не «серверов нет»,
+        а отказ: пустой список был бы фактом, которого кабинет не получал.
+        """
+        if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
+            return RedirectResponse("/login", status_code=303)
+        chosen = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
+        picks = list(pick or [])[:chosen]
+        try:
+            servers = store.list_servers()
+            error: str | None = None
+        except (BotError, BotUnreachable):
+            servers, error = [], BUY_SERVERS_ERROR
+        return HTMLResponse(
+            render_buy_servers(
+                days=days if days in PRICES else DEFAULT_BUY_DAYS,
+                devices=chosen,
+                servers=servers,
+                picked=picks,
+                error=error,
             )
         )
 

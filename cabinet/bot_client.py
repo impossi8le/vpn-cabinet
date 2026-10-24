@@ -66,9 +66,11 @@ __all__ = [
     "LoginPoll",
     "PromoValidation",
     "Referral",
+    "Server",
     "Subscription",
     "TelegramAuthClient",
     "TelegramLogin",
+    "TrialEligibility",
     "UnlinkPreview",
     "public_code_and_secret",
     "secret_hash",
@@ -390,6 +392,45 @@ class PromoValidation:
         )
 
 
+@dataclass(frozen=True)
+class Server:
+    """Сервер для подключения — элемент ответа `GET /internal/servers`.
+
+    `code` — идентификатор, который уходит дальше боту при выдаче конфига;
+    `name` — имя, которое видит человек. Оба нужны: по коду выбирают, а имя
+    показывают, и подменять одно другим нельзя — имя меняется, а код держится
+    в записи заказа. Поля читаются через `.get`: ответ приходит из другого
+    репозитория, и пропавшее поле не должно ронять экран `KeyError`-ом.
+    """
+
+    code: str
+    name: str
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> Server:
+        return cls(code=str(raw.get("code", "")), name=str(raw.get("name", "")))
+
+
+@dataclass(frozen=True)
+class TrialEligibility:
+    """Право на пробный период — ответ
+    `GET /internal/accounts/{id}/trial-eligibility`.
+
+    `eligible` — факт («человеку положен триал»), `reason` — код причины при
+    отказе (`already_used`, `not_new`…), по которому ветвится вызывающий код, а
+    не текст сообщения: текст меняется, код — часть контракта. Отсутствие
+    `eligible` читается как «не положен»: обещать бесплатный доступ, которого
+    бот не подтвердил, опаснее, чем его не показать.
+    """
+
+    eligible: bool
+    reason: str | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> TrialEligibility:
+        return cls(eligible=bool(raw.get("eligible", False)), reason=raw.get("reason"))
+
+
 def _bearer(token: str) -> dict[str, str]:
     """Заголовок с токеном сессии.
 
@@ -614,6 +655,33 @@ class BotClient:
             json={"code": code},
         )
         return PromoValidation.from_api(data)
+
+    # ---------- Покупка: серверы и право на триал --------------------
+
+    async def list_servers(self) -> list[Server]:
+        """Серверы, доступные для подключения (`GET /internal/servers`).
+
+        Секрет в заголовке — тот же, что у прочих внутренних вызовов: ручка
+        живёт у бота за loopback, наружу не выставлена. Список общий, не на
+        аккаунт: сервер один и тот же для всех, а выбор делает человек.
+
+        Пустой список — норма, а не отказ: бот может не иметь ни одного
+        свободного сервера, и это состояние экрана, а не сбой связи.
+        """
+        data = await self._request("GET", f"{BOT_PATH}/servers")
+        return [Server.from_api(item) for item in data.get("servers", [])]
+
+    async def trial_eligibility(self, account_id: int) -> TrialEligibility:
+        """Право на пробный период (`GET /internal/accounts/{id}/trial-eligibility`).
+
+        `eligible=True` — триал **доступен**, а не «выдан»: оформление — шаг
+        покупки, которого кабинет ещё не делает. `reason` при отказе — код
+        причины (`telegram_required`, `trial_used_by_chat_id`,
+        `trial_used_by_mail`), а не текст: на экран код не попадает, рендер
+        сам выбирает русскую формулировку по нему.
+        """
+        data = await self._request("GET", f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
+        return TrialEligibility.from_api(data)
 
     # ---------- Сессии (§4) ----------
 
@@ -945,6 +1013,33 @@ class BotStore:
         «нельзя отвязать последний способ входа», а не «не удалось» и не 500.
         """
         return self._changed_rows(f"{BOT_PATH}/accounts/{account_id}/unlink-mail")
+
+    # ---------- покупка: серверы и право на триал ----------
+    #
+    # Синхронные двойники методов `BotClient`: экран покупки синхронный, а
+    # список серверов и право на триал он спрашивает у бота. Одноимённые методы
+    # у живого клиента — корутины, поэтому адаптер закрывает форму, которую
+    # зовут роуты (`list_servers`, `trial_eligibility`).
+
+    def list_servers(self) -> list[Server]:
+        """Серверы для выбора на шаге 4 (`GET /internal/servers`).
+
+        Пустой список — норма: «нет доступных серверов» — состояние экрана, а
+        не отказ связи (`BotUnreachable`) и не ошибка бота (`BotError`).
+        """
+        data = self._get(f"{BOT_PATH}/servers")
+        return [Server.from_api(item) for item in data.get("servers", [])]
+
+    def trial_eligibility(self, account_id: int) -> TrialEligibility:
+        """Право на пробный период на шаге 3.
+
+        `409 telegram_required` бот на этой ручке **не** отдаёт: отказ по
+        причине приходит `200` с `eligible=False` и кодом в `reason` (см.
+        `utils/db.py` бота). Поэтому здесь нет ветки на `telegram_required` —
+        это результат проверки, а не сбой, и роут ветвится по `reason`.
+        """
+        data = self._get(f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
+        return TrialEligibility.from_api(data)
 
     # ---------- транспорт ----------
 

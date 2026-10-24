@@ -11,13 +11,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import quote
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
 
 from cabinet import pricing, theme
 from cabinet.accounts import Account
-from cabinet.bot_client import Balance, Referral
+from cabinet.bot_client import Balance, Referral, Server, TrialEligibility
 from cabinet.configs import (
     ConfigError,
     ConfigNotFound,
@@ -37,6 +38,8 @@ from cabinet.subscriptions import (
 )
 
 __all__ = [
+    "BUY_CONFIRM_URL",
+    "BUY_SERVERS_URL",
     "CONFIG_DOWNLOAD_BASE",
     "CONFIG_ERRORS",
     "CONFIG_ERROR_FALLBACK",
@@ -63,6 +66,8 @@ __all__ = [
     "render_login_telegram",
     "render_login_waiting",
     "render_buy",
+    "render_buy_confirm",
+    "render_buy_servers",
     "render_subscriptions",
 ]
 
@@ -564,14 +569,15 @@ _DEVICE_DISCOUNT_PERCENTS = {
     3: pricing.BUNDLE_3_DEVICES_DISCOUNT_PERCENT,
 }
 
-# Текст про триал. Он намеренно **не** обещает бесплатный доступ безусловно:
-# триал выдают один раз и только тем, кто ещё не покупал, а кабинет этого не
-# знает — покупки живут у бота. Обещание, которого кабинет не может
-# подтвердить, — та же ложь, что нарисованная кнопка в никуда. Поэтому сказано
-# и что это пробный период, и кто решает, кому он положен.
+# Текст про триал на шаге выбора тарифа (1–2). Он по-прежнему **не** обещает
+# бесплатный доступ: право на триал проверяется на шаге подтверждения, и здесь
+# проверка ещё не сделана — обещать «бесплатно» до неё значило бы обещать то,
+# чего кабинет на этом экране не подтвердил. Что изменилось после шага 3: там
+# право уже **проверяется** у бота, поэтому здесь сказано, где именно это
+# произойдёт, — а не что кабинет этого не умеет вовсе.
 BUY_TRIAL_NOTE = (
     "Пробный период дают один раз — новым покупателям. "
-    "Право на него проверяет бот сервиса, и кабинет заранее его не обещает."
+    "Право на него кабинет проверит на шаге подтверждения."
 )
 
 
@@ -670,6 +676,225 @@ def render_buy(
         device_options=_buy_devices(days, devices, calculator),
         total=_rubles(calculator(days, devices).final_price),
     )
+
+
+# --- покупка: подтверждение и серверы (#37, шаги 3–4) --------------------
+#
+# Шаг 3 показывает итог и **честное** право на триал: не оговорку «возможно,
+# положен», а ответ бота. Шаг 4 — выбор серверов ровно по числу устройств, и
+# это условие завершения, а не лимит (спека §1). Оба экрана работают без
+# JavaScript: выбор выражается адресом, как и на шагах 1–2.
+
+# Адрес шага 4: подтверждение ведёт на выбор серверов с той же парой.
+BUY_SERVERS_URL = "/buy/servers"
+# Адрес шага 3: с выбора серверов есть возврат к подтверждению.
+BUY_CONFIRM_URL = "/buy/confirm"
+
+# Тексты права на триал на шаге подтверждения. Проверка здесь уже сделана, и
+# «доступен» — факт, а не обещание; но и он не значит «выдан»: оформление —
+# следующий шаг, поэтому сказано «доступен», а не «получите».
+TRIAL_AVAILABLE_NOTE = "Пробный период доступен. Первый тариф на 30 дней можно оформить без оплаты."
+# Коды причин отказа из бота (`utils/db.py`) — машинные, а не текст для человека.
+# На каждый известный код своя формулировка: три причины — три разных объяснения,
+# и свести их в одно «триал недоступен» значило бы отнять у человека подсказку,
+# что именно мешает. Незнакомый код сюда не попадает и получает запасной текст
+# (`TRIAL_UNKNOWN_REASON_NOTE`): показать его сырым — вывалить на экран
+# `trial_used_by_chat_id`.
+TRIAL_REASON_TEXTS: dict[str, str] = {
+    "telegram_required": (
+        "Пробный период выдаётся по Telegram. У этого аккаунта он не привязан, "
+        "поэтому право на триал проверить не по чему."
+    ),
+    "trial_used_by_chat_id": "Этот Telegram уже использовал пробный период.",
+    "trial_used_by_mail": "На эту почту пробный период уже выдавали.",
+}
+# Незнакомая причина: бот знает причину, которой кабинет не понимает. Честный
+# ответ — сказать, что право надо уточнить, а не подставить первое объяснение:
+# догадка, выданная за сообщение сервиса, — та же ложь, что нарисованная кнопка.
+TRIAL_UNKNOWN_REASON_NOTE = (
+    "Право на пробный период неясно: сервис назвал причину, которой кабинет не "
+    "знает. Уточните его в поддержке."
+)
+# Отдельное состояние: **сбой бота**, а не решение о человеке. Свести их значило
+# бы читать недоступность сервиса как «триал вам не положен» — то есть выдавать
+# отказ сети за отказ человеку.
+TRIAL_UNREACHABLE_NOTE = (
+    "Право на пробный период сейчас проверить нельзя: сервис не отвечает. Обновите страницу позже."
+)
+
+
+def _trial_context(trial: TrialEligibility | None, *, unreachable: bool) -> dict[str, object]:
+    """Право на триал, каким его видит разметка: факт, причина или сбой.
+
+    Разведены три состояния, и это не украшение. «Доступен» — проверенный факт;
+    «недоступен» — решение о человеке с конкретной причиной; «не проверено» —
+    сбой бота, о человеке не говорящий. Слить последние два — и недоступность
+    сервиса читалась бы как «вам не положено».
+
+    Тон у всех нейтральный (§7): триал — не подтверждённая защита и не опасность,
+    и красить его нечем. Признак `unreachable` нужен разметке, чтобы показать
+    отдельное состояние своим текстом, а не тем же «недоступен».
+    """
+    if unreachable:
+        return {
+            "trial_state": "unreachable",
+            "trial_available": False,
+            "trial_note": TRIAL_UNREACHABLE_NOTE,
+        }
+    if trial is not None and trial.eligible:
+        return {
+            "trial_state": "available",
+            "trial_available": True,
+            "trial_note": TRIAL_AVAILABLE_NOTE,
+        }
+    reason = trial.reason if trial is not None else None
+    note = TRIAL_REASON_TEXTS.get(reason or "", TRIAL_UNKNOWN_REASON_NOTE)
+    return {
+        "trial_state": "refused",
+        "trial_available": False,
+        "trial_note": note,
+    }
+
+
+def render_buy_confirm(
+    *,
+    days: int = DEFAULT_BUY_DAYS,
+    devices: int = DEFAULT_BUY_DEVICES,
+    trial: TrialEligibility | None = None,
+    trial_unreachable: bool = False,
+    calculator: Callable[..., PriceQuote] = pricing.calculate_price,
+) -> str:
+    """Шаг 3: сводка заказа и честное право на триал.
+
+    Цена берётся **у калькулятора** по паре `days`/`devices`, а не из адреса:
+    адрес называет выбор, но не сумму, и принятая из адреса цена позволила бы
+    купить за рубль. Тот же шов `calculator`, что у `render_buy`: подмена
+    доказывает, что число посчитано, а не вписано.
+
+    `trial` — ответ бота на `trial-eligibility`; `trial_unreachable` — бот не
+    ответил. Это **разные** состояния с разными текстами (`_trial_context`):
+    сбой сервиса не должен читаться как «триал вам не положен».
+
+    Кнопка подтверждения ведёт на шаг 4 (`?days=&devices=`) — выбор уже выражен
+    адресом, и хранить черновик на сервере здесь нечего.
+    """
+    quote_ = calculator(days, devices)
+    return _ENV.get_template("buy_confirm.html").render(
+        **_base_context(),
+        days_label=_pluralize_days(days),
+        devices_label=_pluralize_devices(devices),
+        total=_rubles(quote_.final_price),
+        total_url=f"{BUY_SERVERS_URL}?days={days}&devices={devices}",
+        back_url=f"/buy?days={days}&devices={devices}",
+        **_trial_context(trial, unreachable=trial_unreachable),
+    )
+
+
+def _pluralize_servers(count: int) -> str:
+    """«1 сервер», «2 сервера», «5 серверов» — склонение по числу.
+
+    Без него «выбрано 2 сервер» читается как сбой страницы, как и в склонениях
+    сроков и устройств. Исключение 11–14 — форма «серверов».
+    """
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} серверов"
+    last = count % 10
+    if last == 1:
+        return f"{count} сервер"
+    if 2 <= last <= 4:
+        return f"{count} сервера"
+    return f"{count} серверов"
+
+
+def _servers_url(days: int, devices: int, picks: list[str]) -> str:
+    """Адрес выбора серверов с текущим набором в query.
+
+    Выбор выражается **адресом**, а не скрытым состоянием: так экран работает
+    без JavaScript, а набор восстанавливается из ссылки. Один сервер может
+    стоять несколько раз (комплект из одинаковых), поэтому повторяется
+    параметр `pick`, а не счётчик — порядок и повторы сохраняются.
+    """
+    parts = [f"days={days}", f"devices={devices}"]
+    parts.extend(f"pick={quote(code)}" for code in picks)
+    return f"{BUY_SERVERS_URL}?{'&'.join(parts)}"
+
+
+def render_buy_servers(
+    *,
+    days: int = DEFAULT_BUY_DAYS,
+    devices: int = DEFAULT_BUY_DEVICES,
+    servers: list[Server] | None = None,
+    picked: list[str] | None = None,
+    error: str | None = None,
+) -> str:
+    """Шаг 4: выбор ровно столько серверов, сколько устройств (спека §1).
+
+    Число выбранных — **условие завершения**, а не лимит: пока выбрано меньше
+    `devices`, шаг не закончен. Один и тот же сервер можно выбрать несколько
+    раз, поэтому выбор — список кодов с повторами, а не множество.
+
+    Каждый сервер даёт две ссылки («добавить»/«убрать»), и обе — адрес. Ссылки
+    собираются здесь, а не в шаблоне: адрес зависит от текущего набора и числа
+    устройств, и вторая его копия в разметке разошлась бы при первой правке.
+
+    Пустой список серверов — состояние экрана («серверов нет»), а не отказ:
+    бот мог не отдать ни одного, и выдумывать сервер нельзя. `error` — **другой**
+    случай: список не получен (бот не ответил). Их нельзя свести — «серверов нет»
+    утверждало бы про список, которого кабинет не видел.
+    """
+    servers = servers or []
+    picked = list(picked or [])
+    total_picked = len(picked)
+    complete = total_picked == devices
+    rows = []
+    for server in servers:
+        chosen = picked.count(server.code)
+        # Нельзя добавить сверх нужного: добавление остановлено на числе
+        # устройств, и лишний сервер в адресе не привёл бы к переполнению.
+        can_add = total_picked < devices
+        rows.append(
+            {
+                "code": server.code,
+                "name": server.name,
+                "chosen": chosen,
+                "chosen_label": _pluralize_servers(chosen) if chosen else None,
+                "can_add": can_add,
+                "can_remove": chosen > 0,
+                "add_url": _servers_url(days, devices, [*picked, server.code]),
+                # Убираем **одно** вхождение: сервер мог стоять дважды, и снять
+                # сразу оба значило бы потерять задуманный комплект.
+                "remove_url": _servers_url(days, devices, _without_one(picked, server.code)),
+            }
+        )
+    return _ENV.get_template("buy_servers.html").render(
+        **_base_context(),
+        days_label=_pluralize_days(days),
+        devices_label=_pluralize_devices(devices),
+        days=days,
+        devices=devices,
+        rows=rows,
+        error=error,
+        has_servers=bool(rows),
+        total_picked=total_picked,
+        picked_label=_pluralize_servers(total_picked),
+        remaining=devices - total_picked,
+        complete=complete,
+        back_url=f"{BUY_CONFIRM_URL}?days={days}&devices={devices}",
+    )
+
+
+def _without_one(picks: list[str], code: str) -> list[str]:
+    """Список без **одного** вхождения `code`.
+
+    Убираем по одному, а не все сразу: сервер мог быть выбран нарочно несколько
+    раз (комплект из одинаковых), и снять их все одной ссылкой значило бы
+    разрушить выбор, которого человек не просил разрушать.
+    """
+    result = list(picks)
+    if code in result:
+        result.remove(code)
+    return result
 
 
 # --- связывание способов входа (W5.3) ------------------------------------
