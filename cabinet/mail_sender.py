@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import smtplib
 import ssl
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -34,6 +34,11 @@ DEFAULT_CODE_TTL_MINUTES = 10
 
 SUBJECT = "Код для входа в кабинет"
 _HEADER_BREAKS = ("\r", "\n")
+
+# Вложение: (имя файла, содержимое, mime-тип). Имя — `str` (бывает кириллица),
+# содержимое — `bytes` (`.ovpn` может быть бинарным). Собирать письмо в одну
+# строку нельзя: содержимое не текст, а имя кодируется отдельно от байтов.
+Attachment = tuple[str, bytes, str]
 
 
 class MailError(Exception):
@@ -54,6 +59,15 @@ class MailAddressError(MailError):
 
 class MailTransportError(MailError):
     """Транспорт не доставил письмо: сеть, авторизация, отказ сервиса."""
+
+
+class MailAttachmentError(MailError):
+    """Транспорт не умеет вложение, а отправить письмо без файла нельзя.
+
+    Молчаливое письмо без конфига человек прочитает как «покупка потерялась» —
+    и это хуже честной ошибки. Поэтому отказ виден сразу, а не прячется за
+    письмом, в котором нет главного.
+    """
 
 
 def _check_header(value: str, what: str) -> str:
@@ -170,12 +184,21 @@ class Transport(Protocol):
     """Шов, ради которого модуль и разделён: функция отправки одна, а доставляет
     письмо то, что подставлено в `MailSender.transport`.
 
-    Транспорт принимает уже разобранное письмо — адресата, тему и текст — и не
-    знает ни про коды, ни про TTL. Подставной транспорт в тестах (`fake_mail`)
-    повторяет ровно этот вызов, поэтому подменяется без правок вызывающего.
+    Транспорт принимает уже разобранное письмо — адресата, тему, текст и, если
+    есть, вложения — и не знает ни про коды, ни про TTL. Подставной транспорт в
+    тестах (`fake_mail`) повторяет ровно этот вызов, поэтому подменяется без
+    правок вызывающего. Транспорт, не умеющий вложение, обязан отказать
+    (`MailAttachmentError`), а не отправить письмо без файла.
     """
 
-    def send(self, *, to: str, subject: str, body: str) -> None: ...
+    def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment] = (),
+    ) -> None: ...
 
 
 @dataclass
@@ -197,12 +220,31 @@ class SmtpTransport:
 
     transport_name: str = field(default=TRANSPORT_SMTP, init=False)
 
-    def send(self, *, to: str, subject: str, body: str) -> None:
+    def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment] = (),
+    ) -> None:
         message = EmailMessage()
         message["From"] = formataddr((self.sender, self.sender))
         message["To"] = to
         message["Subject"] = subject
         message.set_content(body)
+
+        # `add_attachment` (а не `set_content`) — имя файла и байты кодирует он:
+        # кириллическое имя уходит в RFC 2231, содержимое — в base64. Собрать
+        # это руками значило бы сломать разбор на стороне почтового клиента.
+        for filename, content, mime_type in attachments:
+            maintype, _, subtype = mime_type.partition("/")
+            message.add_attachment(
+                content,
+                maintype=maintype or "application",
+                subtype=subtype or "octet-stream",
+                filename=filename,
+            )
 
         address = f"{self.host}:{self.port}"
         try:
@@ -240,7 +282,23 @@ class ApiTransport:
 
     transport_name: str = field(default=TRANSPORT_API, init=False)
 
-    def send(self, *, to: str, subject: str, body: str) -> None:
+    def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment] = (),
+    ) -> None:
+        # Brevo принимает вложение отдельным полем со ссылкой на файл у себя,
+        # а не байтами в запросе. Пока этого нет — отказываем явно: письмо без
+        # конфига человек прочитает как потерянную покупку и не поймёт, что
+        # делать. Отказ видно сразу, тихое письмо — нет.
+        if attachments:
+            raise MailAttachmentError(
+                "api: транспорт не умеет вложение; письмо с файлом не отправлено"
+            )
+
         payload = {
             "sender": {"email": self.sender},
             "to": [{"email": to}],

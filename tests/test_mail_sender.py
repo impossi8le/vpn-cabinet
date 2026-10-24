@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import email
 import json
 import smtplib
+from email import policy
 
 import httpx
 import pytest
@@ -21,6 +23,7 @@ from fakes import FakeMailSender
 from cabinet.mail_sender import (
     ApiTransport,
     MailAddressError,
+    MailAttachmentError,
     MailConfigError,
     MailSender,
     MailSettings,
@@ -231,3 +234,183 @@ def test_api_transport_sends_brevo_shape_not_generic():
     # Заголовок именно `api-key`: с `Authorization: Bearer` Brevo отвечает 401.
     assert captured["headers"].get("api-key") == "key-123"
     assert "authorization" not in {k.lower() for k in captured["headers"]}
+
+
+# --- вложение в письме (#62) ---------------------------------------------
+#
+# Отдельная тема: после оплаты человеку без Telegram конфиг `.ovpn` должен
+# прийти **файлом**, а не ссылкой на страницу, куда из почтового клиента он не
+# войдёт. Здесь проверяется сам транспорт: умеет вложить файл так, чтобы он
+# пережил кодирование и разбор на стороне получателя.
+
+
+def _capture_smtp_message(monkey: pytest.MonkeyPatch) -> dict:
+    """Подменить `smtplib.SMTP` так, чтобы письмо оседало в памяти.
+
+    Возвращает словарь, куда `send_message` кладёт собранное `EmailMessage`:
+    дальше тест разбирает его так, как это сделал бы почтовый клиент.
+    """
+    captured: dict = {}
+
+    class FakeSmtp:
+        def __init__(self, host, port, timeout=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context=None):
+            pass
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, message):
+            captured["message"] = message
+
+    monkey.setattr(smtplib, "SMTP", FakeSmtp)
+    return captured
+
+
+def test_smtp_transport_attaches_file_that_survives_encoding():
+    """Вложение доезжает файлом: имя и байты переживают сборку и разбор.
+
+    Тест разбирает **собранное** письмо (`as_bytes` → `message_from_bytes`), а
+    не ищет слово в тексте: кириллическое имя уходит в отдельное кодирование,
+    содержимое — в base64, и «в письме есть имя» ничего не доказывает. Смотрим,
+    что после круга имя совпало и байты совпали.
+    """
+    content = b"\x00\xff\x10binary\x00ovpn"
+    filename = "конфиг клиента.ovpn"
+
+    transport = SmtpTransport(
+        host="smtp.example.com",
+        port=587,
+        user="user@example.com",
+        password="secret",
+        sender="cabinet@example.com",
+    )
+    monkey = pytest.MonkeyPatch()
+    captured = _capture_smtp_message(monkey)
+    try:
+        transport.send(
+            to="user@example.com",
+            subject="Оплата прошла",
+            body="Конфиг во вложении.",
+            attachments=[(filename, content, "application/x-openvpn-profile")],
+        )
+    finally:
+        monkey.undo()
+
+    parsed = email.message_from_bytes(captured["message"].as_bytes(), policy=policy.default)
+    # С вложением письмо перестаёт быть простым текстом — становится mixed.
+    assert parsed.get_content_type() == "multipart/mixed"
+
+    attachments = [part for part in parsed.walk() if part.get_content_disposition() == "attachment"]
+    assert len(attachments) == 1
+    part = attachments[0]
+    assert part.get_filename() == filename
+    assert part.get_content_type() == "application/x-openvpn-profile"
+    assert part.get_payload(decode=True) == content
+
+
+def test_smtp_transport_without_attachment_is_still_plain_text():
+    """Парный тест: без вложения письмо остаётся простым `text/plain`.
+
+    Иначе легко протащить сборку через `add_attachment` всегда и сломать
+    письмо с кодом входа — а заметят это только на живом входе.
+    """
+    transport = SmtpTransport(
+        host="smtp.example.com",
+        port=587,
+        user="user@example.com",
+        password="secret",
+        sender="cabinet@example.com",
+    )
+    monkey = pytest.MonkeyPatch()
+    captured = _capture_smtp_message(monkey)
+    try:
+        transport.send(to="user@example.com", subject="код", body="123456")
+    finally:
+        monkey.undo()
+
+    parsed = email.message_from_bytes(captured["message"].as_bytes(), policy=policy.default)
+    assert not parsed.is_multipart()
+    assert parsed.get_content_type() == "text/plain"
+    assert parsed.get_content().strip() == "123456"
+
+
+def test_api_transport_refuses_attachment_instead_of_dropping_it():
+    """Транспорт без поддержки вложений отказывает явно.
+
+    Молчаливое письмо без конфига человек прочитает как «покупка потерялась».
+    Отказ виден сразу; тихое письмо — нет. Поэтому запрос вообще не уходит.
+    """
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request)
+        return httpx.Response(201, json={"messageId": "1"})
+
+    transport = ApiTransport(
+        url="https://api.brevo.com/v3/smtp/email",
+        api_key="key-123",
+        sender="cabinet@example.com",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(MailAttachmentError):
+        transport.send(
+            to="user@example.com",
+            subject="Оплата прошла",
+            body="Конфиг во вложении.",
+            attachments=[("client.ovpn", b"data", "application/x-openvpn-profile")],
+        )
+    # Ничего не отправлено: отказ — до обращения к сервису.
+    assert requested == []
+
+
+def test_fake_mail_sender_remembers_attachments():
+    """Подставной отправитель запоминает вложение — тем же способом, что и
+    письмо. Тесты выше по течению (отправка конфига после оплаты) утверждают по
+    этому полю, что приложен именно файл, а не ссылка."""
+    mail = FakeMailSender()
+    attachment = ("client.ovpn", b"data\x00bytes", "application/x-openvpn-profile")
+
+    mail.send(
+        to="user@example.com",
+        subject="Оплата прошла",
+        body="Конфиг во вложении.",
+        attachments=[attachment],
+    )
+
+    sent = mail.sent_to("user@example.com")
+    assert sent[0]["attachments"] == [attachment]
+
+
+def test_fake_mail_sender_records_no_attachments_when_there_are_none():
+    """Парный тест: письмо без вложения даёт пустой список, а не отсутствие
+    поля — тест выше по течению читает `attachments` всегда."""
+    mail = FakeMailSender()
+    mail.send(to="user@example.com", subject="код", body="123456")
+    assert mail.sent_to("user@example.com")[0]["attachments"] == []
+
+
+def test_send_code_still_delivers_without_attachments():
+    """Вход не сломан: `send_code` по-прежнему доставляет код без вложения.
+    Письмо с кодом — единственный путь входа, и его нельзя задеть правкой
+    транспорта."""
+    mail = FakeMailSender()
+    sender = MailSender(sender="cabinet@example.com", transport=mail)
+
+    sender.send_code("user@example.com", code="654321")
+
+    sent = mail.sent_to("user@example.com")
+    assert len(sent) == 1
+    assert "654321" in sent[0]["body"]
+    assert sent[0]["attachments"] == []
