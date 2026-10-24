@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from cabinet.accounts import Account
+from cabinet.bot_client import Server, TrialEligibility
 from cabinet.bot_client import Subscription as ClientSubscription
 
 # Статус подписки. Контракт `/me` ещё не зафиксирован — это набор мока, который
@@ -125,6 +126,12 @@ class FakeApi:
     accounts: list[Account] = field(default_factory=list)
     subscriptions: list[FakeSubscription] = field(default_factory=list)
     configs: list[VpnConfig] = field(default_factory=list)
+    # Серверы для покупки (шаг 4). Список общий, не на аккаунт: бот отдаёт один
+    # набор на всех. Пусто по умолчанию — экран обязан честно показать «нет».
+    servers: list[Server] = field(default_factory=list)
+    # Ответы про право на триал, которые тест задаёт сам. Пусто — считается по
+    # общей логике (триал живёт на `chat_id`, как у бота).
+    trial_overrides: dict[int, TrialEligibility] = field(default_factory=dict)
     # Журнал вызовов: тест может утверждать, что кабинет ходил ровно туда,
     # куда должен, и не ходил лишний раз.
     calls: list[tuple[str, dict]] = field(default_factory=list)
@@ -338,6 +345,46 @@ class FakeApi:
         if config is None or not config.is_downloadable_by(subscription):
             return None
         return config
+
+    # --- покупка: серверы и право на триал (шаги 3–4) --------------------
+
+    def add_server(self, code: str, name: str) -> Server:
+        """Добавить сервер в набор — как `servers` в боте."""
+        self._log("add_server", code=code, server_name=name)
+        server = Server(code=code, name=name)
+        self.servers.append(server)
+        return server
+
+    def list_servers(self) -> list[Server]:
+        """Серверы для шага 4, в форме ответа бота (`GET /internal/servers`).
+
+        Возвращается тот же тип (`bot_client.Server`), что строит живой клиент:
+        иначе потребитель получал бы от мока форму, которой настоящий клиент не
+        делает, и связка «мок → экран» разошлась бы незаметно.
+        """
+        self._log("list_servers")
+        return list(self.servers)
+
+    def set_trial(self, account_id: int, *, eligible: bool, reason: str | None = None) -> None:
+        """Задать ответ про триал для аккаунта — как решил бы бот."""
+        self.trial_overrides[account_id] = TrialEligibility(eligible=eligible, reason=reason)
+
+    def trial_eligibility(self, account_id: int) -> TrialEligibility:
+        """Право на триал — ответ `GET /internal/accounts/{id}/trial-eligibility`.
+
+        Без заданного ответа повторяется логика бота: триал живёт на `chat_id`,
+        поэтому аккаунту без Telegram бот отвечает `telegram_required`, а не
+        «положен». Это не удобство мока, а условие тестов: разреши мок то, чего
+        живой бот не делает, и зелёный прогон перестал бы что-либо значить.
+        """
+        self._log("trial_eligibility", account_id=account_id)
+        override = self.trial_overrides.get(account_id)
+        if override is not None:
+            return override
+        account = self._by_id(account_id)
+        if account.chat_id is None:
+            return TrialEligibility(eligible=False, reason="telegram_required")
+        return TrialEligibility(eligible=True, reason=None)
 
 
 @dataclass
