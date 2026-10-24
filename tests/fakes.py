@@ -20,12 +20,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from cabinet.accounts import Account
 from cabinet.bot_client import Server, TrialEligibility
 from cabinet.bot_client import Subscription as ClientSubscription
+from cabinet.mail_sender import Attachment
 
 # Статус подписки. Контракт `/me` ещё не зафиксирован — это набор мока, который
 # закрепит W4.1. Пока он один на весь проект, чтобы тесты и фикстуры не
@@ -393,14 +395,33 @@ class FakeMailSender:
 
     Сознательно глуп: не генерирует коды и не считает попытки — это дело
     `auth_mail` (W2.2). Здесь только «письмо ушло» в виде записи в `outbox`.
+
+    Вложение запоминается тем же способом, что и остальное письмо: списком
+    кортежей `(имя, содержимое, mime-тип)` в поле `attachments` записи. Тест
+    выше по течению — отправка конфига после оплаты — утверждает по нему, что
+    приложен именно файл, а не ссылка.
     """
 
-    outbox: list[dict[str, str]] = field(default_factory=list)
+    outbox: list[dict[str, object]] = field(default_factory=list)
 
-    def send(self, *, to: str, subject: str, body: str) -> None:
-        self.outbox.append({"to": to, "subject": subject, "body": body})
+    def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Sequence[Attachment] = (),
+    ) -> None:
+        self.outbox.append(
+            {
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "attachments": list(attachments),
+            }
+        )
 
-    def sent_to(self, mail: str) -> list[dict[str, str]]:
+    def sent_to(self, mail: str) -> list[dict[str, object]]:
         return [message for message in self.outbox if message["to"] == mail]
 
 
