@@ -42,7 +42,7 @@ from cabinet.bot_client import (
     TelegramAuthClient,
 )
 from cabinet.mail_sender import MailConfigError, MailSender
-from cabinet.payments import build_payments
+from cabinet.payments import PUBLIC_BASE_ENV, build_payments
 
 # Интерфейс и порт по умолчанию. Порт — настройка развёртывания, поэтому
 # берётся из окружения; значение по умолчанию существует лишь чтобы
@@ -106,6 +106,11 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
         # подменяется выдуманным платежом: `build_payments` отдаёт отказывающую
         # заглушку, и экран оплаты честно говорит, что оплата недоступна.
         payments=build_payments(source),
+        # Публичный адрес кабинета — из него собирается адрес возврата для
+        # ссылки в сообщении бота (issue #52). Пустое значение здесь допустимо и
+        # не роняет запуск: кабинет без публичного адреса просто не предлагает
+        # боту ссылку, а человек вводит код руками, как раньше.
+        public_base=source.get(PUBLIC_BASE_ENV, "").strip(),
     )
 
 

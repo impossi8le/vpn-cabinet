@@ -599,6 +599,7 @@ def build_app(
     config_source: ConfigSource | None = None,
     telegram_auth: TelegramAuthClient | None = None,
     payments: Payments | None = None,
+    public_base: str = "",
 ) -> FastAPI:
     """Собрать приложение, приняв зависимости параметрами.
 
@@ -610,6 +611,10 @@ def build_app(
     Часы — тоже зависимость: экраны (сроки подписок, TTL сессии) зависят от
     «сейчас», и подать их снаружи — то же требование детерминированности, что в
     `sessions` и `subscriptions`.
+
+    `public_base` — публичный адрес кабинета (`CABINET_PUBLIC_BASE`), из него
+    собирается адрес возврата для ссылки в сообщении бота (issue #52). Пусто —
+    законное состояние локального запуска и стенда: тогда бот шлёт только код.
     """
     store = store if store is not None else _default_store()
     mail_sender = mail_sender if mail_sender is not None else _default_mail_sender()
@@ -697,6 +702,7 @@ def build_app(
         store=store,
         telegram_auth=telegram_auth,
         telegram_login=telegram_login,
+        public_base=public_base,
     )
     _add_subscription_routes(
         app,
@@ -729,6 +735,7 @@ def _add_login_routes(
     store: AccountStore,
     telegram_auth: TelegramAuthClient,
     telegram_login: TelegramLogin,
+    public_base: str = "",
 ) -> None:
     """Роуты входа: форма, запрос кода, ввод кода.
 
@@ -954,7 +961,14 @@ def _add_login_routes(
         """
         public_code, secret = public_code_and_secret()
         try:
-            link = telegram_auth.start_login(public_code, secret_hash(secret))
+            # Адрес возврата уходит боту вместе с кодом (§5.2): по нему бот
+            # соберёт ссылку, которая возвращает человека уже вошедшим (#52).
+            # Нет публичного адреса — поля нет, и бот шлёт только код.
+            link = telegram_auth.start_login(
+                public_code,
+                secret_hash(secret),
+                return_base=telegram_return_base(public_base),
+            )
         except BotUnreachable:
             # Бот не ответил — начать не удалось, и это не отказ человека.
             # Свой текст и **без** кнопки «Открыть Telegram»: ссылки нет.
@@ -1011,56 +1025,155 @@ def _add_login_routes(
         код, истёкший челлендж и недоступность сервиса требуют разных действий.
         Сессия не выдаётся ни на одном отказе, и ни один отказ не выходит 500.
         """
-        challenge = telegram_login.get(public_code)
-        if challenge is None:
-            # Челленджа нет: не начинали, он протух или кабинет перезапускался.
-            # Это обычное состояние старой вкладки, а не сбой сервера.
-            return HTMLResponse(render_login_telegram(error=LOGIN_TELEGRAM_NOT_STARTED))
+        return _telegram_finish(
+            request=request,
+            public_code=public_code,
+            device_nonce=code,
+            telegram_login=telegram_login,
+            telegram_auth=telegram_auth,
+            signin=signin,
+            sessions=sessions,
+            store=store,
+        )
 
-        try:
-            poll = telegram_auth.poll_login(public_code, challenge.secret, code.strip())
-        except BotUnreachable:
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
-        except BotError as exc:
-            return _telegram_retry(
-                challenge,
-                public_code,
-                LOGIN_TELEGRAM_POLL_ERRORS.get(exc.code, LOGIN_TELEGRAM_FAILED),
-            )
+    @app.get("/login/telegram/return", response_class=HTMLResponse)
+    def login_telegram_return(
+        request: Request,
+        public_code: str = Query(default=""),
+        nonce: str = Query(default=""),
+    ) -> Response:
+        """Завершить вход по ссылке из сообщения бота (§5.2, issue #52).
 
-        if poll.status == POLL_PENDING:
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_PENDING)
-        if poll.status == POLL_DENIED:
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_DENIED)
-        if poll.status != POLL_CONFIRMED or poll.account_id is None or poll.chat_id is None:
-            # `confirmed` без `account_id` — расхождение контракта (§5). Вывести
-            # аккаунт из `chat_id` здесь значило бы открыть вход в обход
-            # подтверждения ботом: `chat_id` в ответе есть, но кабинет ему не
-            # верит — он пользуется только `account_id`.
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+        Человек нажал ссылку в Telegram и вернулся в кабинет уже с кодом в
+        адресе: вводить его руками тут не нужно. Опрос бота и выдача сессии —
+        **тот же** путь, что у кнопки «Проверить вход» (`_telegram_finish`);
+        этот роут добавляет к нему только заголовки.
 
-        # Челлендж израсходован ботом (операция односторонняя) — свой гасим тем
-        # же движением, а не оставляем протухать.
-        telegram_login.forget(public_code)
-        try:
-            result = signin.sign_in_with_telegram(poll.chat_id, account_id=poll.account_id)
-        except BotUnreachable:
-            # Бот подтвердил вход, но аккаунт прочитать не удалось: сессии нет, и
-            # обещать её нельзя. Текст — про сервис, а не про код: код человек
-            # ввёл верно.
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
-        except SignInError:
-            # Расхождение состояния: бот назвал аккаунт, которого нет. Гасить
-            # нечего — сессии не было.
-            return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+        **Чего здесь быть не должно.** Никакой личности из адреса: `public_code`
+        и `nonce` — это код человека и его секрет, а не `chat_id` и не
+        `account_id`. Владельца сессии по-прежнему называет бот.
+        """
+        response = _telegram_finish(
+            request=request,
+            public_code=public_code,
+            device_nonce=nonce,
+            telegram_login=telegram_login,
+            telegram_auth=telegram_auth,
+            signin=signin,
+            sessions=sessions,
+            store=store,
+        )
+        # `nonce` в адресе — предъявительский токен: кто прочитал сообщение, тот
+        # и войдёт. `Referer` отдал бы адрес целиком следующему сайту, а кеш
+        # сохранил бы его на диске. Успех и отказ закрыты одинаково: адрес
+        # остаётся в строке браузера и после неудачного перехода.
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
-        # Шаг воронки: успешный вход через Telegram — тем же шагом, что вход по
-        # почте (issue #64): человек один, и способ входа воронку не раздваивает.
-        visitor, is_new = _visitor_of(request)
-        _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
-        response = RedirectResponse("/subscriptions", status_code=303)
-        _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+
+# Роут, который завершает вход по ссылке из сообщения бота (§5.2). Путь живёт
+# здесь, а не в разметке: тот же адрес кабинет отдаёт боту как `return_base`, и
+# две строки вместо одной разошлись бы при первой же правке.
+TELEGRAM_RETURN_PATH = "/login/telegram/return"
+
+
+def telegram_return_base(public_base: str) -> str | None:
+    """Адрес возврата для ссылки в сообщении бота или `None`, если адреса нет.
+
+    Собирает его кабинет, а не бот: `/login/telegram/return` — устройство
+    кабинета, и знать его боту незачем. Бот лишь дописывает к адресу
+    `public_code` и `nonce`.
+
+    Пустой ответ — не «ссылка на пустое место»: без публичного адреса бот
+    обязан прислать сообщение как раньше, с одним кодом. Поэтому `None`, а не
+    строка без начала или с относительным путём, который из Telegram никуда не
+    ведёт.
+    """
+    base = public_base.strip().rstrip("/")
+    return f"{base}{TELEGRAM_RETURN_PATH}" if base else None
+
+
+def _telegram_finish(
+    *,
+    request: Request,
+    public_code: str,
+    device_nonce: str,
+    telegram_login: TelegramLogin,
+    telegram_auth: TelegramAuthClient,
+    signin: SignInService,
+    sessions: SessionService,
+    store: AccountStore,
+) -> Response:
+    """Завершить челлендж входа: опрос бота и, на подтверждении, сессия кабинета.
+
+    Один путь на обе двери — кнопку «Проверить вход» (код приходит из формы) и
+    ссылку из сообщения бота (код приходит в адресе, §5.2). Разница только в
+    том, откуда взялся код человека; остальное — общий разбор, и второй его
+    копии быть не должно: копия разошлась бы с первой ровно там, где решается,
+    кому выдать сессию.
+
+    `account_id` приходит **только** отсюда — из ответа бота на опрос (§5). Ни
+    форма, ни адрес ссылки, ни `chat_id` в них на это не влияют: `chat_id`
+    передаётся в `sign_in_with_telegram` потому, что этого требует сигнатура, и
+    при заданном `account_id` не используется вовсе (см. `signin.py`). Если
+    `account_id` в ответе нет — отказ, а не догадка по `chat_id`.
+
+    Текст отказа выбирается по причине: ожидание, отказ человека, неверный код,
+    истёкший челлендж и недоступность сервиса требуют разных действий. Сессия не
+    выдаётся ни на одном отказе, и ни один отказ не выходит 500.
+    """
+    challenge = telegram_login.get(public_code)
+    if challenge is None:
+        # Челленджа нет: не начинали, он протух, кабинет перезапускался или
+        # ссылку открыл другой браузер. Это обычное состояние, а не сбой сервера.
+        return HTMLResponse(render_login_telegram(error=LOGIN_TELEGRAM_NOT_STARTED))
+
+    try:
+        poll = telegram_auth.poll_login(public_code, challenge.secret, device_nonce.strip())
+    except BotUnreachable:
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
+    except BotError as exc:
+        return _telegram_retry(
+            challenge,
+            public_code,
+            LOGIN_TELEGRAM_POLL_ERRORS.get(exc.code, LOGIN_TELEGRAM_FAILED),
+        )
+
+    if poll.status == POLL_PENDING:
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_PENDING)
+    if poll.status == POLL_DENIED:
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_DENIED)
+    if poll.status != POLL_CONFIRMED or poll.account_id is None or poll.chat_id is None:
+        # `confirmed` без `account_id` — расхождение контракта (§5). Вывести
+        # аккаунт из `chat_id` здесь значило бы открыть вход в обход
+        # подтверждения ботом: `chat_id` в ответе есть, но кабинет ему не
+        # верит — он пользуется только `account_id`.
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+
+    # Челлендж израсходован ботом (операция односторонняя) — свой гасим тем же
+    # движением, а не оставляем протухать. Отсюда же одноразовость ссылки:
+    # повторный переход по ней челленджа уже не найдёт.
+    telegram_login.forget(public_code)
+    try:
+        result = signin.sign_in_with_telegram(poll.chat_id, account_id=poll.account_id)
+    except BotUnreachable:
+        # Бот подтвердил вход, но аккаунт прочитать не удалось: сессии нет, и
+        # обещать её нельзя. Текст — про сервис, а не про код: код человек
+        # ввёл верно.
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_BOT_UNREACHABLE)
+    except SignInError:
+        # Расхождение состояния: бот назвал аккаунт, которого нет. Гасить
+        # нечего — сессии не было.
+        return _telegram_retry(challenge, public_code, LOGIN_TELEGRAM_FAILED)
+
+    # Шаг воронки: успешный вход через Telegram — тем же шагом, что вход по
+    # почте (issue #64): человек один, и способ входа воронку не раздваивает.
+    visitor, is_new = _visitor_of(request)
+    _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
+    response = RedirectResponse("/subscriptions", status_code=303)
+    _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
+    return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
 
 def _login_refusal(

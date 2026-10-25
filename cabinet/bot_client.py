@@ -1768,6 +1768,7 @@ class TelegramAuthClient:
         secret_hash_value: str,
         *,
         mode: str = AUTH_MODE_LOGIN,
+        return_base: str | None = None,
     ) -> LoginLink:
         """Начать челлендж: `public_code` + `secret_hash` (+ `mode`) → `deep_link`.
 
@@ -1780,14 +1781,21 @@ class TelegramAuthClient:
         `link` (привязка `chat_id` к существующему аккаунту без его создания,
         issue #65). Умолчание — `login`: вторая операция не должна подменять
         первую у вызывающих, которые о режиме не знают.
+
+        `return_base` — адрес роута возврата кабинета: с ним бот положит в
+        сообщение ещё и ссылку, по которой человек вернётся уже вошедшим (issue
+        #52). Не задан — поля в запросе нет вовсе, и сообщение остаётся прежним,
+        только с кодом: так ходит Android-клиент и так же ведёт себя кабинет,
+        у которого нет публичного адреса.
         """
-        return LoginLink.from_api(
-            self._request(
-                "POST",
-                AUTH_LINK_PATH,
-                json={"public_code": public_code, "secret_hash": secret_hash_value, "mode": mode},
-            )
-        )
+        body: dict[str, Any] = {
+            "public_code": public_code,
+            "secret_hash": secret_hash_value,
+            "mode": mode,
+        }
+        if return_base:
+            body["return_base"] = return_base
+        return LoginLink.from_api(self._request("POST", AUTH_LINK_PATH, json=body))
 
     def poll_login(self, public_code: str, secret: str, device_nonce: str) -> LoginPoll:
         """Опрос подтверждения: `public_code` + `secret` (+ код из Telegram).

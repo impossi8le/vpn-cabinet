@@ -661,12 +661,23 @@ class FakeTelegramAuth:
     _challenges: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
 
     def start_login(
-        self, public_code: str, secret_hash_value: str, *, mode: str = AUTH_MODE_LOGIN
+        self,
+        public_code: str,
+        secret_hash_value: str,
+        *,
+        mode: str = AUTH_MODE_LOGIN,
+        return_base: str | None = None,
     ) -> LoginLink:
-        """Начать челлендж: ссылка бота, режим — часть тела запроса, как в бою."""
-        self.link_calls.append(
-            {"public_code": public_code, "secret_hash": secret_hash_value, "mode": mode}
-        )
+        """Начать челлендж: ссылка бота, режим и адрес возврата — тело запроса.
+
+        `return_base` попадает в запись вызова только когда он есть — так же,
+        как его отправляет живой клиент: пустого поля в бою не бывает, и
+        заглушка не должна показывать тесту то, чего бот не получит.
+        """
+        call = {"public_code": public_code, "secret_hash": secret_hash_value, "mode": mode}
+        if return_base:
+            call["return_base"] = return_base
+        self.link_calls.append(call)
         self._challenges[public_code] = {"mode": mode, "decision": POLL_PENDING, "chat_id": None}
         prefix = "link" if mode == AUTH_MODE_LINK else "login"
         deep_link = self.deep_link_template.format(prefix=prefix, code=public_code)

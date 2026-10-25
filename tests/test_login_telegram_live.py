@@ -119,8 +119,13 @@ class FakePublicBot:
         return httpx.Response(200, json=decision)
 
 
-def _client(bot: FakePublicBot, api: FakeApi) -> TestClient:
-    """Приложение на подставных зависимостях и подставном публичном API бота."""
+def _client(bot: FakePublicBot, api: FakeApi, *, public_base: str = "") -> TestClient:
+    """Приложение на подставных зависимостях и подставном публичном API бота.
+
+    `public_base` — публичный адрес кабинета (`CABINET_PUBLIC_BASE`). Пусто по
+    умолчанию: у локального запуска и стенда его нет, и тогда кабинет не даёт
+    боту адрес возврата вовсе.
+    """
     transport = httpx.MockTransport(bot.handler)
     app = build_app(
         store=api,
@@ -130,6 +135,7 @@ def _client(bot: FakePublicBot, api: FakeApi) -> TestClient:
             base_url=BASE,
             client=httpx.Client(base_url=BASE, transport=transport),
         ),
+        public_base=public_base,
     )
     return TestClient(app, raise_server_exceptions=False)
 
@@ -657,3 +663,194 @@ def test_telegram_screen_offers_a_button_that_works_without_javascript() -> None
     assert render.TELEGRAM_VERIFY_ACTION in html
     assert 'name="public_code"' in html
     assert 'method="post"' in html
+
+
+# --- ссылка возврата: вход одним нажатием (issue #52) ----------------------
+
+
+def test_start_sends_the_cabinet_return_address() -> None:
+    """Кабинет отдаёт боту адрес возврата — из него бот собирает ссылку.
+
+    Адрес целиком собирает кабинет, а не бот: `/login/telegram/return` —
+    устройство кабинета, и знать его пути боту незачем. Бот лишь дописывает к
+    адресу `public_code` и `nonce`.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    client = _client(bot, api, public_base="https://cabinet.example")
+
+    client.get("/login/telegram")
+
+    assert bot.link_calls[0]["return_base"] == "https://cabinet.example/login/telegram/return"
+
+
+def test_start_sends_no_return_address_without_a_public_base() -> None:
+    """Нет публичного адреса — поля нет вовсе, а не пустая строка.
+
+    Пара к предыдущему: пустой `return_base` бот запомнил бы как «ссылка есть»,
+    и в сообщении оказался бы адрес, по которому кабинета нет. Тогда бот обязан
+    прислать только код — как было до этой правки.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    client = _client(bot, api)
+
+    client.get("/login/telegram")
+
+    assert "return_base" not in bot.link_calls[0]
+
+
+def test_return_link_signs_in_the_account_the_bot_named() -> None:
+    """Переход по ссылке приводит в кабинет уже вошедшим.
+
+    Главное свойство задачи: `nonce` из адреса уходит боту вместо кода, который
+    человек ввёл бы руками, и на экране подписок видно подписку **того** аккаунта,
+    которого назвал бот. Код при этом не вводится вовсе.
+    """
+    api = FakeApi()
+    account_id = _account_with_subscription(api)
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "confirmed", "account_id": account_id}]
+    client = _client(bot, api, public_base="https://cabinet.example")
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+
+    returned = client.get(
+        f"/login/telegram/return?public_code={public_code}&nonce=123456",
+        follow_redirects=False,
+    )
+
+    assert returned.status_code == 303
+    assert returned.headers["location"] == "/subscriptions"
+    # Номер операции ушёл боту как код человека — из адреса, а не откуда-то ещё.
+    assert bot.poll_calls[-1]["device_nonce"] == "123456"
+    token = returned.cookies.get(COOKIE_NAME)
+    assert token
+    assert client.app.state.sessions.resolve(token).account_id == account_id  # type: ignore[attr-defined]
+
+    subscriptions = client.get("/subscriptions")
+    assert SUB_NAME in subscriptions.text
+
+
+def test_return_link_keeps_the_nonce_out_of_referrer_and_cache() -> None:
+    """Адрес с `nonce` не утекает дальше: ни `Referer`-ом, ни через кеш.
+
+    `nonce` в строке адреса — предъявительский токен: кто прочитал сообщение, тот
+    и войдёт. Переход по внешней ссылке отдал бы его целиком заголовком
+    `Referer`, а сохранённый ответ оставил бы адрес на диске.
+    """
+    api = FakeApi()
+    account_id = _account_with_subscription(api)
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "confirmed", "account_id": account_id}]
+    client = _client(bot, api)
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+
+    response = client.get(
+        f"/login/telegram/return?public_code={public_code}&nonce=123456",
+        follow_redirects=False,
+    )
+
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_return_link_without_a_started_challenge_is_refused() -> None:
+    """Ссылка без начатого челленджа — отказ, а не 500 и не сессия.
+
+    Челлендж живёт в памяти процесса кабинета, поэтому ссылку мог открыть
+    другой браузер или она могла остаться с прошлого запуска. К боту в этом
+    случае не ходят: секрета челленджа нет, и опрашивать нечем.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    client = _client(bot, api)
+
+    response = client.get(
+        "/login/telegram/return?public_code=чужой-код&nonce=123456",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert app_module.LOGIN_TELEGRAM_NOT_STARTED in response.text
+    assert COOKIE_NAME not in response.cookies
+    assert bot.poll_calls == []
+
+
+def test_return_link_denied_in_telegram_does_not_sign_in() -> None:
+    """Отказ человека в Telegram по ссылке — тот же экран, что при вводе кода.
+
+    Отказ и «ещё не подтвердил» ведут к разным действиям, поэтому текст берётся
+    от причины, а не один на всё.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "denied"}]
+    client = _client(bot, api)
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+
+    response = client.get(
+        f"/login/telegram/return?public_code={public_code}&nonce=123456",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert app_module.LOGIN_TELEGRAM_DENIED in response.text
+    assert COOKIE_NAME not in response.cookies
+
+
+def test_return_link_with_a_wrong_nonce_is_refused() -> None:
+    """Несовпавший код бот отвергает — и сессии не будет.
+
+    Пара к успешному переходу: без неё кабинет зеленел бы и на коде, который
+    выдаёт сессию по любой ссылке, не спрашивая бота.
+    """
+    api = FakeApi()
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"error": ("nonce_mismatch", 409)}]
+    client = _client(bot, api)
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+
+    response = client.get(
+        f"/login/telegram/return?public_code={public_code}&nonce=000000",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert app_module.LOGIN_TELEGRAM_CODE_ERROR in response.text
+    assert COOKIE_NAME not in response.cookies
+
+
+def test_return_link_works_once() -> None:
+    """По одной ссылке дважды не войти: челлендж погашен первым входом.
+
+    Одноразовость операции держит бот, но кабинет не должен и пытаться:
+    повторный переход — отказ, а не вторая сессия. Пара к успеху: без неё
+    «вошёл» проверялось бы на ссылке, которая остаётся рабочей вечно.
+    """
+    api = FakeApi()
+    account_id = _account_with_subscription(api)
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "confirmed", "account_id": account_id}]
+    client = _client(bot, api)
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+    link = f"/login/telegram/return?public_code={public_code}&nonce=123456"
+
+    first = client.get(link, follow_redirects=False)
+    assert first.status_code == 303
+
+    client.cookies.clear()
+    second = client.get(link, follow_redirects=False)
+
+    assert second.status_code == 200
+    assert COOKIE_NAME not in second.cookies
+    assert app_module.LOGIN_TELEGRAM_NOT_STARTED in second.text
