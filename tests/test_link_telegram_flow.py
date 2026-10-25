@@ -55,6 +55,10 @@ MAIL = "user@example.com"
 # части имён ещё нет, и импорт уронил бы **весь файл** на сборе.
 _LINK_START = "/account/link/telegram"
 _LINK_VERIFY = "/account/link/telegram/verify"
+# Домен, с которым `TestClient` кладёт cookie из ответа. Подстановка без домена
+# оставила бы в банке **два** cookie сессии: сервер обновляет cookie при каждом
+# заходе (#53), и запрос ушёл бы с обоими — а сервер взял бы не тот.
+_COOKIE_DOMAIN = "testserver.local"
 DONE_TEXT = "Telegram привязан"
 TAKEN_TEXT = "Этот Telegram уже привязан к другому аккаунту"
 
@@ -138,7 +142,11 @@ def _client(bot: FakePublicBot, api: FakeApi) -> TestClient:
 def _signed_in_mail_only(client: TestClient, api: FakeApi) -> int:
     """Почтовый аккаунт — тот самый, которому привязка Telegram и нужна."""
     account = api.create_account(mail=MAIL, mail_verified_at=NOW)
-    client.cookies.set(COOKIE_NAME, client.app_state.sessions.sign_in(account.id).token)  # type: ignore[attr-defined]
+    client.cookies.set(
+        COOKIE_NAME,
+        client.app_state.sessions.sign_in(account.id).token,  # type: ignore[attr-defined]
+        domain=_COOKIE_DOMAIN,
+    )
     return account.id
 
 
@@ -302,7 +310,11 @@ def test_confirming_does_not_issue_a_session() -> None:
     fields["code"] = "123456"
     response = client.post(str(verify_form["action"]), data=fields, follow_redirects=False)
 
-    assert COOKIE_NAME not in response.cookies
+    # Нового токена привязка не выдаёт. Cookie в ответе есть — но с прежним
+    # значением: её обновляет продление при заходе (#53), а не подтверждение
+    # привязки. Проверяется именно значение: «нет Set-Cookie» отличило бы
+    # продление от новой сессии только потому, что продления раньше не было.
+    assert response.cookies.get(COOKIE_NAME) == before[COOKIE_NAME]
     assert dict(client.cookies) == before
 
 

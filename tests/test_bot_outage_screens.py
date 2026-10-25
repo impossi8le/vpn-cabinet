@@ -245,7 +245,11 @@ def _entered_over(
     """
     app = _app_over(bot, sender)
     client = TestClient(app, raise_server_exceptions=False)
-    client.cookies.set(COOKIE_NAME, app.state.sessions.sign_in(account_id).token)
+    client.cookies.set(
+        COOKIE_NAME,
+        app.state.sessions.sign_in(account_id).token,
+        domain="testserver.local",
+    )
     client.app_state = app.state  # type: ignore[attr-defined]
     return client
 
@@ -290,8 +294,12 @@ def test_subscriptions_screen_survives_a_bot_outage() -> None:
     assert response.status_code == 200
     assert SUBSCRIPTIONS_ERROR in response.text
     assert EMPTY_LIST_CARD not in response.text
-    # Отказной экран не трогает cookie сессии: гасят её только на «аккаунта нет».
-    assert "set-cookie" not in response.headers
+    # Сессию отказной экран не гасит: cookie приходит тем же значением и с
+    # живым сроком (обновление при заходе — #53, а не выход). Гасят её только
+    # на «аккаунта нет».
+    cookie_header = response.headers.get("set-cookie", "")
+    assert f"{COOKIE_NAME}=" in cookie_header
+    assert "max-age=0" not in cookie_header.lower()
     # Сессия жива — и в хранилище сессий, и на следующем запросе.
     assert client.app_state.sessions.resolve(token) is not None
     bot.offline.clear()

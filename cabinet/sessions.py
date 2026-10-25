@@ -41,6 +41,7 @@ from cabinet.accounts import Account
 
 __all__ = [
     "DEFAULT_SESSION_TTL",
+    "MAX_SESSION_LIFETIME",
     "MIN_TOKEN_BYTES",
     "AccountStore",
     "NoAccount",
@@ -61,8 +62,16 @@ __all__ = [
 # рубеже, где он и заходит; полгода этот случай закрывает, а угнанный токен
 # перестаёт работать сам, без действий человека. Срок не «вечный» ещё и потому,
 # что он **скользит** (`resolve`): живой сессии он продлевается на полный TTL от
-# последнего захода, но у забытой — истекает.
+# последнего захода, но у забытой — истекает. Скольжение при этом упирается в
+# `MAX_SESSION_LIFETIME`: безусловное продление жило бы дольше любого токена.
 DEFAULT_SESSION_TTL = timedelta(days=180)
+
+# Абсолютный горизонт сессии. Скользящий срок без потолка означал бы, что токен,
+# которым пользуются хотя бы раз в TTL, живёт **вечно**: продление уводило бы
+# `expires_at` вперёд без конца, и обещание «украденный токен перестаёт работать
+# сам» было бы неправдой (issue #53). Год заметно больше TTL, поэтому продление
+# горизонта не отменяет — вход повторяется раз в год, а не раз в полгода.
+MAX_SESSION_LIFETIME = timedelta(days=365)
 
 # Энтропия токена. 32 байта `secrets` — 256 бит; перебор невозможен, и значение
 # вынесено в константу, чтобы уступка здесь не прошла незамеченной: короткий
@@ -114,8 +123,21 @@ class SessionStore(Protocol):
     быть не должно.
     """
 
-    def create(self, *, account_id: int, token_hash: str, expires_at: datetime) -> Session:
-        """Записать сессию и вернуть строку, какой она легла в хранилище."""
+    def create(
+        self,
+        *,
+        account_id: int,
+        token_hash: str,
+        expires_at: datetime,
+        created_at: datetime,
+    ) -> Session:
+        """Записать сессию и вернуть строку, какой она легла в хранилище.
+
+        `created_at` — момент появления сессии, и он **не** сдвигается
+        продлением: от него считается абсолютный горизонт (`MAX_SESSION_LIFETIME`).
+        Если хранилище его не сохранит, у продления не останется потолка, и
+        токен, которым пользуются хотя бы раз в TTL, будет жить вечно (#53).
+        """
         ...
 
     def find(self, token_hash: str) -> Session | None:
@@ -152,13 +174,18 @@ class Session:
     `SessionService.resolve`, считая его от текущего момента. Разница важная —
     `last_seen_at` остаётся фактом «когда заходили», а срок отвечает на вопрос
     «до когда вход ещё действует», и это разные вещи. Забытая сессия (человек не
-    заходил дольше TTL) не продлевается и истекает сама: угнанный токен
-    перестаёт работать без действий человека.
+    заходил дольше TTL) не продлевается и истекает сама.
+
+    `created_at` — когда сессия появилась. Продлением он не сдвигается, и от
+    него считается абсолютный горизонт: без него продление уводило бы срок
+    вперёд без конца, и «угнанный токен перестаёт работать сам» оставалось бы
+    верным только для токена, которым не пользуются (#53).
     """
 
     token_hash: str
     account_id: int
     expires_at: datetime
+    created_at: datetime
     last_seen_at: datetime | None = None
 
 
@@ -217,12 +244,14 @@ class SessionService:
         store: SessionStore,
         accounts: AccountStore,
         ttl: timedelta = DEFAULT_SESSION_TTL,
+        max_lifetime: timedelta = MAX_SESSION_LIFETIME,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         token_factory: Callable[[], str] = new_token,
     ) -> None:
         self._store = store
         self._accounts = accounts
         self._ttl = ttl
+        self._max_lifetime = max_lifetime
         self._now = now
         self._new_token = token_factory
 
@@ -255,10 +284,12 @@ class SessionService:
             raise NoAccount(f"аккаунт {account_id} не найден")
 
         token = self._new_token()
+        moment = _as_utc(self._now())
         session = self._store.create(
             account_id=account_id,
             token_hash=hash_token(token),
-            expires_at=_as_utc(self._now()) + self._ttl,
+            expires_at=moment + self._ttl,
+            created_at=moment,
         )
         return SessionView(
             account_id=session.account_id,
@@ -290,6 +321,12 @@ class SessionService:
         воскрешает ни то, ни другое. Забытая сессия (человек не заходил дольше
         TTL) продления не получает и истекает сама.
 
+        Продление не безусловно: срок не уходит дальше горизонта
+        (`MAX_SESSION_LIFETIME`), отсчитанного от создания сессии. Без потолка
+        токен, которым пользуются хотя бы раз в TTL, жил бы вечно — и тогда
+        «угнанный токен перестаёт работать сам» было бы верно только для
+        токена, которым не пользуются (#53).
+
         Активность отмечается **после** проверки срока: запрос с истёкшим токеном
         активностью не является.
         """
@@ -306,7 +343,7 @@ class SessionService:
             self._store.revoke(token_hash)
             return None
 
-        expires_at = moment + self._ttl
+        expires_at = min(moment + self._ttl, _as_utc(session.created_at) + self._max_lifetime)
         self._store.touch(token_hash, moment=moment, expires_at=expires_at)
         return SessionView(
             account_id=session.account_id,
@@ -360,17 +397,33 @@ class SingleSessionStore:
 
     sessions: dict[str, Session] = field(default_factory=dict)
 
-    def create(self, *, account_id: int, token_hash: str, expires_at: datetime) -> Session:
+    def create(
+        self,
+        *,
+        account_id: int,
+        token_hash: str,
+        expires_at: datetime,
+        created_at: datetime,
+    ) -> Session:
         """Записать сессию.
 
         Повтор по тому же хешу — не «новая сессия», а коллизия источника токенов:
         токен, выданный дважды, означал бы, что второй человек получает доступ
         первого. Отказ, а не тихая перезапись — иначе сессию первого сменила бы
         сессия второго, и заметить это было бы негде.
+
+        `created_at` хранится рядом с `expires_at` и продлением не меняется:
+        это точка отсчёта абсолютного горизонта, и потерять её значит вернуть
+        бесконечное продление (#53).
         """
         if token_hash in self.sessions:
             raise SessionRefused("хеш токена уже занят: источник токенов выдал повтор")
-        session = Session(token_hash=token_hash, account_id=account_id, expires_at=expires_at)
+        session = Session(
+            token_hash=token_hash,
+            account_id=account_id,
+            expires_at=expires_at,
+            created_at=created_at,
+        )
         self.sessions[token_hash] = session
         return session
 

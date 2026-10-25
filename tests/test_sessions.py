@@ -19,6 +19,7 @@ import pytest
 from cabinet.accounts import Account
 from cabinet.sessions import (
     DEFAULT_SESSION_TTL,
+    MAX_SESSION_LIFETIME,
     MIN_TOKEN_BYTES,
     NoAccount,
     SessionRefused,
@@ -185,11 +186,19 @@ def test_naive_expiry_from_the_store_does_not_break_resolution(
     """
 
     class NaiveStore(SingleSessionStore):
-        def create(self, *, account_id: int, token_hash: str, expires_at: datetime):
+        def create(
+            self,
+            *,
+            account_id: int,
+            token_hash: str,
+            expires_at: datetime,
+            created_at: datetime,
+        ):
             return super().create(
                 account_id=account_id,
                 token_hash=token_hash,
                 expires_at=expires_at.replace(tzinfo=None),
+                created_at=created_at,
             )
 
     service = SessionService(store=NaiveStore(), accounts=fake_api, now=lambda: NOW)
@@ -369,6 +378,79 @@ def test_session_outlives_the_former_month_limit(fake_api: FakeApi, account_emai
     moment[0] = NOW + timedelta(days=60)
 
     assert service.resolve(view.token) is not None
+
+
+def test_renewal_stops_at_the_absolute_limit(fake_api: FakeApi, account_email_only: Account):
+    """Продление не уводит срок дальше абсолютного горизонта (#53).
+
+    Продление безусловно на каждом заходе, поэтому токен, которым пользуются
+    хотя бы раз в TTL, жил бы **бесконечно** — и обещание «украденный токен
+    перестаёт работать сам» было бы неправдой. Горизонт считается от момента
+    создания сессии и заходами не сдвигается.
+
+    Человек здесь заходит каждые двадцать дней, то есть продление работает, —
+    и всё равно упирается в потолок.
+    """
+    moment = [NOW]
+    store = SingleSessionStore()
+    service = SessionService(
+        store=store,
+        accounts=fake_api,
+        ttl=timedelta(days=30),
+        max_lifetime=timedelta(days=90),
+        now=lambda: moment[0],
+    )
+    view = service.sign_in(account_email_only.id)
+
+    for day in (20, 40, 60, 80):
+        moment[0] = NOW + timedelta(days=day)
+        assert service.resolve(view.token) is not None
+
+    session = store.find(hash_token(view.token))
+    assert session is not None
+    assert session.expires_at == NOW + timedelta(days=90)
+
+
+def test_session_ends_when_the_absolute_limit_passes(
+    fake_api: FakeApi, account_email_only: Account
+):
+    """За горизонтом сессия кончается — даже если человек заходил регулярно.
+
+    Пара к предыдущему: там срок упирается в потолок, здесь проверяется, что
+    потолок — действительно конец, а не «очень далёкая дата». Без этой пары
+    продление, не знающее про горизонт, выглядело бы работающим: в момент
+    захода сессия ещё жива по TTL, и «конец» наступил бы только через десятки
+    дней.
+
+    Человек заходит каждые двадцать дней, и до восьмидесятого дня сессия жива —
+    то есть упирается именно в горизонт, а не в TTL. Следующий заход за
+    горизонтом обязан не пустить; без горизонта продление ушло бы за него
+    вместе с заходом, и эта проверка краснеет.
+    """
+    moment = [NOW]
+    store = SingleSessionStore()
+    service = SessionService(
+        store=store,
+        accounts=fake_api,
+        ttl=timedelta(days=30),
+        max_lifetime=timedelta(days=90),
+        now=lambda: moment[0],
+    )
+    view = service.sign_in(account_email_only.id)
+
+    for day in (20, 40, 60, 80):
+        moment[0] = NOW + timedelta(days=day)
+        assert service.resolve(view.token) is not None
+
+    moment[0] = NOW + timedelta(days=95)
+
+    assert service.resolve(view.token) is None
+    assert store.sessions == {}
+
+
+def test_absolute_limit_is_longer_than_the_sliding_ttl():
+    """Горизонт не короче TTL — иначе он отменял бы продление целиком."""
+    assert MAX_SESSION_LIFETIME > DEFAULT_SESSION_TTL
 
 
 def test_resolution_does_not_extend_an_expired_session(

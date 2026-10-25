@@ -50,6 +50,10 @@ NEW_MAIL = "new@example.com"
 _CONFIRM_PATH = "/account/link/mail/confirm"
 LINKED_TEXT = "Почта привязана"
 _COOKIE = "cabinet_session"
+# Домен, с которым `TestClient` кладёт cookie из ответа. Подстановка без домена
+# оставила бы в банке **два** cookie сессии: сервер обновляет cookie при каждом
+# заходе (#53), и запрос ушёл бы с обоими — а сервер взял бы не тот.
+_COOKIE_DOMAIN = "testserver.local"
 
 
 @pytest.fixture
@@ -83,7 +87,11 @@ def _signed_in_telegram_only(client: TestClient, fake_api: FakeApi) -> Account:
     по сессии.
     """
     account = fake_api.create_account(chat_id=CHAT_ID)
-    client.cookies.set(_COOKIE, client.app_state.sessions.sign_in(account.id).token)  # type: ignore[attr-defined]
+    client.cookies.set(
+        _COOKIE,
+        client.app_state.sessions.sign_in(account.id).token,  # type: ignore[attr-defined]
+        domain=_COOKIE_DOMAIN,
+    )
     return account
 
 
@@ -261,7 +269,11 @@ def test_confirming_does_not_overwrite_an_existing_address(
     account = fake_api.create_account(
         chat_id=CHAT_ID, mail="first@example.com", mail_verified_at=NOW
     )
-    client.cookies.set(_COOKIE, client.app_state.sessions.sign_in(account.id).token)  # type: ignore[attr-defined]
+    client.cookies.set(
+        _COOKIE,
+        client.app_state.sessions.sign_in(account.id).token,  # type: ignore[attr-defined]
+        domain=_COOKIE_DOMAIN,
+    )
     code = _code_for(client, sender, NEW_MAIL)
 
     response = _confirm(client, NEW_MAIL, code)
@@ -381,7 +393,11 @@ def test_pending_code_address_is_not_shown_to_another_account(
     _code_for(client, sender, NEW_MAIL)
 
     other = fake_api.create_account(chat_id=OTHER_CHAT_ID)
-    client.cookies.set(_COOKIE, client.app_state.sessions.sign_in(other.id).token)  # type: ignore[attr-defined]
+    client.cookies.set(
+        _COOKIE,
+        client.app_state.sessions.sign_in(other.id).token,  # type: ignore[attr-defined]
+        domain=_COOKIE_DOMAIN,
+    )
 
     html = client.get("/account").text
 

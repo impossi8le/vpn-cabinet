@@ -168,6 +168,48 @@ def test_session_cookie_outlives_the_browser(
     assert f"max-age={int(DEFAULT_SESSION_TTL.total_seconds())}" in header
 
 
+def test_visit_renews_the_session_cookie(
+    client: TestClient, fake_mail_sender: FakeMailSender
+) -> None:
+    """Заход обновляет cookie сессии — вместе с серверным продлением (#53).
+
+    Серверная запись продлевается при каждом успешном заходе, а cookie,
+    выпущенная один раз при входе, несла бы прежний `Max-Age`. Тогда активного
+    человека выбрасывало бы из кабинета ровно через TTL от **первого** входа —
+    то есть ровно то, что продление и должно отменять. Проверяются обе
+    половины: cookie приходит заново и токен в ней тот же — это продление, а
+    не вторая сессия.
+
+    Пара — тест ниже: заход **без** сессии cookie не заводит.
+    """
+    client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    code = _code_from(fake_mail_sender)
+    signed_in = client.post(
+        "/login/waiting", data={"mail": MAIL, "code": code}, follow_redirects=False
+    )
+    token = signed_in.cookies.get(COOKIE_NAME)
+    assert token
+
+    response = client.get("/subscriptions", follow_redirects=False)
+
+    header = response.headers.get("set-cookie", "")
+    assert header.startswith(f"{COOKIE_NAME}=")
+    assert f"max-age={int(DEFAULT_SESSION_TTL.total_seconds())}" in header.lower()
+    assert response.cookies.get(COOKIE_NAME) == token
+
+
+def test_page_without_a_session_sets_no_session_cookie(client: TestClient) -> None:
+    """Без сессии обновлять нечего — cookie не заводится.
+
+    Пара к предыдущему: иначе он зеленел бы и на коде, который штампует cookie
+    каждому зашедшему, включая того, кто ещё не входил.
+    """
+    response = client.get("/subscriptions", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert COOKIE_NAME not in response.headers.get("set-cookie", "")
+
+
 def test_wrong_code_keeps_you_on_the_waiting_screen(
     client: TestClient, fake_mail_sender: FakeMailSender
 ) -> None:

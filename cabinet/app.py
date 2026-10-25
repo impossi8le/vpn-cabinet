@@ -27,7 +27,10 @@
   на запись в хранилище. Долгая cookie — долгий доступ, поэтому она не отменяет
   ничего из своего же устройства: срок **скользит** (`SessionService.resolve`
   продлевает живую сессию), истекает у забытой, а `HttpOnly` и `SameSite` держат
-  токен вне JS и вне сторонних POST.
+  токен вне JS и вне сторонних POST. Cookie выпускается заново при каждом
+  заходе — одним middleware на всё приложение: продление, записанное только в
+  хранилище, оставляло бы в браузере прежний срок, и активного человека
+  выбрасывало бы через TTL от первого входа (issue #53).
 
 Границ сервиса это не пересекает: кабинет по-прежнему не ходит в базу
 (CLAUDE.md), а говорит с хранилищем через те же протоколы, что и модули.
@@ -665,6 +668,28 @@ def build_app(
     app.state.telegram_login = telegram_login
     app.state.payments = payments
 
+    # Cookie сессии живёт ровно столько, сколько её серверная запись, а запись
+    # продлевается при каждом заходе (`SessionService.resolve`). Cookie же,
+    # выпущенная один раз при входе, несла бы прежний `Max-Age` — и активного
+    # человека выбрасывало бы через TTL от **первого** входа, то есть ровно то,
+    # что продление и отменяет (issue #53).
+    #
+    # Обновление стоит здесь, а не в роутах: в каждом из них это была бы копия,
+    # которую однажды забудут приписать новому экрану. Ответ, который сам решает
+    # судьбу cookie (вход выдаёт новую, выход гасит), не трогаем — иначе
+    # продление затирало бы только что выданный токен.
+    @app.middleware("http")
+    async def _renew_session_cookie(request: Request, call_next):
+        response = await call_next(request)
+        token = request.cookies.get(COOKIE_NAME)
+        if not token or _answers_with_session_cookie(response):
+            return response
+
+        view = sessions.resolve(token)
+        if view is not None:
+            _set_session_cookie(response, view.token, max_age=sessions.ttl)
+        return response
+
     _add_login_routes(
         app,
         signin=signin,
@@ -1166,6 +1191,18 @@ def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -
         httponly=True,
         samesite="lax",
         path="/",
+    )
+
+
+def _answers_with_session_cookie(response: Response) -> bool:
+    """Ответ сам распорядился cookie сессии: выдал новую при входе или погасил
+    при выходе.
+
+    Переписывать такую cookie поверх нельзя: при входе это подменило бы только
+    что выданный токен прежним, а при выходе — вернуло бы удалённую сессию.
+    """
+    return any(
+        header.startswith(f"{COOKIE_NAME}=") for header in response.headers.getlist("set-cookie")
     )
 
 
