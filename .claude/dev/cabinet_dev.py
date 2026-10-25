@@ -26,6 +26,12 @@
 руками. Проверено на потоке привязки почты: экран, запрос кода, ввод, отказ по
 подменённому адресу.
 
+Вход через Telegram тоже проходит целиком: подтверждение в «боте»
+(`/dev/tg-confirm`), возврат на подписки и ссылка возврата §5.2. Для этого
+подставной бот стенда называет аккаунт, как живой (`StandTelegramAuth`). Голая
+заглушка из `tests.fakes` этого не делала, и вход обрывался на «Не удалось
+проверить вход» (#66) — стенд показывал отказ там, где живой кабинет пускает.
+
 Стенд сеет ещё и серверы для покупки (шаги 3–4): `/buy/confirm` покажет право на
 триал от подставного бота, `/buy/servers` — список и выбор серверов. Право на
 триал подставной бот считает как живой: у аккаунта без Telegram — `telegram_required`,
@@ -37,6 +43,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,9 +59,10 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 
 from cabinet.app import COOKIE_NAME, DEFAULT_SENDER, build_app  # noqa: E402
+from cabinet.bot_client import AUTH_MODE_LOGIN, POLL_CONFIRMED, LoginPoll  # noqa: E402
 from cabinet.mail_sender import Attachment, MailSender  # noqa: E402
 from cabinet.payments import Payment  # noqa: E402
-from tests.fakes import FakeApi, FakeTelegramAuth  # noqa: E402
+from tests.fakes import STATUS_ACTIVE, FakeApi, FakeTelegramAuth  # noqa: E402
 
 PORT = 8111
 
@@ -129,6 +137,68 @@ class PrintingMail:
         )
 
 
+# `chat_id`, которым стенд изображает подтверждённый Telegram. Совпадает с
+# посеянным аккаунтом: вход обязан приводить туда, где человек видит свои
+# данные, а не в свежезаведённый пустой.
+STAND_CHAT_ID = 111_222_333
+
+
+@dataclass
+class StandTelegramAuth(FakeTelegramAuth):
+    """Подставной бот стенда: на подтверждении **входа** называет аккаунт.
+
+    Живой бот на `/auth/poll` в режиме `login` находит или заводит аккаунт для
+    подтверждённого `chat_id` и отдаёт `account_id` рядом с ним (§5 контракта).
+    Без `account_id` кабинет **правильно** отказывает: личность называет только
+    бот, и выводить её из `chat_id` он не вправе (§3.3).
+
+    Заглушка из `tests.fakes` отдаёт один `chat_id` — этого хватает привязке, где
+    аккаунт уже есть. Из-за этого вход через Telegram на стенде не проходил
+    вовсе: человек доходил до «Не удалось проверить вход» (#66), и глазами не
+    проверялся ни он, ни возврат по ссылке (#52).
+
+    Режим `link` не трогаем: привязка `account_id` получать не должна — иначе
+    кабинет вывел бы вход из подтверждения привязки.
+    """
+
+    accounts: FakeApi | None = None
+    # Telegram для режима привязки — ничей. Вход подтверждает владелец посеянного
+    # аккаунта (`STAND_CHAT_ID`), а привязка — «другой Telegram»: возьми стенд один
+    # и тот же, привязка всегда упиралась бы в занятое место, и живой прогон
+    # показывал бы отказ там, где настоящий человек привязывает. Это нашлось
+    # прогоном в браузере, после того как вход научили называть аккаунт.
+    link_chat_id: int = 555_000_111
+
+    def confirm(self, public_code: str, *, chat_id: int | None = None) -> None:
+        """«Человек нажал кнопку в Telegram» — в стенде за него это делает роут.
+
+        Кто именно нажал, зависит от операции: при входе — владелец аккаунта с
+        этим `chat_id`, при привязке — свободный Telegram.
+        """
+        chosen = chat_id or (
+            STAND_CHAT_ID if self._mode_of(public_code) == AUTH_MODE_LOGIN else self.link_chat_id
+        )
+        super().confirm(public_code, chat_id=chosen)
+
+    def poll_login(self, public_code: str, secret: str, device_nonce: str) -> LoginPoll:
+        poll = super().poll_login(public_code, secret, device_nonce)
+        if self.accounts is None or poll.status != POLL_CONFIRMED or poll.chat_id is None:
+            return poll
+        if self._mode_of(public_code) != AUTH_MODE_LOGIN:
+            return poll
+
+        account = self.accounts.find_by_chat_id(poll.chat_id) or self.accounts.create_account(
+            chat_id=poll.chat_id
+        )
+        return LoginPoll(status=poll.status, chat_id=poll.chat_id, account_id=account.id)
+
+    def _mode_of(self, public_code: str) -> str:
+        """Режим начатого челленджа. Забытый считаем входом: так его начинает
+        `GET /login/telegram`, а привязка всегда называет режим сама."""
+        state = self._challenges.get(public_code)
+        return str(state["mode"]) if state else AUTH_MODE_LOGIN
+
+
 def seeded_api() -> FakeApi:
     """Три состояния аккаунта из §4–5 спеки — по одному на каждый путь экрана."""
     api = FakeApi()
@@ -142,6 +212,16 @@ def seeded_api() -> FakeApi:
         ("только почта — привязываем Telegram", mail_only),
     ):
         print(f"аккаунт {account.id}: {label}", flush=True)
+
+    # Подписка аккаунта с Telegram: после входа через Telegram человек обязан
+    # увидеть **своё**, а не пустой список — иначе прогон не отличает «вход
+    # прошёл» от «вход прошёл, но не туда».
+    api.add_subscription(
+        telegram_only.id,
+        name="Нидерланды · Амстердам",
+        status=STATUS_ACTIVE,
+        expires_at=datetime(2026, 11, 22, 12, 0, tzinfo=UTC),
+    )
 
     # Серверы для шага 4 покупки. Имена — отображаемые (их видит человек), коды —
     # идентификаторы; адресов и хостов здесь быть не может (репозиторий публичный).
@@ -160,9 +240,16 @@ def build() -> FastAPI:
     # Подставной публичный API бота: флоу привязки/входа идёт на стенде без
     # живого Telegram. Ссылку ведём на страницу стенда `/dev/tg/{code}`, где
     # «нажатие кнопки в Telegram» имитирует отдельный служебный роут.
-    telegram_auth = FakeTelegramAuth(deep_link_template=f"http://127.0.0.1:{PORT}/dev/tg/{{code}}")
+    api = seeded_api()
+    # `StandTelegramAuth`, а не голый `FakeTelegramAuth`: входу нужен `account_id`
+    # — живой бот его отдаёт, и без него кабинет отказывает (#66).
+    telegram_auth = StandTelegramAuth(
+        accounts=api,
+        chat_id=STAND_CHAT_ID,
+        deep_link_template=f"http://127.0.0.1:{PORT}/dev/tg/{{code}}",
+    )
     app = build_app(
-        store=seeded_api(),
+        store=api,
         mail_sender=MailSender(sender=DEFAULT_SENDER, transport=PrintingMail()),
         payments=payments,
         telegram_auth=telegram_auth,

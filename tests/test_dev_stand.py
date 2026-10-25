@@ -211,3 +211,75 @@ def test_stand_fake_bot_matches_the_real_client_shape() -> None:
     assert problems == []
     # И обратная сторона: `mode` у старта — часть формы, а не украшение.
     assert "mode" in inspect.signature(FakeTelegramAuth.start_login).parameters
+
+
+def test_stand_bot_answers_a_login_confirmation_with_the_account_id() -> None:
+    """Подтверждение входа на стенде называет аккаунт — как это делает живой бот.
+
+    Живой бот находит или заводит аккаунт для подтверждённого `chat_id` и
+    возвращает `account_id` рядом с ним (§5 контракта). Без `account_id` кабинет
+    отказывает — и правильно: личность называет только бот.
+
+    Отсутствие его у заглушки и делало вход через Telegram на стенде
+    непроходимым: человек доходил до «Не удалось проверить вход» (#66), а вместе
+    с ним глазами не проверялся и возврат по ссылке (#52).
+
+    Второе утверждение — про **тот** аккаунт: вход обязан приводить туда, где
+    человек видит свои данные, а не в свежезаведённый пустой. `chat_id` заглушки
+    раньше не совпадал ни с одним посеянным аккаунтом.
+    """
+    stand = _stand()
+    app = stand.build()
+    bot = app.state.telegram_auth  # type: ignore[attr-defined]
+
+    bot.start_login("code-login", "hash")  # режим входа — по умолчанию
+    bot.confirm("code-login")
+    poll = bot.poll_login("code-login", "secret", "123456")
+
+    assert poll.status == "confirmed"
+    assert poll.account_id is not None
+    seeded = {account.id: account for account in app.state.store.accounts}  # type: ignore[attr-defined]
+    assert poll.account_id in seeded, "вход ведёт в посеянный аккаунт, а не в пустой"
+    assert seeded[poll.account_id].chat_id == poll.chat_id
+
+
+def test_stand_link_confirms_with_a_free_telegram() -> None:
+    """Привязка на стенде подтверждается **свободным** Telegram, а вход — нет.
+
+    Вход подтверждает владелец посеянного аккаунта: иначе кабинет не показал бы
+    свои подписки. Привязка — другой Telegram, ничей: возьми стенд занятый
+    `chat_id`, и привязка всегда упиралась бы в «Этот Telegram уже привязан к
+    другому аккаунту» — ровно это и показал живой прогон, после того как вход
+    научили называть аккаунт (#66).
+    """
+    stand = _stand()
+    app = stand.build()
+    bot = app.state.telegram_auth  # type: ignore[attr-defined]
+    store = app.state.store  # type: ignore[attr-defined]
+
+    bot.start_login("code-link", "hash", mode="link")
+    bot.confirm("code-link")
+    poll = bot.poll_login("code-link", "secret", "123456")
+
+    assert poll.chat_id is not None
+    assert store.find_by_chat_id(poll.chat_id) is None, "привязке нужен свободный Telegram"
+
+
+def test_stand_bot_keeps_the_link_mode_free_of_an_account_id() -> None:
+    """А в режиме привязки `account_id` не появляется — даже на стенде.
+
+    Живой бот в режиме `link` возвращает только `chat_id`: привязка не создаёт
+    аккаунт и не выдаёт сессию. Отдай заглушка `account_id` всем подряд — кабинет
+    вывел бы вход из подтверждения привязки, то есть ровно то, от чего сторожит
+    `test_confirming_does_not_issue_a_session`.
+    """
+    stand = _stand()
+    app = stand.build()
+    bot = app.state.telegram_auth  # type: ignore[attr-defined]
+
+    bot.start_login("code-link", "hash", mode="link")
+    bot.confirm("code-link")
+    poll = bot.poll_login("code-link", "secret", "123456")
+
+    assert poll.status == "confirmed"
+    assert poll.account_id is None
