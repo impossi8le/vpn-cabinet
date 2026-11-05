@@ -886,6 +886,10 @@ def render_buy_confirm(
         devices_label=_pluralize_devices(devices),
         total=_rubles(quote_.final_price),
         total_url=f"{BUY_SERVERS_URL}?days={days}&devices={devices}{suffix}",
+        # Куда идти, когда бесплатного пути не будет: сразу к оплате этого же
+        # срока. Серверы человек выберет там же, на шаге оплаты, — гонять его
+        # через шаг выбора ради кнопки, которая всё равно откажет, незачем.
+        pay_url=f"{BUY_PAY_URL}?days={days}&devices={devices}",
         microcopy=CONFIRM_MICROCOPY,
         back_url=f"/buy?days={days}&devices={devices}",
         **_trial_context(trial, unreachable=trial_unreachable),

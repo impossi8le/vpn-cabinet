@@ -191,10 +191,57 @@ def test_unreachable_bot_is_its_own_state_not_a_refusal() -> None:
 
 
 def test_confirm_button_leads_to_server_selection() -> None:
-    """Кнопка подтверждения ведёт на шаг 4 с той же парой — выбор выражен адресом."""
-    html = _mail_account(FakeApi()).get("/buy/confirm?days=90&devices=2").text
+    """Кнопка подтверждения ведёт на шаг 4 с той же парой — выбор выражен адресом.
+
+    Аккаунт здесь **с Telegram и правом на триал**: именно на этом пути шаг 4
+    осмыслен (серверы → бесплатная выдача). Почтовый аккаунт без Telegram триала
+    не имеет, и там кнопка ведёт к оплате — это проверяет соседний тест.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=555_000_555)
+    api.set_trial(account.id, eligible=True)
+
+    html = _client_for(api, account.id).get("/buy/confirm?days=90&devices=2").text
 
     assert 'href="/buy/servers?days=90&amp;devices=2"' in html
+
+
+def test_confirm_does_not_lead_into_the_dead_end_when_trial_is_refused() -> None:
+    """Триала нет — кнопка ведёт к оплате, а не в тупик выбора серверов.
+
+    Владелец прошёл этот путь целиком: экран говорил «Пробный период недоступен»,
+    кнопка звала «Выбрать серверы», он выбирал сервер, нажимал «Получить
+    бесплатно» — и получал «Бесплатный доступ недоступен» с советом «Выбрать
+    тариф», то есть на шаг назад. Каждый шаг был честным по отдельности, а путь
+    вёл в никуда.
+
+    Теперь при отказе кнопка сразу называет то, что человеку и предстоит: выбор
+    серверов никуда не денется, но он уже часть оплаты.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=555_000_333)
+    api.set_trial(account.id, eligible=False, reason="trial_used_by_chat_id")
+
+    html = _client_for(api, account.id).get("/buy/confirm?days=30&devices=1").text
+
+    assert 'href="/buy/pay?days=30&amp;devices=1"' in html
+    assert "Продолжить за" in html
+    assert 'href="/buy/servers?days=30&amp;devices=1"' not in html
+
+
+def test_confirm_still_leads_to_servers_when_trial_is_available() -> None:
+    """А когда триал есть — прежний путь: серверы, потом бесплатная выдача.
+
+    Пара к предыдущему: иначе он зеленел бы и на экране, где кнопка всегда ведёт
+    к оплате, и человек с правом на бесплатный доступ платил бы по ошибке.
+    """
+    api = FakeApi()
+    account = api.create_account(chat_id=555_000_444)
+    api.set_trial(account.id, eligible=True)
+
+    html = _client_for(api, account.id).get("/buy/confirm?days=30&devices=1").text
+
+    assert 'href="/buy/servers?days=30&amp;devices=1"' in html
 
 
 def test_confirm_screen_renders_through_the_real_route() -> None:
