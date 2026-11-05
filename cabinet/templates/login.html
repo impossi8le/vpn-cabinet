@@ -32,9 +32,14 @@
   </div>
 
   <form method="post" action="{{ form_action }}">
-    <label class="field-label" for="mail">Почта</label>
-    <input class="field" id="mail" name="mail" type="email" inputmode="email"
-           autocomplete="email" required value="{{ mail or '' }}">
+    {# Подсказка внутри поля — не украшение. Поле с тонкой рамкой на тёмном фоне
+       и без текста внутри читается как декоративный блок: владелец кабинета
+       искал вход по почте и не находил его на этом же экране. Плейсхолдер
+       делает поле узнаваемым с первого взгляда. #}
+    <label class="field-label" for="mail">Почта для входа</label>
+    <input class="field field-mail" id="mail" name="mail" type="email" inputmode="email"
+           autocomplete="email" required placeholder="you@example.com"
+           value="{{ mail or '' }}">
     {# Адрес отвергнут (пустой, или занят другим аккаунтом). Тон — общий для
        ошибок ввода, а не красный: см. login_waiting.html про смысл цвета. #}
     {% if retry_after %}

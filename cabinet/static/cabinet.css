@@ -121,6 +121,14 @@ a.btn { text-decoration: none; }
   border: 0.5px solid var(--edge); border-radius: var(--radius-button);
   padding: 0 14px; text-align: center;
 }
+/* Поле почты — не поле кода. Базовый `.field` сделан под шесть цифр:
+   моноширинный шрифт, разрядка 0.35em и текст по центру. Для адреса это
+   неверно вдвойне: разреженный текст по центру читается плохо, а пустое поле
+   выглядит декоративным блоком — вход по почте на этом экране искали и не
+   находили. */
+.field-mail {
+  font-family: inherit; font-size: 16px; letter-spacing: normal; text-align: left;
+}
 .field:focus { outline: none; border-color: var(--ice); }
 .field.is-busy { border-color: var(--amber); }
 

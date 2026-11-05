@@ -94,6 +94,23 @@ def test_login_does_not_make_telegram_compulsory(login_html: str) -> None:
     assert 'class="btn btn-p"' in login_html  # белая кнопка остаётся у почты
 
 
+def test_mail_field_looks_like_a_field_not_like_a_code_box(login_html: str) -> None:
+    """Поле почты узнаётся как поле ввода — и текстом, и стилем.
+
+    Владелец кабинета искал вход по почте на этом самом экране и не находил:
+    поле было сделано общим классом `.field`, то есть под шесть цифр —
+    моноширинный шрифт, разрядка 0.35em, текст по центру. Пустое, с тонкой
+    рамкой, оно читалось как декоративный блок.
+
+    Утверждений три, и все обязательны: подсказка внутри поля (что вводить),
+    отдельный класс стиля (чтобы не вернуться к разрядке кода) и подпись,
+    называющая, что это почта для входа.
+    """
+    assert 'placeholder="you@example.com"' in login_html
+    assert "field-mail" in login_html
+    assert "Почта для входа" in login_html
+
+
 def test_login_keeps_entered_mail_on_error() -> None:
     """Отвергнутый адрес возвращается в поле, а не сбрасывается.
 
