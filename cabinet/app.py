@@ -113,7 +113,7 @@ from cabinet.render import (
     render_subscriptions,
     trial_refusal_note,
 )
-from cabinet.sessions import SessionService, SessionView, SingleSessionStore
+from cabinet.sessions import SessionService, SessionStore, SessionView, SingleSessionStore
 from cabinet.signin import MailSignInError, SignInError, SignInService
 from cabinet.subscriptions import SubscriptionView, subscription_views
 from cabinet.theme import Tone
@@ -603,6 +603,7 @@ def build_app(
     telegram_auth: TelegramAuthClient | None = None,
     payments: Payments | None = None,
     public_base: str = "",
+    session_store: SessionStore | None = None,
 ) -> FastAPI:
     """Собрать приложение, приняв зависимости параметрами.
 
@@ -618,6 +619,14 @@ def build_app(
     `public_base` — публичный адрес кабинета (`CABINET_PUBLIC_BASE`), из него
     собирается адрес возврата для ссылки в сообщении бота (issue #52). Пусто —
     законное состояние локального запуска и стенда: тогда бот шлёт только код.
+
+    `session_store` — хранилище сессий. Умолчание (`SingleSessionStore`) —
+    память процесса: так собирают приложение тесты и стенд, и это то состояние,
+    в котором вход **не** переживает перезапуск. Боевую форму (`BotSessionStore`
+    над живым клиентом) подставляет `cabinet.__main__`: подстановка по типу
+    хранилища здесь была бы незаметной правкой поведения — тесты, собранные над
+    живым клиентом ради аккаунтов, разом получили бы и боевые сессии, а их
+    подставной бот ручек `/internal/sessions/*` не знает.
     """
     store = store if store is not None else _default_store()
     mail_sender = mail_sender if mail_sender is not None else _default_mail_sender()
@@ -637,7 +646,11 @@ def build_app(
     # отдельно: тот хранит коды по адресу, а экрану нужно знать, какому
     # аккаунту какой адрес показывать (см. `pending_mail`).
     pending = PendingMail()
-    sessions = SessionService(store=SingleSessionStore(), accounts=store, now=clock)
+    sessions = SessionService(
+        store=session_store if session_store is not None else SingleSessionStore(),
+        accounts=store,
+        now=clock,
+    )
     # Связывание держим отдельной ссылкой: экрану способов входа нужны и
     # привязка, и отвязка, а `SignInService` берёт только привязку почты.
     # Один объект, а не два: «сколько способов входа у аккаунта сейчас» должно
@@ -693,7 +706,15 @@ def build_app(
         if not token or _answers_with_session_cookie(response):
             return response
 
-        view = sessions.resolve(token)
+        try:
+            view = sessions.resolve(token)
+        except (BotUnreachable, BotError):
+            # Живое хранилище проверяет сессию у бота. Бот не ответил — это не
+            # «сессии нет» и не повод падать: cookie оставляем как есть, а
+            # страницу отдаём ту, что уже собрана. Без этой ветки недоступность
+            # бота превращала бы в 500 любой экран с cookie в браузере — включая
+            # экран входа, который обязан оставаться формой (Review Focus).
+            return response
         if view is not None:
             _set_session_cookie(response, view.token, max_age=sessions.ttl)
         return response

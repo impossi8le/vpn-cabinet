@@ -38,6 +38,7 @@ from cabinet.bot_client import (
     BOT_SECRET_ENV,
     BotClient,
     BotConfigError,
+    BotSessionStore,
     BotStore,
     TelegramAuthClient,
 )
@@ -92,6 +93,10 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
             secret=_required(source, BOT_SECRET_ENV, "общий секрет"),
         )
     )
+    # Сессии — у бота, а не в памяти процесса: иначе `systemctl restart`
+    # разлогинивал бы всех. Хранилище сессий берёт того же клиента, что и
+    # аккаунты, — второй копии адреса и секрета быть не должно.
+    session_store = BotSessionStore(store)
     # Вход через Telegram — **другой** сервис бота (публичный клиентский API), и
     # адрес у него свой (`BOT_PUBLIC_BASE`). Общего секрета у него нет: он
     # выставлен внешним клиентам и секрета внутреннего роутера не ждёт. Пустая
@@ -99,6 +104,7 @@ def build_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
     # а не как отказ: за loopback другого сервиса нет, и промахнуться некуда.
     return build_app(
         store=store,
+        session_store=session_store,
         mail_sender=MailSender.from_env(source),
         telegram_auth=TelegramAuthClient.from_env(source),
         # Магазин ЮKassa. Неполный конфиг не роняет запуск кабинета (оплата — одна

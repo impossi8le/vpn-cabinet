@@ -41,6 +41,7 @@ from urllib.parse import quote
 import httpx
 
 from cabinet.accounts import Account
+from cabinet.sessions import Session
 
 __all__ = [
     "AUTH_MODE_LINK",
@@ -63,6 +64,7 @@ __all__ = [
     "BotClient",
     "BotConfigError",
     "BotError",
+    "BotSessionStore",
     "BotStore",
     "BotUnreachable",
     "Challenge",
@@ -1485,9 +1487,14 @@ class BotStore:
         `BotClient._send`: своя у каждого, обработка ошибок разъехалась бы ровно
         там, где отказ бота и надо различать по коду (issue #48: код отказа
         обязан дойти до экрана, а не свернуться в общий отказ).
+
+        Заголовки вызова **дополняют** общий секрет, а не заменяют его: у сессий
+        к секрету добавляется `Authorization: Bearer` (§4), и второй заголовок не
+        должен вытеснять первый. Приём тот же, что у `BotClient._send`.
         """
+        headers = {**self._headers(), **kwargs.pop("headers", {})}
         try:
-            response = self._http.request(method, path, headers=self._headers(), **kwargs)
+            response = self._http.request(method, path, headers=headers, **kwargs)
         except _NETWORK_ERRORS as exc:
             raise BotUnreachable(
                 f"запрос к боту не удался: {exc.__class__.__name__}", cause=exc
@@ -1515,6 +1522,121 @@ class BotStore:
                 return 0
             raise
         return 1
+
+
+class BotSessionStore:
+    """Сессии кабинета у бота: `cabinet.sessions.SessionStore` поверх HTTP.
+
+    **Зачем.** Сессии кабинета жили в памяти процесса (`SingleSessionStore`), и
+    `systemctl restart cabinet-app` разлогинивал всех. У бота для этого есть
+    таблица `client_sessions` и роуты `/internal/sessions/*` (§4 контракта), но
+    кабинет их не звал. Этот адаптер и есть подключение: та же форма, что у
+    `BotStore` для аккаунтов, — синхронные методы поверх того же клиента.
+
+    **Почему адаптер отдаёт токен, а не хеш.** Владелец таблицы сессий — бот, и
+    он опознаёт сессию по самому токену (`Authorization: Bearer` у `current`).
+    Поэтому токен кабинета — тот, что выдал бот (`POST for-account`), и cookie
+    несёт именно его. Навяжи кабинет свой токен — он не нашёлся бы в таблице, и
+    выданная сессия стала бы мёртвой на первом же заходе. Хранилище в памяти
+    работает иначе (хеширует токен само), но это деталь хранилища, а не
+    вызывающего кода.
+
+    **Чего адаптер не делает.** Первое: не считает срок и горизонт — это остаётся
+    у `SessionService` для хранилища в памяти, а для живого владелец срока — бот
+    (`current` уже отвечает `401` на истёкшую). Второе: не продлевает срок в
+    `touch` — активность обновляет бот на каждом `current` (§4), и второй копии
+    этого правила здесь быть не должно.
+
+    Отказ бота проходит насквозь, кроме одного случая: `401 unauthorized` от
+    `current` — это «сессии нет» (истекла, отозвана, неизвестна), и он
+    переводится в `None`, как того и ждёт протокол. Недоступность бота
+    (`BotUnreachable`) — не «нет сессии»: её и надо показать отказом, чтобы
+    человек не принимал сбой связи за выход.
+    """
+
+    def __init__(self, bot: BotStore) -> None:
+        # Конфигурацию адаптер не дублирует: адрес и секрет он берёт у того же
+        # клиента, которого оборачивает, — второй копии секрета быть не должно.
+        self._bot = bot
+
+    def create(
+        self,
+        *,
+        account_id: int,
+        token: str,  # noqa: ARG002 - токен выдаёт бот: он владелец таблицы сессий
+        expires_at: datetime,
+        created_at: datetime,
+    ) -> Session:
+        """Выдать сессию аккаунту (`POST /internal/sessions/for-account`, §4).
+
+        `token` кабинета бот **не** использует: свой токен он генерирует сам, и
+        вернуть надо его. Параметр остаётся — форма `SessionStore`, и вызывающий
+        (`SessionService`) передаёт токен, каким выдал бы его хранилище в памяти.
+
+        Срок и момент создания берутся из ответа бота; если он их не прислал,
+        остаются посчитанные кабинетом — тогда хотя бы форма записи не теряется.
+        Повторный токен бот отдать не может: он генерирует новый на каждую выдачу.
+        """
+        data = self._bot._request(
+            "POST", f"{BOT_PATH}/sessions/for-account", json={"account_id": account_id}
+        )
+        return Session(
+            token=str(data.get("token", "")) or token,
+            account_id=_int_or_zero(data.get("account_id")) or account_id,
+            expires_at=_parse_datetime(data.get("expires_at")) or expires_at,
+            created_at=_parse_datetime(data.get("created_at")) or created_at,
+        )
+
+    def find(self, token: str) -> Session | None:
+        """Проверить сессию (`GET /internal/sessions/current`, §4).
+
+        `401 unauthorized` — сессии нет: неизвестный, истёкший или отозванный
+        токен снаружи неразличимы, и это `None`, а не исключение (протокол).
+
+        `created_at` в ответе нет и быть не может: момент появления сессии знает
+        только бот, а `SessionService` в этом случае горизонта не сужает — срок
+        живых сессий ведёт бот. Придумывать здесь `created_at` значило бы
+        подменить один срок другим.
+
+        `chat_id` и `mail` ответа кабинету для сессии не нужны — владелец её
+        `account_id`, и аккаунт читается отдельно.
+        """
+        try:
+            data = self._bot._request("GET", f"{BOT_PATH}/sessions/current", headers=_bearer(token))
+        except BotError as exc:
+            if exc.code == "unauthorized" or exc.status == 401:
+                return None
+            raise
+        expires_at = _parse_datetime(data.get("expires_at"))
+        account_id = _int_or_zero(data.get("account_id"))
+        if expires_at is None or account_id == 0:
+            # Бот ответил успехом, но без срока или без владельца: за такую
+            # запись ручаться нельзя, а молчаливое «сессия без срока» пустило бы
+            # кого угодно. Это расхождение контракта, а не «нет сессии».
+            raise BotError("invalid_response", "сессия без срока или без аккаунта")
+        return Session(token=token, account_id=account_id, expires_at=expires_at)
+
+    def touch(self, token: str, *, moment: datetime, expires_at: datetime) -> None:  # noqa: ARG002
+        """Ничего: активность и продление срока обновляет бот (§4).
+
+        `current` уже трогает запись на своей стороне, и делать это ещё раз
+        отсюда значило бы держать вторую копию правила «заход продлевает» —
+        ровно то, от чего отказались, оставив владельцем строки сессии бота.
+        """
+
+    def revoke(self, token: str) -> None:
+        """Выход: отозвать сессию (`POST /internal/sessions/revoke`, §4).
+
+        Идемпотентно у бота, поэтому здесь нечего различать: повторный выход —
+        успех, и разбирать его как ошибку не надо. Токен идёт и в заголовке, и в
+        теле — так требует §4; заголовок к тому же не оседает в логах доступа.
+        """
+        self._bot._request(
+            "POST",
+            f"{BOT_PATH}/sessions/revoke",
+            headers=_bearer(token),
+            json={"token": token},
+        )
 
 
 def _error_from_response(response: httpx.Response) -> BotError:

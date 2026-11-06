@@ -190,13 +190,13 @@ def test_naive_expiry_from_the_store_does_not_break_resolution(
             self,
             *,
             account_id: int,
-            token_hash: str,
+            token: str,
             expires_at: datetime,
             created_at: datetime,
         ):
             return super().create(
                 account_id=account_id,
-                token_hash=token_hash,
+                token=token,
                 expires_at=expires_at.replace(tzinfo=None),
                 created_at=created_at,
             )
@@ -352,7 +352,7 @@ def test_resolution_extends_the_session(fake_api: FakeApi, account_email_only: A
     assert resolved is not None
     assert resolved.expires_at == moment[0] + timedelta(days=1)
     assert resolved.expires_at > first_expires
-    session = store.find(hash_token(view.token))
+    session = store.find(view.token)
     assert session is not None
     assert session.last_seen_at == moment[0]
     assert session.expires_at == moment[0] + timedelta(days=1)
@@ -406,7 +406,7 @@ def test_renewal_stops_at_the_absolute_limit(fake_api: FakeApi, account_email_on
         moment[0] = NOW + timedelta(days=day)
         assert service.resolve(view.token) is not None
 
-    session = store.find(hash_token(view.token))
+    session = store.find(view.token)
     assert session is not None
     assert session.expires_at == NOW + timedelta(days=90)
 

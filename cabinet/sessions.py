@@ -16,16 +16,20 @@
 /internal/sessions/for-account`, `GET /internal/sessions/current`,
 `POST /internal/sessions/revoke`).
 
-Границы: кабинет не ходит в базу (CLAUDE.md, «Границы сервиса»). Живой роутер
-`/internal/sessions/*` подставится на W6 как ещё одна реализация `SessionStore`;
-до неё модуль проверен против `SingleSessionStore` из этого же файла — мок-слой
-`tests/fakes.py` трогать нельзя, он общий с другими волнами.
+Границы: кабинет не ходит в базу (CLAUDE.md, «Границы сервиса»). Живая
+реализация `SessionStore` — `cabinet.bot_client.BotSessionStore`, поверх HTTP к
+роутеру бота; здесь же остаётся `SingleSessionStore` — память процесса, которой
+собираются тесты и стенд. Мок-слой `tests/fakes.py` трогать нельзя, он общий с
+другими волнами.
 
-Сравнение токена. Поиск идёт по **хешу**, а не по самому токену: в хранилище
-лежит `sha256`. Сравнивать токен строкой напрямую было бы нельзя — обычное `==`
-выходит на первом несовпавшем байте, и по времени ответа токен подбирается
-посимвольно. Здесь такого сравнения нет вовсе, и приём тот же, что у кодов в
-`auth_mail`: наружу из хранилища открытый токен не выходит никогда.
+Сравнение токена. Хранилище адресуется **токеном**, а не его хешем, и это не
+уступка: владелец таблицы сессий — бот, а он опознаёт сессию по самому токену
+(`GET /internal/sessions/current` читает `Authorization: Bearer`). Кабинет лишь
+передаёт токен дальше. Требование «`==` по секрету вне хранилища не годится»
+здесь выполняется не хешированием на стороне кабинета, а тем, что сравнение
+токена живёт в одном месте — в таблице бота. Хранилище в памяти
+(`SingleSessionStore`) хеширует само, тем же `sha256`: приём тот же, что у кодов
+в `auth_mail`, — наружу из хранилища открытый токен не выходит.
 """
 
 from __future__ import annotations
@@ -110,9 +114,10 @@ class AccountStore(Protocol):
 class SessionStore(Protocol):
     """Хранилище сессий, как его видит кабинет.
 
-    Токен ходит наружу только в момент выдачи: в хранилище лежит его **хеш**, и
-    `touch`/`revoke` принимают хеш, а не токен — иначе токен оседал бы в логах и
-    в памяти вне момента выдачи.
+    Адресуется **токеном**: владелец таблицы сессий — бот, и он опознаёт сессию
+    по самому токену (`GET /internal/sessions/current` читает `Authorization:
+    Bearer`). Хранилище в памяти хеширует его само (`sha256`), поэтому открытый
+    токен за его пределы не выходит — приём тот же, что у кодов в `auth_mail`.
 
     Возвращается `Session`, а не `bool`: вызывающему нужны `account_id` и
     `expires_at` — иначе срок пришлось бы хранить второй копией, а без копии не
@@ -127,7 +132,7 @@ class SessionStore(Protocol):
         self,
         *,
         account_id: int,
-        token_hash: str,
+        token: str,
         expires_at: datetime,
         created_at: datetime,
     ) -> Session:
@@ -137,14 +142,17 @@ class SessionStore(Protocol):
         продлением: от него считается абсолютный горизонт (`MAX_SESSION_LIFETIME`).
         Если хранилище его не сохранит, у продления не останется потолка, и
         токен, которым пользуются хотя бы раз в TTL, будет жить вечно (#53).
+
+        `token` — им адресуется строка. `Session.token` в ответе может быть
+        другим: у бота токен генерирует он сам, и кабинет принимает его.
         """
         ...
 
-    def find(self, token_hash: str) -> Session | None:
-        """Найти сессию по хешу токена. `None` — не найдена."""
+    def find(self, token: str) -> Session | None:
+        """Найти сессию по токену. `None` — не найдена."""
         ...
 
-    def touch(self, token_hash: str, *, moment: datetime, expires_at: datetime) -> None:
+    def touch(self, token: str, *, moment: datetime, expires_at: datetime) -> None:
         """Отметить активность **и** сдвинуть срок. Отсутствие сессии — не ошибка.
 
         Срок продлевается тем же заходом, что и активность: кабинет открывают
@@ -157,7 +165,7 @@ class SessionStore(Protocol):
         """
         ...
 
-    def revoke(self, token_hash: str) -> None:
+    def revoke(self, token: str) -> None:
         """Отозвать сессию. Повторный отзыв — не ошибка (§4: выход идемпотентен)."""
         ...
 
@@ -180,12 +188,17 @@ class Session:
     него считается абсолютный горизонт: без него продление уводило бы срок
     вперёд без конца, и «угнанный токен перестаёт работать сам» оставалось бы
     верным только для токена, которым не пользуются (#53).
+
+    `created_at` бывает `None` у живого хранилища: `GET /internal/sessions/current`
+    его не отдаёт, и придумывать момент появления сессии кабинет не вправе. Это
+    не потеря горизонта, а его передача: срок живых сессий ведёт бот, а
+    `SessionService` в этом случае горизонта не сужает.
     """
 
-    token_hash: str
+    token: str
     account_id: int
     expires_at: datetime
-    created_at: datetime
+    created_at: datetime | None = None
     last_seen_at: datetime | None = None
 
 
@@ -287,13 +300,16 @@ class SessionService:
         moment = _as_utc(self._now())
         session = self._store.create(
             account_id=account_id,
-            token_hash=hash_token(token),
+            token=token,
             expires_at=moment + self._ttl,
             created_at=moment,
         )
         return SessionView(
             account_id=session.account_id,
-            token=token,
+            # Токен берётся из записи, а не из локальной переменной: у бота его
+            # генерирует он сам, и cookie обязан нести именно его — иначе
+            # выданная сессия не найдётся на следующем заходе.
+            token=session.token,
             expires_at=session.expires_at,
         )
 
@@ -333,18 +349,22 @@ class SessionService:
         if not token:
             return None
 
-        token_hash = hash_token(token)
-        session = self._store.find(token_hash)
+        session = self._store.find(token)
         if session is None:
             return None
 
         moment = _as_utc(self._now())
         if _as_utc(session.expires_at) <= moment:
-            self._store.revoke(token_hash)
+            self._store.revoke(token)
             return None
 
-        expires_at = min(moment + self._ttl, _as_utc(session.created_at) + self._max_lifetime)
-        self._store.touch(token_hash, moment=moment, expires_at=expires_at)
+        # Горизонт сужает продление, только когда хранилище знает момент
+        # создания сессии. У живого хранилища его нет — срок ведёт бот, и
+        # второй потолок здесь лишь разошёлся бы с первым.
+        expires_at = moment + self._ttl
+        if session.created_at is not None:
+            expires_at = min(expires_at, _as_utc(session.created_at) + self._max_lifetime)
+        self._store.touch(token, moment=moment, expires_at=expires_at)
         return SessionView(
             account_id=session.account_id,
             token=token,
@@ -363,7 +383,7 @@ class SessionService:
         """
         if not token:
             return
-        self._store.revoke(hash_token(token))
+        self._store.revoke(token)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -383,16 +403,20 @@ def _as_utc(value: datetime) -> datetime:
 class SingleSessionStore:
     """Сессии в памяти процесса: тот же `SessionStore`, без базы и без сети.
 
-    Нужен, пока роутер `/internal/sessions/*` не написан: кабинет держит сессии
-    сам. Форма — общий протокол, поэтому подмена на живой бот не потребует правок
-    вызывающего кода, а до неё поведение сессий проверяется здесь, а не в тесте,
-    который пришлось бы писать против второго хранилища.
+    Остаётся тестам и стенду. В бою сессии живут у бота (`cabinet.bot_client.
+    BotSessionStore`), и этот класс — умолчание `build_app`, то есть режим
+    «память процесса». Форма — общий протокол, поэтому подмена на живой бот не
+    требует правок вызывающего кода, а поведение сессий проверяется здесь, не
+    поднимая ради этого второе хранилище.
 
-    Состояние сбрасывается при перезапуске процесса, и это осознанный выбор для
-    текущей волны, а не заготовка: как и коды в `auth_mail`, это состояние,
-    которому переживать перезапуск не нужно. Переживать его сессиям предстоит
-    тогда, когда их домом станет таблица бота (W6) — и тогда эту роль сыграет
-    живой клиент, а не этот класс.
+    Ключ словаря — **хеш** токена (`hash_token`), а не токен: репозиторий
+    публичный, и открытый токен, попавший в дамп памяти, — это уже угнанная
+    сессия. Наружу класса токен не выходит, а сравнение идёт по хешу — тот же
+    приём, что у кодов в `auth_mail`.
+
+    Состояние сбрасывается при перезапуске процесса: памяти процесса после
+    перезапуска нет, и вход, живущий только в ней, теряется — ровно та причина,
+    по которой в бою подставляется бот.
     """
 
     sessions: dict[str, Session] = field(default_factory=dict)
@@ -401,7 +425,7 @@ class SingleSessionStore:
         self,
         *,
         account_id: int,
-        token_hash: str,
+        token: str,
         expires_at: datetime,
         created_at: datetime,
     ) -> Session:
@@ -416,10 +440,11 @@ class SingleSessionStore:
         это точка отсчёта абсолютного горизонта, и потерять её значит вернуть
         бесконечное продление (#53).
         """
+        token_hash = hash_token(token)
         if token_hash in self.sessions:
             raise SessionRefused("хеш токена уже занят: источник токенов выдал повтор")
         session = Session(
-            token_hash=token_hash,
+            token=token,
             account_id=account_id,
             expires_at=expires_at,
             created_at=created_at,
@@ -427,12 +452,12 @@ class SingleSessionStore:
         self.sessions[token_hash] = session
         return session
 
-    def find(self, token_hash: str) -> Session | None:
+    def find(self, token: str) -> Session | None:
         """Сессия или `None`. Поиск идёт по хешу, поэтому содержимое токена на
         время ответа не влияет."""
-        return self.sessions.get(token_hash)
+        return self.sessions.get(hash_token(token))
 
-    def touch(self, token_hash: str, *, moment: datetime, expires_at: datetime) -> None:
+    def touch(self, token: str, *, moment: datetime, expires_at: datetime) -> None:
         """Отметить активность и продлить срок — одним движением.
 
         Пишется **только существующая** строка (`if session is not None`):
@@ -440,10 +465,11 @@ class SingleSessionStore:
         заново. Иначе «обновление» воскрешало бы вышедшего человека по обычному
         запросу, и выход переставал бы что-либо значить.
         """
+        token_hash = hash_token(token)
         session = self.sessions.get(token_hash)
         if session is not None:
             self.sessions[token_hash] = replace(session, last_seen_at=moment, expires_at=expires_at)
 
-    def revoke(self, token_hash: str) -> None:
+    def revoke(self, token: str) -> None:
         """Отозвать. Отсутствие сессии — не ошибка: выход идемпотентен."""
-        self.sessions.pop(token_hash, None)
+        self.sessions.pop(hash_token(token), None)
