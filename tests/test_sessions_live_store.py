@@ -31,10 +31,22 @@ import re
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from cabinet.app import COOKIE_NAME, LOGIN_BOT_UNREACHABLE, build_app
-from cabinet.bot_client import SECRET_HEADER, BotClient, BotSessionStore, BotStore
+from cabinet.app import (
+    BOT_UNREACHABLE_ERROR,
+    COOKIE_NAME,
+    LOGIN_BOT_UNREACHABLE,
+    build_app,
+)
+from cabinet.bot_client import (
+    SECRET_HEADER,
+    BotClient,
+    BotError,
+    BotSessionStore,
+    BotStore,
+)
 from cabinet.mail_sender import MailSender
 from tests.fakes import STATUS_ACTIVE, FakeApi, FakeMailSender
 
@@ -46,9 +58,13 @@ NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
 MAIL = "user@example.com"
 SUBSCRIPTION_NAME = "Нидерланды · Амстердам"
 
-# Срок сессии в подставном боте — как у живой: полгода. Значение не пинится,
-# важно лишь, чтобы сессия была живой на момент проверки.
-SESSION_TTL = timedelta(days=180)
+# Срок сессии у живого бота — 30 дней и **без продления**: так его ставит
+# `create_session`, а `touch_session` двигает только `last_seen_at`. Кабинет
+# обязан брать этот срок, а не свой 180-дневный, иначе cookie обещает на 150
+# дней больше, чем сессия живёт.
+SESSION_TTL = timedelta(days=30)
+# Срок по умолчанию у самого кабинета (память процесса) — для контраста.
+CABINET_TTL_SECONDS = 180 * 24 * 3600
 
 # Код из письма достаётся так же, как его достал бы человек: цифры в тексте.
 _CODE_RE = re.compile(r"(\d{6})")
@@ -399,3 +415,96 @@ def test_unreachable_bot_does_not_turn_the_login_screen_into_a_500() -> None:
     page = client.get("/login")
     assert page.status_code == 200
     assert LOGIN_BOT_UNREACHABLE in page.text
+
+
+# --- 4. недоступность бота на экране под сессией — экран, а не 500 ----------
+
+
+def test_unreachable_bot_on_a_signed_in_screen_shows_the_outage_screen() -> None:
+    """`/subscriptions` при недоступном боте — экран сбоя, а не `500`.
+
+    Сессия проверяется у бота **в начале роута**, а не только в middleware
+    (`resolve` идёт первым делом). Пока этот отказ не пойман одним местом на всё
+    приложение, недоступность бота давала `500` на авторизованных экранах —
+    регресс относительно прежнего экрана «бот недоступен». Сессия при этом
+    обязана остаться целой: отказ связи — не выход, и человек не должен
+    оказываться на форме входа из-за того, что бот на минуту пропал.
+    """
+    api, _account_id = _api_with_subscription()
+    bot = _Bot(api)
+    sender = FakeMailSender()
+    client = TestClient(_app(bot, sender, live=True), raise_server_exceptions=False)
+    token = _sign_in(client, sender)
+
+    bot.outage = True
+    response = client.get("/subscriptions")
+
+    assert response.status_code == 200
+    assert BOT_UNREACHABLE_ERROR in response.text
+    # Сессия цела: отказ связи не гасит её и не уводит на вход.
+    assert token in bot.sessions
+    assert "/login" not in response.headers.get("location", "")
+
+
+# --- 5. срок живой сессии — срок бота, а не TTL кабинета -------------------
+
+
+def test_live_session_and_its_cookie_use_the_bot_term_not_the_cabinet_ttl() -> None:
+    """Срок живой сессии — 30 дней бота, а не 180 дней кабинета.
+
+    Бот ставит `expires_at = created_at + 30 дней` и `current` его отдаёт;
+    продления у него нет. Кабинет, считая `now + 180`, обещал бы браузеру вход
+    ещё 150 дней после того, как сессия умерла, и человек с живой cookie получал
+    бы отказ. Здесь проверяются оба обещания разом: и `resolve` возвращает срок
+    из записи, и `Max-Age` cookie — тот же, а не кабинетный TTL.
+    """
+    api, _account_id = _api_with_subscription()
+    bot = _Bot(api)
+    sender = FakeMailSender()
+    app = _app(bot, sender, live=True)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    client.post("/login", data={"mail": MAIL}, follow_redirects=False)
+    code = _CODE_RE.search(sender.sent_to(MAIL)[-1]["body"]).group(1)
+    response = client.post(
+        "/login/waiting", data={"mail": MAIL, "code": code}, follow_redirects=False
+    )
+    token = response.cookies.get(COOKIE_NAME)
+    assert token
+
+    max_age = int(re.search(r"Max-Age=(\d+)", response.headers["set-cookie"]).group(1))
+    expected = int(SESSION_TTL.total_seconds())
+    assert abs(max_age - expected) <= 60
+    assert abs(max_age - CABINET_TTL_SECONDS) > 60
+
+    view = app.state.sessions.resolve(token)
+    assert view is not None
+    assert abs((view.expires_at - (NOW + SESSION_TTL)).total_seconds()) <= 60
+
+
+# --- 6. 401 не по коду — отказ сервиса, а не «сессии нет» -------------------
+
+
+def test_401_with_a_non_contract_code_is_not_read_as_a_missing_session() -> None:
+    """`401` с кодом `invalid_secret` — отказ сервиса, а не «все разлогинены».
+
+    Ошибка конфигурации (неверный общий секрет) приходит тем же статусом `401`,
+    что и неизвестный токен. Решать «сессии нет» по статусу значило бы молча
+    разлогинить всех из-за опечатки в развёртывании; решение принимается только
+    по коду контракта `unauthorized`.
+    """
+    bot = _Bot(FakeApi())
+    transport = _transport(bot)
+    wrong = BotStore(
+        BotClient(
+            base_url=BASE,
+            secret="wrong-secret",
+            client=httpx.AsyncClient(base_url=BASE, transport=transport),
+        ),
+        http_client=httpx.Client(base_url=BASE, transport=transport),
+    )
+
+    with pytest.raises(BotError) as caught:
+        BotSessionStore(wrong).find("any-token")
+
+    assert caught.value.code == "invalid_secret"

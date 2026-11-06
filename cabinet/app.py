@@ -689,11 +689,23 @@ def build_app(
     app.state.telegram_login = telegram_login
     app.state.payments = payments
 
-    # Cookie сессии живёт ровно столько, сколько её серверная запись, а запись
-    # продлевается при каждом заходе (`SessionService.resolve`). Cookie же,
-    # выпущенная один раз при входе, несла бы прежний `Max-Age` — и активного
-    # человека выбрасывало бы через TTL от **первого** входа, то есть ровно то,
-    # что продление и отменяет (issue #53).
+    # С живым хранилищем сессию проверяет бот, и `resolve` в начале роута может
+    # не дозвониться до него (`BotUnreachable`). Роуты, которым это важно, такой
+    # отказ обрабатывают сами, но одно место на всё приложение всё равно нужно:
+    # иначе каждое новое место вызова `resolve` — ещё одна копия `try` и ещё
+    # одна возможность ответить 500 на сбой связи. Глобальный обработчик ловит
+    # только то, что не поймали локально (вебхук, например, сам отвечает 503), и
+    # отдаёт тот же экран «бот недоступен», что и соседние роуты.
+    @app.exception_handler(BotUnreachable)
+    async def _bot_unreachable_screen(_request: Request, _exc: BotUnreachable) -> Response:
+        return _unreachable_screen(BOT_UNREACHABLE_ERROR)
+
+    # Cookie сессии живёт ровно столько, сколько её серверная запись. В памяти
+    # запись продлевается при каждом заходе, и без перевыпуска cookie несла бы
+    # прежний `Max-Age` — активного человека выбрасывало бы через TTL от
+    # **первого** входа, то есть ровно то, что продление и отменяет (issue #53).
+    # У живого хранилища срок ведёт бот, и здесь берётся его значение: cookie не
+    # должна обещать больше, чем сессия живёт.
     #
     # Обновление стоит здесь, а не в роутах: в каждом из них это была бы копия,
     # которую однажды забудут приписать новому экрану. Ответ, который сам решает
@@ -716,7 +728,7 @@ def build_app(
             # экран входа, который обязан оставаться формой (Review Focus).
             return response
         if view is not None:
-            _set_session_cookie(response, view.token, max_age=sessions.ttl)
+            _set_session_cookie(response, view.token, max_age=sessions.max_age(view))
         return response
 
     _add_login_routes(
@@ -927,7 +939,9 @@ def _add_login_routes(
         visitor, is_new = _visitor_of(request)
         _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
         response = RedirectResponse("/subscriptions", status_code=303)
-        _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
+        _set_session_cookie(
+            response, result.session.token, max_age=sessions.max_age(result.session)
+        )
         return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
     @app.post("/login/verify")
@@ -1196,7 +1210,7 @@ def _telegram_finish(
     visitor, is_new = _visitor_of(request)
     _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
     response = RedirectResponse("/subscriptions", status_code=303)
-    _set_session_cookie(response, result.session.token, max_age=sessions.ttl)
+    _set_session_cookie(response, result.session.token, max_age=sessions.max_age(result.session))
     return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
 
 
@@ -1313,8 +1327,9 @@ def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -
     `max_age` — срок, который переживает закрытие браузера. Без него cookie была
     бы сессионной и умирала бы вместе с браузером, а серверная сессия оставалась
     бы живой: кабинет открывают раз в недели, и человек каждый раз возвращался бы
-    к форме входа. Срок приходит из `SessionService.ttl` — cookie и серверная
-    запись считают его одним местом, а не двумя.
+    к форме входа. Срок приходит из `SessionService.max_age` — это срок **самой
+    сессии**, а не «полный TTL»: у живого хранилища его задаёт бот, и cookie не
+    должна переживать запись.
 
     `secure` здесь **не** ставится: кабинет на этой волне запускается по
     `http://127.0.0.1`, и `Secure`-cookie браузер по http не отправил бы вовсе.

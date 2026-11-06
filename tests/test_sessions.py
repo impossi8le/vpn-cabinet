@@ -286,6 +286,23 @@ def test_token_is_not_stored_in_the_clear(fake_api: FakeApi, account_email_only:
     assert hash_token(view.token) in store.sessions
 
 
+def test_stored_records_do_not_carry_the_open_token(fake_api: FakeApi, account_email_only: Account):
+    """Запись сессии в памяти не содержит токена — ни в поле, ни в `repr`.
+
+    Ключ словаря — хеш, но этого мало: если в значении лежит `Session` с
+    открытым токеном, он попадает и в дамп памяти, и в лог через `repr`. Токен
+    подставляется только в ответ `find`/`create`, то есть тому, кто его и
+    предъявил, — и это проверяется обходом самих записей.
+    """
+    store = SingleSessionStore()
+    service = SessionService(store=store, accounts=fake_api, now=lambda: NOW)
+
+    view = service.sign_in(account_email_only.id)
+
+    for record in store.sessions.values():
+        assert view.token not in repr(record)
+
+
 def test_tokens_differ_between_issuances(sessions: SessionService, account_email_only: Account):
     """Каждая выдача — свой токен.
 

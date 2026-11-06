@@ -68,6 +68,9 @@ __all__ = [
 # что он **скользит** (`resolve`): живой сессии он продлевается на полный TTL от
 # последнего захода, но у забытой — истекает. Скольжение при этом упирается в
 # `MAX_SESSION_LIFETIME`: безусловное продление жило бы дольше любого токена.
+# Оба числа — правда **для хранилища в памяти** (`SingleSessionStore`). У живой
+# сессии срок задаёт бот: кабинет берёт его из записи и не обещает больше
+# (`SessionService.resolve`, `max_age`).
 DEFAULT_SESSION_TTL = timedelta(days=180)
 
 # Абсолютный горизонт сессии. Скользящий срок без потолка означал бы, что токен,
@@ -75,6 +78,8 @@ DEFAULT_SESSION_TTL = timedelta(days=180)
 # `expires_at` вперёд без конца, и обещание «украденный токен перестаёт работать
 # сам» было бы неправдой (issue #53). Год заметно больше TTL, поэтому продление
 # горизонта не отменяет — вход повторяется раз в год, а не раз в полгода.
+# Как и TTL, горизонт действует только для хранилища в памяти: у живой сессии
+# его ведёт бот (см. `SessionService.resolve`).
 MAX_SESSION_LIFETIME = timedelta(days=365)
 
 # Энтропия токена. 32 байта `secrets` — 256 бит; перебор невозможен, и значение
@@ -279,6 +284,21 @@ class SessionService:
         """
         return self._ttl
 
+    def max_age(self, view: SessionView) -> timedelta:
+        """Сколько живёт cookie **этой** сессии.
+
+        Не «полный TTL», а сколько осталось до её срока: у живого хранилища бот
+        отдаёт свой срок (сейчас 30 дней без продления), и cookie на 180 дней
+        обещала бы браузеру вход, которого сервер уже не даст, — а браузер
+        посылал бы мёртвый токен ещё 150 дней. Срок читается из `expires_at`,
+        который вернул `sign_in`/`resolve`, поэтому cookie и запись говорят одно.
+
+        У хранилища в памяти `expires_at` — это `now + ttl`, поэтому здесь
+        получается прежний TTL.
+        """
+        remaining = _as_utc(view.expires_at) - _as_utc(self._now())
+        return remaining if remaining > timedelta(0) else timedelta(0)
+
     # ---------- выдача ----------
 
     def sign_in(self, account_id: int) -> SessionView:
@@ -358,12 +378,16 @@ class SessionService:
             self._store.revoke(token)
             return None
 
-        # Горизонт сужает продление, только когда хранилище знает момент
-        # создания сессии. У живого хранилища его нет — срок ведёт бот, и
-        # второй потолок здесь лишь разошёлся бы с первым.
-        expires_at = moment + self._ttl
-        if session.created_at is not None:
-            expires_at = min(expires_at, _as_utc(session.created_at) + self._max_lifetime)
+        # Откуда берётся срок. У хранилища в памяти (`created_at` есть) он
+        # скользит: полный TTL от текущего момента, с потолком от создания
+        # сессии. У живого хранилища (`created_at` нет) срок — тот, что записан
+        # в сессии: его ведёт бот, и кабинет не обещает больше, чем она живёт.
+        # Считать здесь `moment + ttl` значило бы поставить cookie на 180 дней
+        # поверх тридцатидневной записи и разлогинить активного человека на 30-й.
+        if session.created_at is None:
+            expires_at = _as_utc(session.expires_at)
+        else:
+            expires_at = min(moment + self._ttl, _as_utc(session.created_at) + self._max_lifetime)
         self._store.touch(token, moment=moment, expires_at=expires_at)
         return SessionView(
             account_id=session.account_id,
@@ -399,6 +423,38 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+@dataclass(frozen=True)
+class _StoredSession:
+    """Запись сессии в памяти — **без** открытого токена.
+
+    Ключ словаря и так хеш, но хранить рядом ещё и токен значило бы держать его
+    в памяти вне момента выдачи: `repr(Session)` вывел бы его в лог или в дамп.
+    Поэтому запись несёт `token_hash`, а токен подставляется при возврате из
+    `find`/`create` (см. `_session_with_token`).
+    """
+
+    token_hash: str
+    account_id: int
+    expires_at: datetime
+    created_at: datetime
+    last_seen_at: datetime | None = None
+
+
+def _session_with_token(stored: _StoredSession, token: str) -> Session:
+    """Собрать `Session` из записи, подставив токен вызывающего.
+
+    Токен приходит аргументом и в записи не хранится — так он не оседает в
+    памяти хранилища, а возвращается только тому, кто его и предъявил.
+    """
+    return Session(
+        token=token,
+        account_id=stored.account_id,
+        expires_at=stored.expires_at,
+        created_at=stored.created_at,
+        last_seen_at=stored.last_seen_at,
+    )
+
+
 @dataclass
 class SingleSessionStore:
     """Сессии в памяти процесса: тот же `SessionStore`, без базы и без сети.
@@ -409,17 +465,17 @@ class SingleSessionStore:
     требует правок вызывающего кода, а поведение сессий проверяется здесь, не
     поднимая ради этого второе хранилище.
 
-    Ключ словаря — **хеш** токена (`hash_token`), а не токен: репозиторий
-    публичный, и открытый токен, попавший в дамп памяти, — это уже угнанная
-    сессия. Наружу класса токен не выходит, а сравнение идёт по хешу — тот же
-    приём, что у кодов в `auth_mail`.
+    Ключ словаря — **хеш** токена (`hash_token`), а в записи (`_StoredSession`)
+    открытого токена нет вовсе: репозиторий публичный, и токен, попавший в дамп
+    памяти или в `repr`, — это уже угнанная сессия. Токен подставляется только в
+    ответ `find`/`create`, то есть тому, кто его и предъявил.
 
     Состояние сбрасывается при перезапуске процесса: памяти процесса после
     перезапуска нет, и вход, живущий только в ней, теряется — ровно та причина,
     по которой в бою подставляется бот.
     """
 
-    sessions: dict[str, Session] = field(default_factory=dict)
+    sessions: dict[str, _StoredSession] = field(default_factory=dict)
 
     def create(
         self,
@@ -443,19 +499,22 @@ class SingleSessionStore:
         token_hash = hash_token(token)
         if token_hash in self.sessions:
             raise SessionRefused("хеш токена уже занят: источник токенов выдал повтор")
-        session = Session(
-            token=token,
+        stored = _StoredSession(
+            token_hash=token_hash,
             account_id=account_id,
             expires_at=expires_at,
             created_at=created_at,
         )
-        self.sessions[token_hash] = session
-        return session
+        self.sessions[token_hash] = stored
+        return _session_with_token(stored, token)
 
     def find(self, token: str) -> Session | None:
         """Сессия или `None`. Поиск идёт по хешу, поэтому содержимое токена на
         время ответа не влияет."""
-        return self.sessions.get(hash_token(token))
+        stored = self.sessions.get(hash_token(token))
+        if stored is None:
+            return None
+        return _session_with_token(stored, token)
 
     def touch(self, token: str, *, moment: datetime, expires_at: datetime) -> None:
         """Отметить активность и продлить срок — одним движением.
@@ -466,9 +525,9 @@ class SingleSessionStore:
         запросу, и выход переставал бы что-либо значить.
         """
         token_hash = hash_token(token)
-        session = self.sessions.get(token_hash)
-        if session is not None:
-            self.sessions[token_hash] = replace(session, last_seen_at=moment, expires_at=expires_at)
+        stored = self.sessions.get(token_hash)
+        if stored is not None:
+            self.sessions[token_hash] = replace(stored, last_seen_at=moment, expires_at=expires_at)
 
     def revoke(self, token: str) -> None:
         """Отозвать. Отсутствие сессии — не ошибка: выход идемпотентен."""
