@@ -65,6 +65,48 @@ def test_region_screen_lists_directions_and_current_region(telegram_account) -> 
     assert "Осталось 1 из 2" in html
 
 
+def test_region_shows_when_the_limit_resets(telegram_account) -> None:
+    """Экран говорит, **когда** лимит смен сбросится, — датой, а не «ждите».
+
+    «Осталось 0 из 2» без даты читается как «непонятно сколько ждать»: день
+    или месяц. Дату сброса бот называет в `limits.reset_at`.
+    """
+    api, account = telegram_account
+    api.reissue_payload["limits"] = {
+        "allowed": 2,
+        "used": 2,
+        "remaining": 0,
+        "window_days": 7,
+        "reset_at": "2026-11-09T09:09:57Z",
+    }
+
+    html = _client(api, account.id).get("/region").text
+
+    assert "Осталось 0 из 2" in html
+    assert "9 ноября" in html
+
+
+def test_region_without_reset_date_shows_no_placeholder(telegram_account) -> None:
+    """Нет `reset_at` — даты на экране нет вовсе, а не «None» и пустые скобки.
+
+    Ключа может не быть в ответе бота — это норма, а не сбой. Тогда строка про
+    остаток остаётся как была, и заглушки рядом с ней не появляется.
+    """
+    api, account = telegram_account
+    api.reissue_payload["limits"] = {
+        "allowed": 2,
+        "used": 2,
+        "remaining": 0,
+        "window_days": 7,
+    }
+
+    html = _client(api, account.id).get("/region").text
+
+    assert "Осталось 0 из 2" in html
+    assert "None" not in html
+    assert "()" not in html
+
+
 def test_region_request_sends_the_chosen_direction(telegram_account) -> None:
     """Выбор направления уходит боту, ответ — переход к состоянию заявки."""
     api, account = telegram_account

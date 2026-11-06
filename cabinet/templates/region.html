@@ -62,6 +62,10 @@
 {% if limits.remaining is not none and limits.allowed is not none %}
 <p class="micro">
   Осталось {{ limits.remaining }} из {{ limits.allowed }} за {{ limits.window_days }} дн.
+  {# Дата сброса — рядом с остатком: «осталось 0» без неё читается как
+     «непонятно сколько ждать». Приходит готовой строкой из
+     `format_reset_date`; пустая — фразы нет вовсе, а не пустые скобки. #}
+  {% if reset_date %}Лимит сбросится {{ reset_date }}.{% endif %}
 </p>
 {% endif %}
 

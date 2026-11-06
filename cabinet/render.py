@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -82,6 +83,7 @@ __all__ = [
     "TEMPLATES_DIR",
     "UNLINK_MAIL_ACTION",
     "UNLINK_TELEGRAM_ACTION",
+    "format_reset_date",
     "render_linking",
     "render_login",
     "render_login_telegram",
@@ -1576,6 +1578,42 @@ def region_error_text(code: str | None) -> str:
     return REGION_ERRORS.get(str(code or ""), REGION_UNREACHABLE)
 
 
+# Названия месяцев в родительном падеже: «9 ноября», а не «9 Ноябрь». Дата
+# читается человеком, и машинная форма месяца выглядела бы на экране сбоем.
+_MONTHS_GENITIVE = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+
+
+def format_reset_date(value: str | None) -> str:
+    """«9 ноября» из ISO-строки сброса лимита; пустая строка — если даты нет.
+
+    Разбор живёт здесь, а не в шаблоне: в разметку приходит готовая строка, и
+    датами она не занимается. Пустое значение (ключа `reset_at` в ответе бота
+    может не быть вовсе — это норма) и неразобранное дают одно и то же — пустую
+    строку: тогда строка про дату не рисуется, а не показывает «None» или
+    пустые скобки.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return f"{moment.day} {_MONTHS_GENITIVE[moment.month - 1]}"
+
+
 def render_region(
     options: dict | None = None,
     *,
@@ -1591,11 +1629,16 @@ def render_region(
     страницей значило бы смешать «идёт» с «не вышло».
     """
     data = options or {}
+    # `limits` приходит от бота внешним значением. Не словарь — значит лимитов
+    # мы не прочитали: пустой словарь честнее падения на `get`.
+    limits = data.get("limits")
+    limits = limits if isinstance(limits, dict) else {}
     return _ENV.get_template("region.html").render(
         **_base_context(),
         profiles=data.get("profiles") or [],
         targets=data.get("targets") or [],
-        limits=data.get("limits") or {},
+        limits=limits,
+        reset_date=format_reset_date(limits.get("reset_at")),
         current_region=data.get("current_region"),
         request=request,
         request_id=request_id,
