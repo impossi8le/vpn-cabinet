@@ -209,6 +209,27 @@ def test_waiting_error_is_amber_not_red() -> None:
     assert COLORS.amber.upper() in html.upper()
 
 
+def test_waiting_screen_helps_when_the_letter_is_late(waiting_html: str) -> None:
+    """Письма нет — есть куда посмотреть: спам и смена адреса.
+
+    Без подсказки позднее письмо оставляет человека с одной кнопкой «ещё раз»,
+    и он не догадывается ни про папку «Спам», ни про опечатку в адресе.
+    """
+    assert "Спам" in waiting_html
+    assert "/login" in waiting_html  # смена адреса ведёт на форму входа
+
+
+def test_waiting_screen_keeps_the_refusal_and_the_hint_apart() -> None:
+    """Подсказка про спам не подменяет причину отказа.
+
+    Неверный код и «письма нет» — разные вещи: если смешать их в один текст,
+    человек с опечаткой пойдёт искать спам вместо того, чтобы перечитать код.
+    """
+    html = render_login_waiting(mail="u@example.com", error="Код не подошёл")
+    assert "Код не подошёл" in html
+    assert "Спам" in html
+
+
 # --- семантика цвета на обоих экранах -----------------------------------
 
 
