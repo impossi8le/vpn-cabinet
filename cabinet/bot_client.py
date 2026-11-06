@@ -456,7 +456,7 @@ class TrialEligibility:
         return cls(eligible=bool(raw.get("eligible", False)), reason=raw.get("reason"))
 
 
-# --- заказы кабинета (шаг 5 покупки, #59) ---------------------------------
+# --- заказы кабинета (шаг 4 покупки, #59) ---------------------------------
 #
 # Заказ создаётся **до** платежа и хранится у бота со статусом (спека §3.3):
 # `pending` → `completed` / `cancelled`. Кабинет его не хранит вовсе — заказ
@@ -850,7 +850,7 @@ class BotClient:
         data = await self._request("GET", f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
         return TrialEligibility.from_api(data)
 
-    # ---------- Заказы кабинета (шаг 5 покупки, #59) -----------------
+    # ---------- Заказы кабинета (шаг 4 покупки, #59) -----------------
 
     async def create_order(
         self,
@@ -1289,7 +1289,7 @@ class BotStore:
     # зовут роуты (`list_servers`, `trial_eligibility`).
 
     def list_servers(self) -> list[Server]:
-        """Серверы для выбора на шаге 4 (`GET /internal/servers`).
+        """Серверы для выбора на шаге 3 (`GET /internal/servers`).
 
         Пустой список — норма: «нет доступных серверов» — состояние экрана, а
         не отказ связи (`BotUnreachable`) и не ошибка бота (`BotError`).
@@ -1298,7 +1298,7 @@ class BotStore:
         return [Server.from_api(item) for item in data.get("servers", [])]
 
     def trial_eligibility(self, account_id: int) -> TrialEligibility:
-        """Право на пробный период на шаге 3.
+        """Право на пробный период на шаге 2.
 
         `409 telegram_required` бот на этой ручке **не** отдаёт: отказ по
         причине приходит `200` с `eligible=False` и кодом в `reason` (см.
@@ -1308,7 +1308,7 @@ class BotStore:
         data = self._get(f"{BOT_PATH}/accounts/{account_id}/trial-eligibility")
         return TrialEligibility.from_api(data)
 
-    # ---------- заказы кабинета (шаг 5 покупки, #59) -----------------
+    # ---------- заказы кабинета (шаг 4 покупки, #59) -----------------
     #
     # Синхронные двойники методов `BotClient`: роуты кабинета синхронные, а
     # заказ создания/чтения зовут именно они. Формы — из контракта плана
