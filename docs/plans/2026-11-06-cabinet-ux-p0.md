@@ -112,7 +112,10 @@ git commit -m "Покупка: видно, где человек и скольк
 def test_region_shows_when_the_limit_resets(telegram_account):
     api, account = telegram_account
     api.reissue_payload["limits"] = {
-        "allowed": 2, "used": 2, "remaining": 0, "window_days": 7,
+        "allowed": 2,
+        "used": 2,
+        "remaining": 0,
+        "window_days": 7,
         "reset_at": "2026-11-09T09:09:57Z",
     }
 
