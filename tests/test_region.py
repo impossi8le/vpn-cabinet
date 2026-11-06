@@ -87,10 +87,13 @@ def test_region_shows_when_the_limit_resets(telegram_account) -> None:
 
 
 def test_region_without_reset_date_shows_no_placeholder(telegram_account) -> None:
-    """Нет `reset_at` — даты на экране нет вовсе, а не «None» и пустые скобки.
+    """Нет `reset_at` — фразы про дату на экране нет вовсе.
 
     Ключа может не быть в ответе бота — это норма, а не сбой. Тогда строка про
-    остаток остаётся как была, и заглушки рядом с ней не появляется.
+    остаток остаётся как была, а обещания про дату не появляется. Проверяется
+    **отсутствие всей фразы**, а не одной формы заглушки: сними guard в
+    шаблоне — и на экране оказалось бы «… Лимит сбросится .», а проверка на
+    «()» такое не поймала бы.
     """
     api, account = telegram_account
     api.reissue_payload["limits"] = {
@@ -103,6 +106,7 @@ def test_region_without_reset_date_shows_no_placeholder(telegram_account) -> Non
     html = _client(api, account.id).get("/region").text
 
     assert "Осталось 0 из 2" in html
+    assert "Лимит сбросится" not in html
     assert "None" not in html
     assert "()" not in html
 
