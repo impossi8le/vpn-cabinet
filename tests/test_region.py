@@ -111,6 +111,33 @@ def test_region_without_reset_date_shows_no_placeholder(telegram_account) -> Non
     assert "()" not in html
 
 
+@pytest.mark.parametrize("broken", ["не дата", "2026-13-45T00:00:00Z"])
+def test_region_with_unparsable_reset_date_shows_no_phrase(telegram_account, broken) -> None:
+    """Неразобранная дата — тот же пустой результат, что и её отсутствие.
+
+    `reset_at` приходит от бота внешним значением, и строка может оказаться не
+    той, что ждёт `datetime.fromisoformat`. Докстринг `format_reset_date`
+    обещает пустую строку и здесь: без защиты от неразобранного значения
+    исключение вышло бы наружу, и человек получил бы 500 вместо экрана
+    региона — молчаливая поломка на ровном месте. Проверяется **отсутствие
+    всей фразы** и живой ответ, как и в тесте про отсутствующий ключ.
+    """
+    api, account = telegram_account
+    api.reissue_payload["limits"] = {
+        "allowed": 2,
+        "used": 2,
+        "remaining": 0,
+        "window_days": 7,
+        "reset_at": broken,
+    }
+
+    response = _client(api, account.id).get("/region")
+
+    assert response.status_code == 200
+    assert "Осталось 0 из 2" in response.text
+    assert "Лимит сбросится" not in response.text
+
+
 def test_region_request_sends_the_chosen_direction(telegram_account) -> None:
     """Выбор направления уходит боту, ответ — переход к состоянию заявки."""
     api, account = telegram_account
