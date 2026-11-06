@@ -134,6 +134,11 @@ def test_login_links_are_before_the_button(login_html: str) -> None:
     assert login_html.index("/terms") < login_html.index("<button")
 
 
+def test_login_says_the_account_is_created_automatically(login_html: str) -> None:
+    """Человек не должен гадать, вход это или регистрация."""
+    assert "заведётся сам" in login_html
+
+
 # --- ожидание: код и отсчёт ---------------------------------------------
 
 
