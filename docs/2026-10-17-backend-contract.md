@@ -469,12 +469,18 @@ GET  /internal/accounts/{id}/trial-eligibility
 {"profiles": [{"id": 17, "filename": "NLclient285.ovpn", "expiration_date": "2026-12-01"}],
  "current_region": "nl",
  "targets": [{"target": "GE_CLUSTER", "region": "ge", "available": true, "current": false}],
- "limits": {"allowed": 2, "used": 1, "remaining": 1, "window_days": 7}}
+ "limits": {"allowed": 2, "used": 1, "remaining": 1, "window_days": 7,
+            "reset_at": "2026-11-09T09:09:57Z"}}
 ```
 
 Отдаются **только страны** (`kind = cluster`) и только те регионы, что включены
 в каталоге бота (`servers.state = '1'`): предлагать выключенный регион значит
 звать человека на нерабочий узел.
+
+`reset_at` — когда лимит сбросится. Поле **необязательное**: его может не быть
+вовсе, и тогда кабинет о дате молчит, а не рисует пустую фразу. Человек с
+исчерпанным лимитом без даты не понимает, ждать ему день или месяц, поэтому
+поле полезно отдавать всегда, когда лимит ограничен по времени.
 
 Отказы: `telegram_required` — у аккаунта нет `chat_id` (платформа работает с
 ним), `account_not_found`; ошибки платформы — свои коды с 502.
