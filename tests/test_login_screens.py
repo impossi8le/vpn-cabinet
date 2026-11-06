@@ -214,9 +214,21 @@ def test_waiting_screen_helps_when_the_letter_is_late(waiting_html: str) -> None
 
     Без подсказки позднее письмо оставляет человека с одной кнопкой «ещё раз»,
     и он не догадывается ни про папку «Спам», ни про опечатку в адресе.
+
+    Ссылку проверяем **точным тегом**, а не подстрокой `/login`: на экране уже
+    есть `action="/login/verify"` и `action="/login/resend"`, и проверка по
+    `/login` истинна без всякой ссылки — ревьюер подтвердил это, убрав `<a>` и
+    оставив тест зелёным. Тег `<a href="/login">` на странице ровно один.
     """
     assert "Спам" in waiting_html
-    assert "/login" in waiting_html  # смена адреса ведёт на форму входа
+    assert '<a href="/login">сменить адрес</a>' in waiting_html
+
+
+def _refusal_text(html: str) -> str:
+    """Текст блока отказа (`<p class="error" role="alert">…</p>`) со страницы."""
+    match = re.search(r'<p class="error" role="alert">(.*?)</p>', html, re.S)
+    assert match is not None, "на экране нет блока отказа"
+    return match.group(1)
 
 
 def test_waiting_screen_keeps_the_refusal_and_the_hint_apart() -> None:
@@ -224,10 +236,22 @@ def test_waiting_screen_keeps_the_refusal_and_the_hint_apart() -> None:
 
     Неверный код и «письма нет» — разные вещи: если смешать их в один текст,
     человек с опечаткой пойдёт искать спам вместо того, чтобы перечитать код.
+
+    Проверка структурная, а не «обе строки где-то на странице». Снятие
+    (мутация): влей подсказку в сам отказ — «Код не подошёл, проверьте спам», —
+    и `"Спам" not in refusal` покраснеет; уберите отдельный абзац — упадёт
+    строка с `hint`. Одного присутствия двух строк мало: слитый текст их тоже
+    содержит.
     """
     html = render_login_waiting(mail="u@example.com", error="Код не подошёл")
-    assert "Код не подошёл" in html
-    assert "Спам" in html
+    refusal = _refusal_text(html)
+    assert "Код не подошёл" in refusal
+    # В самом тексте отказа про спам не сказано — подсказка его не подменяет.
+    assert "Спам" not in refusal
+    # И лежит она своим абзацем ниже кнопки повтора, а не строкой внутри отказа.
+    resend = html.index("Отправить код ещё раз")
+    hint = html.index('<p class="alt-lead">', resend)
+    assert "Спам" in html[hint : html.index("</p>", hint)]
 
 
 # --- семантика цвета на обоих экранах -----------------------------------
