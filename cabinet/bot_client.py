@@ -1356,6 +1356,46 @@ class BotStore:
         data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/paid", json=body)
         return OrderPaid.from_api(data)
 
+    # ---------- смена региона (контракт §7) --------------------------
+
+    def reissue_options(self, account_id: int) -> dict[str, Any]:
+        """Что доступно для смены региона: ключи, направления, лимит.
+
+        `409 telegram_required` — осмысленный отказ: платформа знает человека по
+        `chat_id`, и аккаунту без Telegram перевыпускать нечего. Роут по этому
+        коду показывает своё состояние, а не «не удалось».
+        """
+        return self._get(f"{BOT_PATH}/accounts/{account_id}/reissue-options")
+
+    def create_reissue(
+        self,
+        account_id: int,
+        *,
+        target: str,
+        profile_id: int | str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Заявка на перевыпуск профиля (`POST .../reissues`) → `{"request_id"}`.
+
+        Отказы платформы (`target_is_current`, `target_unavailable`,
+        `invalid_target`, `limit_exceeded`) приходят `BotError` с кодом: разбор
+        общий с остальными вызовами, и второй его копии не заводим.
+        """
+        body: dict[str, Any] = {"target": target}
+        if profile_id is not None:
+            body["profile_id"] = profile_id
+        if filename:
+            body["filename"] = filename
+        return self._request("POST", f"{BOT_PATH}/accounts/{account_id}/reissues", json=body)
+
+    def reissue_status(self, account_id: int, request_id: str) -> dict[str, Any]:
+        """Один опрос заявки (`GET .../reissues/{request_id}`) — без ожидания.
+
+        Ждать в кабинете нельзя: запрос держал бы воркер, пока платформа готовит
+        ключ. Поэтому опрос — отдельными запросами, а темп задаёт страница.
+        """
+        return self._get(f"{BOT_PATH}/accounts/{account_id}/reissues/{quote(request_id)}")
+
     def cancel_order(self, order_id: str) -> Order:
         """Отменить заказ (`POST .../{order_id}/cancel`)."""
         data = self._request("POST", f"{ORDERS_PATH}/{quote(order_id)}/cancel")

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Смена региона{% endblock %}
+{% block content %}
+<div class="nav">
+  {# Возврат к подпискам: регион — свойство ключа, а ключи живут там. #}
+  <a class="back" href="/subscriptions">‹ Назад</a>
+  <span class="t">Смена региона</span>
+  <span class="side"></span>
+</div>
+
+{% if error %}
+{# Отказ по существу: причина названа, повтор возможен, но не вслепую. #}
+<div class="card">
+  <div class="empty-t">Сменить регион не удалось</div>
+  <div class="empty-s">{{ error }}</div>
+</div>
+<a class="btn btn-g" href="/region">Вернуться к выбору</a>
+
+{% elif request %}
+{# Состояние заявки. Три исхода и ни одного «на всякий случай»: идёт, готово,
+   не вышло — разные действия. #}
+{% if request.status == 'completed' %}
+<div class="card">
+  <div class="empty-t">Готово</div>
+  <div class="empty-s">
+    {{ done_text }}
+    {% if request.new_filename %}<br>Файл: {{ request.new_filename }}{% endif %}
+    {% if request.expiration_date %}<br>Действует до: {{ request.expiration_date }}{% endif %}
+  </div>
+</div>
+<a class="btn btn-p" href="/subscriptions">К подпискам</a>
+{% elif request.status == 'failed' %}
+<div class="card">
+  <div class="empty-t">Перевыпуск не удался</div>
+  <div class="empty-s">{{ failed_text }}{% if request.error %} ({{ request.error }}){% endif %}</div>
+</div>
+<a class="btn btn-p" href="/region">Выбрать другое направление</a>
+{% else %}
+<div class="card">
+  <div class="empty-t">Готовим ключ</div>
+  <div class="empty-s">{{ pending_text }}</div>
+</div>
+<a class="btn btn-g" href="/region?request_id={{ request_id }}">Обновить</a>
+{% endif %}
+
+{% else %}
+<h1>Сменить регион</h1>
+<p class="lead">
+  Ключ перевыпускается в другом регионе. Старый отключится после доставки нового,
+  срок действия сохранится.
+</p>
+
+{# Текущий регион называется человеческим именем: код `nl` ничего не говорит,
+   а название уже пришло в целях вместе с признаком `current`. #}
+{% set current = targets | selectattr('current') | list | first %}
+{% if current %}
+<p class="group-t">Сейчас: {{ current.title }}</p>
+{% elif current_region %}
+<p class="group-t">Сейчас: {{ current_region }}</p>
+{% endif %}
+
+{% if limits.remaining is not none and limits.allowed is not none %}
+<p class="micro">
+  Осталось {{ limits.remaining }} из {{ limits.allowed }} за {{ limits.window_days }} дн.
+</p>
+{% endif %}
+
+{% if not targets %}
+<div class="card empty">
+  <div class="empty-t">Направлений нет</div>
+  <div class="empty-s">Сейчас переехать некуда — доступных направлений нет.</div>
+</div>
+{% else %}
+{# Одна форма с двумя списками, а не карточка на каждое направление: так выбор
+   ключа не дублируется, а экран работает без JavaScript. #}
+<form method="post" action="/region">
+  {% if profiles|length > 1 %}
+  <label class="field-label" for="profile_id">Какой ключ менять</label>
+  <select class="field field-mail" id="profile_id" name="profile_id">
+    {% for p in profiles %}
+    <option value="{{ p.id }}">{{ p.filename }}</option>
+    {% endfor %}
+  </select>
+  {% elif profiles %}
+  <input type="hidden" name="profile_id" value="{{ profiles[0].id }}">
+  {% endif %}
+
+  <label class="field-label" for="target">Направление</label>
+  <select class="field field-mail" id="target" name="target">
+    {% for t in targets if t.available and not t.current %}
+    <option value="{{ t.target }}">{{ t.title }}</option>
+    {% endfor %}
+  </select>
+
+  {# Недоступные направления названы, но выбрать их нельзя: «временно
+     недоступно» — факт, а не повод отправить заявку. #}
+  {% set blocked = targets | rejectattr('available') | list %}
+  {% if blocked %}
+  <p class="micro">
+    Недоступны сейчас:
+    {% for t in blocked %}{{ t.title }}{% if not loop.last %}, {% endif %}{% endfor %}
+  </p>
+  {% endif %}
+
+  <button class="btn btn-p" type="submit">Перевыпустить ключ</button>
+</form>
+{% endif %}
+{% endif %}
+{% endblock %}

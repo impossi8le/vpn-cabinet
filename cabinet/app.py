@@ -95,8 +95,10 @@ from cabinet.render import (
     DEFAULT_BUY_DEVICES,
     PURCHASE_DEVICES,
     RATE_LIMIT_ERROR,
+    REGION_UNREACHABLE,
     STATIC_DIR,
     TELEGRAM_CHECK_LABEL,
+    region_error_text,
     render_buy,
     render_buy_confirm,
     render_buy_done,
@@ -107,6 +109,7 @@ from cabinet.render import (
     render_login,
     render_login_telegram,
     render_login_waiting,
+    render_region,
     render_subscriptions,
     trial_refusal_note,
 )
@@ -1753,6 +1756,73 @@ def _add_subscription_routes(
             return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
         response = RedirectResponse(payment.confirmation_url, status_code=303)
         return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+
+    @app.get("/region", response_class=HTMLResponse)
+    def region_page(request: Request, request_id: str = Query(default="")) -> Response:
+        """Смена региона: выбор направления, заявка, состояние заявки (контракт §7).
+
+        Три состояния на одном адресе, и они не смешиваются: `request_id` — это
+        «посмотреть, как идёт заявка», его отсутствие — «выбрать направление»,
+        отказ бота — своя страница с причиной. Отказ платформы («вы уже здесь»,
+        «недоступно», «лимит») показывается своим текстом по коду: свести их в
+        «не удалось» значило бы отнять у человека единственную подсказку.
+        """
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
+            return RedirectResponse("/login", status_code=303)
+
+        if request_id:
+            try:
+                state = store.reissue_status(view.account_id, request_id)
+            except BotUnreachable:
+                return HTMLResponse(render_region(error=REGION_UNREACHABLE))
+            except BotError as exc:
+                return HTMLResponse(render_region(error=region_error_text(exc.code)))
+            return HTMLResponse(render_region(request_id=request_id, request=state))
+
+        try:
+            options = store.reissue_options(view.account_id)
+        except BotUnreachable:
+            return HTMLResponse(render_region(error=REGION_UNREACHABLE))
+        except BotError as exc:
+            # `telegram_required` приходит сюда же: у аккаунта нет Telegram, и
+            # платформа перевыпускать не станет. Это отказ по существу.
+            return HTMLResponse(render_region(error=region_error_text(exc.code)))
+        return HTMLResponse(render_region(options))
+
+    @app.post("/region")
+    def region_request(
+        request: Request,
+        target: str = Form(default=""),
+        profile_id: str = Form(default=""),
+    ) -> Response:
+        """Отправить заявку на перевыпуск в выбранный регион.
+
+        `target` пришёл из формы — но решает не он, а платформа: заявка уходит
+        боту, и отказ платформы возвращается своим кодом. Повтор по тому же
+        ключу безопасен: ключ идемпотентности у заявки свой (дата + направление).
+        """
+        view = sessions.resolve(request.cookies.get(COOKIE_NAME))
+        if view is None:
+            return RedirectResponse("/login", status_code=303)
+        if not target.strip():
+            return RedirectResponse("/region", status_code=303)
+
+        try:
+            result = store.create_reissue(
+                view.account_id,
+                target=target.strip(),
+                profile_id=(profile_id or None),
+            )
+        except BotUnreachable:
+            return HTMLResponse(render_region(error=REGION_UNREACHABLE))
+        except BotError as exc:
+            return HTMLResponse(render_region(error=region_error_text(exc.code)))
+
+        request_id = str(result.get("request_id") or "")
+        if not request_id:
+            return RedirectResponse("/region", status_code=303)
+        return RedirectResponse(f"/region?request_id={quote(request_id)}", status_code=303)
 
     @app.get("/buy/done", response_class=HTMLResponse)
     def buy_done_page(

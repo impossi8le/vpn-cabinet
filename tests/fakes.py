@@ -202,6 +202,39 @@ class FakeApi:
     # Журнал вызовов: тест может утверждать, что кабинет ходил ровно туда,
     # куда должен, и не ходил лишний раз.
     calls: list[tuple[str, dict]] = field(default_factory=list)
+    # Смена региона (контракт §7). `reissue_payload` — что «ответил» бот на
+    # `reissue-options`; `reissue_state` — состояние заявки на опросе;
+    # `reissue_error` — код отказа платформы, чтобы проверять разные тексты.
+    reissue_payload: dict = field(
+        default_factory=lambda: {
+            "profiles": [
+                {"id": 17, "filename": "NLclient285.ovpn", "expiration_date": "2026-12-01"}
+            ],
+            "current_region": "nl",
+            "targets": [
+                {
+                    "target": "GE_CLUSTER",
+                    "region": "ge",
+                    "title": "Германия",
+                    "available": True,
+                    "current": False,
+                },
+                {
+                    "target": "NL_CLUSTER",
+                    "region": "nl",
+                    "title": "Нидерланды",
+                    "available": True,
+                    "current": True,
+                },
+            ],
+            "limits": {"allowed": 2, "used": 1, "remaining": 1, "window_days": 7},
+        }
+    )
+    reissue_state: dict = field(
+        default_factory=lambda: {"status": "queued", "region": "ge", "error": None}
+    )
+    reissue_error: str | None = None
+    reissue_requests: list[dict] = field(default_factory=list)
     _next_account_id: int = 1
     _next_subscription_id: int = 1
     _next_config_id: int = 1
@@ -350,6 +383,43 @@ class FakeApi:
         return 1
 
     # --- подписки и конфиги (W4) -----------------------------------------
+
+    def reissue_options(self, account_id: int) -> dict:
+        """Что доступно для смены региона — как ответил бы бот (контракт §7).
+
+        Аккаунту без Telegram — отказ по существу, а не сбой: платформа знает
+        человека по `chat_id`.
+        """
+        self._log("reissue_options", account_id=account_id)
+        account = self.find_by_id(account_id)
+        if account is None or account.chat_id is None:
+            raise BotError("telegram_required", "у аккаунта нет Telegram", status=409)
+        return dict(self.reissue_payload)
+
+    def create_reissue(
+        self,
+        account_id: int,
+        *,
+        target: str,
+        profile_id: int | str | None = None,
+        filename: str | None = None,
+    ) -> dict:
+        """Заявка на перевыпуск: запоминает, что отправили, и отдаёт номер."""
+        self._log("create_reissue", account_id=account_id, target=target)
+        account = self.find_by_id(account_id)
+        if account is None or account.chat_id is None:
+            raise BotError("telegram_required", "у аккаунта нет Telegram", status=409)
+        if self.reissue_error:
+            raise BotError(self.reissue_error, "отказ платформы", status=409)
+        self.reissue_requests.append(
+            {"target": target, "profile_id": profile_id, "filename": filename}
+        )
+        return {"request_id": "req-1"}
+
+    def reissue_status(self, account_id: int, request_id: str) -> dict:
+        """Состояние заявки, каким его задал тест."""
+        self._log("reissue_status", account_id=account_id, request_id=request_id)
+        return dict(self.reissue_state)
 
     def subscriptions_for(self, account_id: int) -> list[ClientSubscription]:
         """Список подписок аккаунта в форме ответа бота. Пустой список — не

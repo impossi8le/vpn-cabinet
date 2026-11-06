@@ -1549,3 +1549,58 @@ def _config_refusal(error: ConfigError) -> dict[str, object]:
         "note": note,
         "retry_after": getattr(error, "retry_after_seconds", None),
     }
+
+
+# --- смена региона (контракт §7) ------------------------------------------
+
+# Тексты отказов — по коду от бота, а не один на всё: «вы уже здесь» и
+# «направление недоступно» требуют разных действий, и общее «не удалось»
+# лишило бы человека единственной подсказки.
+REGION_ERRORS = {
+    "telegram_required": (
+        "Смена региона доступна аккаунту с привязанным Telegram — платформа знает человека по нему."
+    ),
+    "invalid_target": "Такого направления нет. Выберите другое.",
+    "target_is_current": "Вы уже в этом регионе — выберите другое направление.",
+    "target_unavailable": "Направление временно недоступно. Попробуйте позже.",
+    "limit_exceeded": "Лимит смен региона на эту неделю исчерпан.",
+}
+REGION_UNREACHABLE = "Сервис смены региона не отвечает. Попробуйте позже."
+REGION_PENDING = "Готовим новый ключ — это занимает до минуты. Обновите страницу."
+REGION_DONE = "Новый ключ выпущен. Старый отозван."
+REGION_FAILED = "Перевыпустить не удалось."
+
+
+def region_error_text(code: str | None) -> str:
+    """Текст отказа по коду от бота; незнакомый код — общий текст, без сырого кода."""
+    return REGION_ERRORS.get(str(code or ""), REGION_UNREACHABLE)
+
+
+def render_region(
+    options: dict | None = None,
+    *,
+    request: dict | None = None,
+    request_id: str = "",
+    error: str | None = None,
+) -> str:
+    """Экран смены региона: выбор направления, подтверждение, статус заявки.
+
+    `options` — ответ бота `reissue-options`; `request` — состояние заявки после
+    опроса; `error` — готовый текст отказа. Три состояния разведены, как и на
+    других экранах покупки: показать статус заявки и показать отказ одной
+    страницей значило бы смешать «идёт» с «не вышло».
+    """
+    data = options or {}
+    return _ENV.get_template("region.html").render(
+        **_base_context(),
+        profiles=data.get("profiles") or [],
+        targets=data.get("targets") or [],
+        limits=data.get("limits") or {},
+        current_region=data.get("current_region"),
+        request=request,
+        request_id=request_id,
+        error=error,
+        pending_text=REGION_PENDING,
+        done_text=REGION_DONE,
+        failed_text=REGION_FAILED,
+    )
