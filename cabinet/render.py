@@ -38,12 +38,17 @@ from cabinet.configs import (
 )
 from cabinet.pricing import PriceQuote
 from cabinet.subscriptions import (
+    SORT_EXPIRY,
+    SORT_LATEST,
+    SORT_NAME,
     STATUS_ACTIVE,
     STATUS_BLOCKED,
     STATUS_EXPIRED,
     STATUS_TRIAL,
     STATUS_UNKNOWN,
     SubscriptionView,
+    normalize_sort,
+    sort_views,
 )
 
 __all__ = [
@@ -390,6 +395,7 @@ def _subscription_context(
     error: str | None = None,
     config_error: ConfigError | None = None,
     config_error_id: str | None = None,
+    sort: str | None = None,
 ) -> dict[str, object]:
     """Подписки, какими их видит разметка: состояние, тон, пояснение, срок.
 
@@ -413,31 +419,100 @@ def _subscription_context(
     refusal = (
         _config_refusal(config_error) if config_error is not None and config_error_id else None
     )
-    rows = []
-    for view in views:
+    ordered = sort_views(views, sort=sort)
+
+    def row_of(view: SubscriptionView) -> dict[str, object]:
         days = view.days_left
-        rows.append(
-            {
-                "id": view.id,
-                "name": view.name,
-                "status_label": view.status_label,
-                "note": _SUBSCRIPTION_NOTES.get(view.status, _SUBSCRIPTION_NOTES[STATUS_UNKNOWN]),
-                "tone": theme.tone_for(f"subscription_{view.status}").value,
-                "end_date": _end_date_text(view),
-                "days_left": _pluralize_days(days) if days is not None else None,
-                # Предупреждение о близком сроке — отдельная строка, а не смена
-                # тона: срок не опасность, и красить его нельзя (§7).
-                "expires_soon": view.expires_soon,
-                "usable": view.is_usable,
-                "download_url": f"{CONFIG_DOWNLOAD_BASE}/{view.id}/config",
-                # Отказ виден только на своей карточке; у остальных — None.
-                "refusal": refusal if view.id == config_error_id else None,
-            }
-        )
+        return {
+            "id": view.id,
+            "name": view.name,
+            "status_label": view.status_label,
+            "note": _SUBSCRIPTION_NOTES.get(view.status, _SUBSCRIPTION_NOTES[STATUS_UNKNOWN]),
+            "tone": theme.tone_for(f"subscription_{view.status}").value,
+            "end_date": _end_date_text(view),
+            "days_left": _pluralize_days(days) if days is not None else None,
+            # Предупреждение о близком сроке — отдельная строка, а не смена
+            # тона: срок не опасность, и красить его нельзя (§7).
+            "expires_soon": view.expires_soon,
+            "usable": view.is_usable,
+            "download_url": f"{CONFIG_DOWNLOAD_BASE}/{view.id}/config",
+            # Отказ виден только у своей подписки; у остальных — None.
+            "refusal": refusal if view.id == config_error_id else None,
+        }
+
+    # Истёкшее уезжает в «Историю»: человек должен найти старую подписку, но не
+    # спотыкаться о неё в списке того, чем пользуется сейчас. Заблокированная
+    # остаётся: она не истекла, её разбирают, а не архивируют.
+    rows = [row_of(view) for view in ordered if view.status != STATUS_EXPIRED]
+    history_rows = [row_of(view) for view in ordered if view.status == STATUS_EXPIRED]
     return {
         "rows": rows,
-        "has_subscriptions": bool(rows),
+        "history_rows": history_rows,
+        "has_subscriptions": bool(ordered),
+        "has_history": bool(history_rows),
+        "has_current": bool(rows),
         "subscriptions_known": error is None,
+        "summary": _subscription_summary(ordered, known=error is None),
+        "sort_options": _sort_options(sort),
+    }
+
+
+# Подписи к порядкам списка. Здесь, а не в шаблоне: порядок и его название —
+# одно решение, и разъехаться они не должны.
+_SORT_LABELS = (
+    (SORT_EXPIRY, "По остатку"),
+    (SORT_LATEST, "По новизне"),
+    (SORT_NAME, "По названию"),
+)
+
+
+def _sort_options(sort: str | None) -> list[dict[str, object]]:
+    current = normalize_sort(sort)
+    return [
+        {"value": value, "label": label, "current": value == current}
+        for value, label in _SORT_LABELS
+    ]
+
+
+def _subscription_summary(
+    views: list[SubscriptionView], *, known: bool = True
+) -> dict[str, object]:
+    """Строка состояния наверху экрана: что действует и до какого числа.
+
+    Берётся самая близкая к сроку работающая подписка — независимо от того,
+    какой порядок человек выбрал в списке: предупредить нужно о той, которая
+    кончится раньше всех, а не о верхней строке.
+
+    Когда список **неизвестен** (`error`), строка молчит: «Подключений пока нет»
+    рядом с отказом было бы утверждением о том, чего мы не знаем. Тогда не
+    рисуется и вся верхняя карточка — покупать при недоступном боте тоже нельзя.
+    """
+    if not known or not views:
+        # Пустой экран говорит о себе сам — карточкой «Подписок нет» с кнопкой.
+        # Вторая строка «Подключений пока нет» над ней была бы тем же самым
+        # дважды.
+        return {"text": "", "download_url": None}
+    usable = [view for view in views if view.is_usable]
+    if not usable:
+        return {"text": "Действующих подключений нет", "download_url": None}
+    soonest = min(
+        usable,
+        key=lambda view: (
+            view.end_date is None,
+            view.end_date.timestamp() if view.end_date else 0.0,
+            view.id,
+        ),
+    )
+    if soonest.end_date is None or soonest.days_left is None:
+        text = "Действует — срок не указан"
+    else:
+        text = (
+            f"Действует до {soonest.end_date.strftime('%d.%m.%Y')}"
+            f" · ещё {_pluralize_days(soonest.days_left)}"
+        )
+    return {
+        "text": text,
+        "download_url": f"{CONFIG_DOWNLOAD_BASE}/{soonest.id}/config",
     }
 
 
@@ -523,6 +598,7 @@ def render_subscriptions(
     balance: Balance | None = None,
     referral: Referral | None = None,
     telegram_required: bool = False,
+    sort: str | None = SORT_EXPIRY,
 ) -> str:
     """Экран подписок: срок и состояние каждой, либо честное «подписок нет».
 
@@ -561,6 +637,7 @@ def render_subscriptions(
             error=error,
             config_error=config_error,
             config_error_id=config_error_id,
+            sort=sort,
         ),
         **_money_context(
             balance=balance,

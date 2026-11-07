@@ -1,6 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Мои подключения{% endblock %}
 {% block content %}
+{# Отказ в конфиге рисуется там, где стоит подписка, по которой нажали:
+   у работающей — рядом со ссылкой в блоке файлов, у истёкшей и
+   заблокированной — на самой карточке. Один макрос на все три места: три
+   копии разметки разъехались бы по тексту и по тону. #}
+{% macro refusal_block(refusal) -%}
+<div class="refusal">
+  <p class="refusal-t">{{ refusal.title }}</p>
+  <p class="refusal-s">{{ refusal.note }}</p>
+  {%- if refusal.retry_after %}
+  <p class="refusal-w">Повторить можно примерно через <b class="mono">{{ refusal.retry_after }} с</b>.</p>
+  {%- endif %}
+</div>
+{%- endmacro %}
 <div class="nav">
   {# Слева — пустое место вместо возврата: это главный экран, и «назад» с него
      вело на `/`, который сразу возвращает сюда же, то есть в никуда. #}
@@ -24,117 +37,48 @@
   <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-{# Главное — что у человека есть: срок и скачивание. Этот блок стоит первым,
-   а покупка, баланс и рефералка — ниже. Экран отвечает на вопрос «что у меня
-   есть?», и ответ на него не должен начинаться с предложения купить. #}
-{% if has_subscriptions %}
-  <div class="stack">
-    {%- for row in rows %}
-    <div class="card sub-card">
-      <div class="sub-head">
-        <span class="sub-name">{{ row.name }}</span>
-        {# Значок состояния нейтральный либо янтарный — по тону причины.
-           Зелёного здесь быть не может: активная подписка говорит о сроке, а
-           не о том, что трафик защищён (§7). #}
-        <span class="badge tone-{{ row.tone }}">{{ row.status_label }}</span>
-      </div>
-      {# Срок — сразу под именем, до пояснения: это то, ради чего человек
-         открыл экран. Пояснение к состоянию дублирует дату словами и уходит
-         ниже. #}
-      <dl class="rows">
-        <div class="row">
-          <dt>Срок</dt>
-          <dd>{% if row.end_date %}<span class="mono">{{ row.end_date }}</span>{% else %}неизвестен{% endif %}</dd>
-        </div>
-        {%- if row.days_left %}
-        <div class="row">
-          <dt>Осталось</dt>
-          <dd>{% if row.expires_soon %}<span class="soon">{{ row.days_left }}</span>{% else %}{{ row.days_left }}{% endif %}</dd>
-        </div>
-        {%- endif %}
-      </dl>
-      {# Кнопка скачивания есть только у работающей подписки: у истёкшей и
-         заблокированной конфиг всё равно не отдаётся, и предлагать её значило
-         бы обещать то, что сервис отвергнет. #}
-      {%- if row.usable %}
-      <a class="btn btn-g btn-sm" href="{{ row.download_url }}">Скачать конфиг</a>
-      {%- else %}
-      <p class="sub-unusable">Скачивание недоступно, пока подписка не действует.</p>
-      {%- endif %}
-      {# Отказ в конфиге — на карточке той подписки, по которой нажали скачать.
-         Отдельного экрана для него нет: уехав на другую страницу, человек теряет
-         из виду, к чему относилась ошибка, и возвращается назад. Причина
-         показана там же, где действие, и своим текстом по типу отказа.
-         Тон — нейтральный или процессный: отказ выдачи это состояние, а не
-         опасность, и красного здесь нет (§7). #}
-      {%- if row.refusal %}
-      <div class="refusal">
-        <p class="refusal-t">{{ row.refusal.title }}</p>
-        <p class="refusal-s">{{ row.refusal.note }}</p>
-        {%- if row.refusal.retry_after %}
-        <p class="refusal-w">Повторить можно примерно через <b class="mono">{{ row.refusal.retry_after }} с</b>.</p>
-        {%- endif %}
-      </div>
-      {%- endif %}
-      <p class="sub-note">{{ row.note }}</p>
-      {# Предупреждение о близком сроке — отдельная строка, без смены тона:
-         «скоро истечёт» — это срок, а не опасность. #}
-      {%- if row.expires_soon %}
-      <p class="sub-soon">Подписка скоро закончится — продлите заранее, чтобы не потерять доступ.</p>
-      {%- endif %}
-    </div>
-    {%- endfor %}
+{# Верх экрана — состояние и действия. Экран открывают ради действия: скачать
+   файл или продлить. Поэтому «Скачать конфиг» и «Купить подписку» стоят выше
+   списка, а сам список остаётся справкой о том, что уже есть. Состояние
+   сказано одной строкой: оно отвечает «как у меня дела», но не спорит за
+   место с кнопками. #}
+{% if summary.text %}
+<div class="card action-card">
+  <p class="action-state">{{ summary.text }}</p>
+  <div class="action-btns">
+    {%- if summary.download_url %}
+    <a class="btn btn-p btn-sm" href="{{ summary.download_url }}">Скачать конфиг</a>
+    <a class="btn btn-g btn-sm" href="/buy">Купить подписку</a>
+    {%- else %}
+    <a class="btn btn-p btn-sm" href="/buy">Купить подписку</a>
+    {%- endif %}
   </div>
-{% elif subscriptions_known %}
-  {# Пустой список — состояние экрана, а не ошибка (W4.3): честно говорим, что
-     подписок нет, вместо пустой страницы.
-
-     Но только когда список **известен**. Если выше показан отказ (`error`),
-     список не пуст, а неизвестен, и «Подписок нет» рядом с отказом было бы
-     утверждением о том, чего мы не знаем: человек прочёл бы «у вас ничего нет» и
-     не пошёл бы обновлять страницу. Саму развилку держит
-     `render._subscription_context` — правило одно на все экраны. #}
-  <div class="card empty">
-    <p class="empty-t">Подписок нет</p>
-    <p class="empty-s">Если вы только что оформили подписку — подождите пару минут и обновите. Подписка оформляется в боте сервиса.</p>
-  </div>
+</div>
 {% endif %}
 
-{# Вход в покупку — ниже того, что у человека уже есть. Кабинет должен уметь
-   продавать, но предложение не должно заслонять срок и скачивание. Цену
-   человек увидит на экране покупки, и она считается тем же расчётом, что у
-   бота (§2 спеки). #}
-<div class="cta">
-  <a class="btn btn-p" href="/buy">Купить подписку</a>
-</div>
-
-{# Баланс. Тон нейтральный: деньги — ни защита, ни опасность (§7), поэтому
-   зелёного и красного здесь нет. `balance_text` равно `None` в двух случаях:
-   блок не запрашивали или аккаунт без Telegram — во втором случае рисуется
-   честный текст вместо суммы, а не ноль. #}
-{% if balance_text %}
+{# Баланс и рефералка — под действиями и в одной карточке: они не отвечают на
+   вопрос «что мне сделать», но должны быть под рукой, потому что баланс
+   списывается как скидка при оплате. Тон нейтральный: деньги — ни защита, ни
+   опасность (§7). `balance_text` равно `None` в двух случаях: блок не
+   запрашивали или аккаунт без Telegram — во втором рисуется честный текст
+   вместо суммы, а не ноль. #}
+{% if balance_text or telegram_required or referral_code %}
 <div class="card money-card">
+  {%- if balance_text %}
   <div class="money-row">
     <span class="money-k">Баланс</span>
     <span class="money-v">{{ balance_text }}</span>
   </div>
   <p class="money-note">Спишется как скидка при оплате — покажем её при выборе тарифа.</p>
-</div>
-{% elif telegram_required %}
-<div class="card money-card">
+  {%- elif telegram_required %}
   <div class="money-row">
     <span class="money-k">Баланс</span>
     <span class="money-v money-off">недоступен</span>
   </div>
   <p class="money-note">Баланс и бонусы живут в боте и видны после привязки Telegram.</p>
-</div>
-{% endif %}
-
-{# Рефералка: свой код и сколько по нему пришло. Тон нейтральный — приглашённые
-   не достижение и не защита (§7). Код показывается как есть: его передают
-   другому человеку. #}
-{% if referral_code %}
-<div class="card money-card">
+  {%- endif %}
+  {%- if referral_code %}
+  <div class="money-div"></div>
   <div class="money-row">
     <span class="money-k">Ваш код</span>
     <span class="money-v mono">{{ referral_code }}</span>
@@ -149,7 +93,154 @@
       <dd>{{ referral_earned }}</dd>
     </div>
   </dl>
+  {%- endif %}
 </div>
+{% endif %}
+
+{% if has_subscriptions %}
+  {# Список подключений. Панель раскрыта по умолчанию — это то, за чем экран и
+     открывают; свёрнутыми идут те блоки, которые нужны редко. `details`
+     выбран вместо JavaScript: раскрытие работает и без него, как на смене
+     региона.
+
+     Если действующих нет (остались одни истёкшие), панель не рисуется вовсе:
+     верхняя карточка уже сказала об этом, и второй раз то же самое читать
+     незачем — ниже сразу история. #}
+  {% if has_current %}
+  <details class="panel" open>
+    <summary class="panel-h">
+      <span class="panel-t">Мои подключения</span>
+      <span class="panel-n">{{ rows|length }}</span>
+    </summary>
+
+    {# Порядок списка — ссылками. Работает без JavaScript, состояние живёт в
+       адресе, а не в памяти вкладки. #}
+    <div class="sorter">
+      {%- for opt in sort_options %}
+      <a class="sort{% if opt.current %} is-on{% endif %}" href="/subscriptions?sort={{ opt.value }}"{% if opt.current %} aria-current="true"{% endif %}>{{ opt.label }}</a>
+      {%- endfor %}
+    </div>
+
+    <div class="stack">
+      {%- for row in rows %}
+      <div class="card sub-card">
+        <div class="sub-head">
+          <span class="sub-name">{{ row.name }}</span>
+          {# Значок состояния нейтральный либо янтарный — по тону причины.
+             Зелёного здесь быть не может: активная подписка говорит о сроке, а
+             не о том, что трафик защищён (§7). #}
+          <span class="badge tone-{{ row.tone }}">{{ row.status_label }}</span>
+        </div>
+        {# Срок — сразу под именем, до пояснения: это то, ради чего человек
+           открыл экран. Пояснение к состоянию дублирует дату словами и уходит
+           ниже. #}
+        <dl class="rows">
+          <div class="row">
+            <dt>Срок</dt>
+            <dd>{% if row.end_date %}<span class="mono">{{ row.end_date }}</span>{% else %}неизвестен{% endif %}</dd>
+          </div>
+          {%- if row.days_left %}
+          <div class="row">
+            <dt>Осталось</dt>
+            <dd>{% if row.expires_soon %}<span class="soon">{{ row.days_left }}</span>{% else %}{{ row.days_left }}{% endif %}</dd>
+          </div>
+          {%- endif %}
+        </dl>
+        <p class="sub-note">{{ row.note }}</p>
+        {# Предупреждение о близком сроке — отдельная строка, без смены тона:
+           «скоро истечёт» — это срок, а не опасность. #}
+        {%- if row.expires_soon %}
+        <p class="sub-soon">Подписка скоро закончится — продлите заранее, чтобы не потерять доступ.</p>
+        {%- endif %}
+        {# У работающей подписки отказ живёт в блоке файлов, рядом со ссылкой;
+           здесь он нужен только заблокированной — у неё ссылки нет. #}
+        {%- if row.refusal and not row.usable %}
+        {{ refusal_block(row.refusal) }}
+        {%- endif %}
+      </div>
+      {%- endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  {# История. Истёкшее не удаляется, а уезжает сюда и раскрывается по клику:
+     человек должен найти старую подписку, когда она понадобится, но не
+     спотыкаться о неё в списке того, чем пользуется сейчас. #}
+  {% if has_history %}
+  <details class="panel">
+    <summary class="panel-h">
+      <span class="panel-t">История</span>
+      <span class="panel-n">{{ history_rows|length }}</span>
+    </summary>
+    <div class="stack">
+      {%- for row in history_rows %}
+      <div class="card sub-card sub-card-dim">
+        <div class="sub-head">
+          <span class="sub-name">{{ row.name }}</span>
+          <span class="badge tone-{{ row.tone }}">{{ row.status_label }}</span>
+        </div>
+        <dl class="rows">
+          <div class="row">
+            <dt>Срок</dt>
+            <dd>{% if row.end_date %}<span class="mono">{{ row.end_date }}</span>{% else %}неизвестен{% endif %}</dd>
+          </div>
+        </dl>
+        <p class="sub-note">{{ row.note }}</p>
+        <p class="sub-unusable">Скачивание недоступно, пока подписка не действует.</p>
+        {%- if row.refusal %}
+        {{ refusal_block(row.refusal) }}
+        {%- endif %}
+      </div>
+      {%- endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  {# Конфиги. Раньше кнопка скачивания стояла на каждой карточке и спорила за
+     внимание со сроком; теперь файлы собраны в одно место и свёрнуты —
+     открывают их редко, но когда открывают, ищут именно список файлов. #}
+  {% set configs = rows | selectattr("usable") | list %}
+  {% if configs %}
+  <details class="panel">
+    <summary class="panel-h">
+      <span class="panel-t">Файлы конфигурации</span>
+      <span class="panel-n">{{ configs|length }}</span>
+    </summary>
+    <ul class="files">
+      {%- for row in configs %}
+      <li class="file">
+        <div class="file-h">
+          <span class="file-n">{{ row.name }}</span>
+          <a class="file-a" href="{{ row.download_url }}">Скачать</a>
+        </div>
+        <div class="file-m">{% if row.end_date %}до {{ row.end_date }}{% else %}срок не указан{% endif %}</div>
+        {# Отказ в конфиге — рядом со ссылкой той подписки, по которой нажали:
+           человек нажал здесь — здесь и читает ответ. Тон нейтральный или
+           процессный: отказ выдачи это состояние, а не опасность (§7). #}
+        {%- if row.refusal %}
+        {{ refusal_block(row.refusal) }}
+        {%- endif %}
+      </li>
+      {%- endfor %}
+    </ul>
+  </details>
+  {% endif %}
+{% elif subscriptions_known %}
+  {# Пустой список — состояние экрана, а не ошибка (W4.3): честно говорим, что
+     подписок нет, вместо пустой страницы.
+
+     Но только когда список **известен**. Если выше показан отказ (`error`),
+     список не пуст, а неизвестен, и «Подписок нет» рядом с отказом было бы
+     утверждением о том, чего мы не знаем: человек прочёл бы «у вас ничего нет» и
+     не пошёл бы обновлять страницу. Саму развилку держит
+     `render._subscription_context` — правило одно на все экраны. #}
+  <div class="card empty">
+    <p class="empty-t">Подписок нет</p>
+    <p class="empty-s">Если вы только что оформили подписку — подождите пару минут и обновите. Подписка оформляется в боте сервиса.</p>
+    {# Кнопка здесь, а не отдельной карточкой сверху: пустой экран — уже одна
+       мысль, и покупка — её продолжение, а не второй блок о том же. #}
+    <a class="btn btn-p btn-sm" href="/buy">Купить подписку</a>
+  </div>
 {% endif %}
 
 {% if has_subscriptions %}

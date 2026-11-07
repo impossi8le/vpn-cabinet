@@ -1447,7 +1447,7 @@ def _add_subscription_routes(
     """
 
     @app.get("/subscriptions", response_class=HTMLResponse)
-    def subscriptions_page(request: Request) -> Response:
+    def subscriptions_page(request: Request, sort: str | None = Query(default=None)) -> Response:
         """Список подписок вошедшего аккаунта; без сессии — на вход.
 
         Без сессии здесь **редирект**, а не 500 и не пустой экран: это обычное
@@ -1488,6 +1488,7 @@ def _add_subscription_routes(
                 balance=balance,
                 referral=referral,
                 telegram_required=telegram_required,
+                sort=sort,
             )
         )
 

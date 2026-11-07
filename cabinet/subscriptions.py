@@ -33,6 +33,10 @@ from cabinet.bot_client import Subscription
 
 __all__ = [
     "EXPIRING_SOON_DAYS",
+    "SORTS",
+    "SORT_EXPIRY",
+    "SORT_LATEST",
+    "SORT_NAME",
     "STATUS_ACTIVE",
     "STATUS_BLOCKED",
     "STATUS_EXPIRED",
@@ -42,8 +46,10 @@ __all__ = [
     "SubscriptionView",
     "days_left",
     "is_past",
+    "normalize_sort",
     "normalize_status",
     "resolve_status",
+    "sort_views",
     "subscription_view",
     "subscription_views",
 ]
@@ -91,6 +97,25 @@ _STATUS_ORDER = {
 _FAR_FUTURE = datetime.max.replace(tzinfo=UTC)
 
 _SECONDS_PER_DAY = 86_400
+
+# Порядок списка, который человек выбирает сам. Умолчание — `expiry`: подписку,
+# до конца которой три дня, нельзя прятать под годовой, иначе человек узнаёт о
+# сроке тогда, когда продлевать уже поздно.
+SORT_EXPIRY = "expiry"
+SORT_LATEST = "latest"
+SORT_NAME = "name"
+
+SORTS = (SORT_EXPIRY, SORT_LATEST, SORT_NAME)
+
+
+def normalize_sort(value: str | None) -> str:
+    """Известный порядок из адреса или умолчание.
+
+    Порядок приходит из строки запроса, то есть от кого угодно: чужой опечатки
+    достаточно, чтобы страница упала на `sorted(key=None)`. Неизвестное значение
+    молча становится умолчанием — так же поступает экран покупки с `?days=45`.
+    """
+    return value if value in SORTS else SORT_EXPIRY
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -227,7 +252,7 @@ def subscription_view(subscription: Subscription, *, now: datetime) -> Subscript
 
 
 def subscription_views(
-    subscriptions: Iterable[Subscription], *, now: datetime
+    subscriptions: Iterable[Subscription], *, now: datetime, sort: str = SORT_EXPIRY
 ) -> list[SubscriptionView]:
     """Список подписок для экрана, в порядке показа.
 
@@ -236,17 +261,46 @@ def subscription_views(
     только приводится к порядку.
     """
     views = [subscription_view(item, now=now) for item in subscriptions]
-    return sorted(views, key=_sort_key)
+    return sort_views(views, sort=sort)
 
 
-def _sort_key(view: SubscriptionView) -> tuple[int, datetime, str, str]:
-    """Работающее впереди, внутри — то, что сгорит раньше; подписки без срока
-    в конце. Имя добивает равенство, id — последнее: две подписки с одним
-    именем и сроком не должны меняться местами между запросами, иначе список
-    на экране «дрожит» без причины."""
-    return (
-        _STATUS_ORDER.get(view.status, _STATUS_ORDER[STATUS_UNKNOWN]),
-        view.end_date or _FAR_FUTURE,
-        view.name,
-        view.id,
-    )
+def sort_views(views: list[SubscriptionView], *, sort: str = SORT_EXPIRY) -> list[SubscriptionView]:
+    """Представления в выбранном порядке.
+
+    Работающее впереди неработающего — это общее для всех порядков: порядок
+    выбирает, как читать **внутри** группы, а не выносит закрытую подписку над
+    действующей.
+    """
+    key = {
+        SORT_EXPIRY: _sort_by_expiry,
+        SORT_LATEST: _sort_by_latest,
+        SORT_NAME: _sort_by_name,
+    }[normalize_sort(sort)]
+    return sorted(views, key=key)
+
+
+def _status_rank(view: SubscriptionView) -> int:
+    return _STATUS_ORDER.get(view.status, _STATUS_ORDER[STATUS_UNKNOWN])
+
+
+def _sort_by_expiry(view: SubscriptionView) -> tuple[int, datetime, str, str]:
+    """По остатку: то, что сгорит раньше, — выше; подписки без срока в конце.
+
+    Имя добивает равенство, id — последнее: две подписки с одним именем и
+    сроком не должны меняться местами между запросами, иначе список на экране
+    «дрожит» без причины.
+    """
+    return (_status_rank(view), view.end_date or _FAR_FUTURE, view.name, view.id)
+
+
+def _sort_by_latest(view: SubscriptionView) -> tuple[int, int, float, str, str]:
+    """По новизне: дальний срок — выше. Дата покупки боту неизвестна, а
+    свежая подписка и есть та, у которой срок дальше всех."""
+    if view.end_date is None:
+        return (_status_rank(view), 1, 0.0, view.name, view.id)
+    return (_status_rank(view), 0, -view.end_date.timestamp(), view.name, view.id)
+
+
+def _sort_by_name(view: SubscriptionView) -> tuple[int, str, str]:
+    """По названию, внутри той же группы состояния."""
+    return (_status_rank(view), view.name.casefold(), view.id)

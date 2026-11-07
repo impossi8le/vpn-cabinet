@@ -62,7 +62,7 @@ from cabinet.app import COOKIE_NAME, DEFAULT_SENDER, build_app  # noqa: E402
 from cabinet.bot_client import AUTH_MODE_LOGIN, POLL_CONFIRMED, LoginPoll  # noqa: E402
 from cabinet.mail_sender import Attachment, MailSender  # noqa: E402
 from cabinet.payments import Payment  # noqa: E402
-from tests.fakes import STATUS_ACTIVE, FakeApi, FakeTelegramAuth  # noqa: E402
+from tests.fakes import STATUS_ACTIVE, STATUS_EXPIRED, FakeApi, FakeTelegramAuth  # noqa: E402
 
 PORT = 8111
 
@@ -221,6 +221,21 @@ def seeded_api() -> FakeApi:
         name="Нидерланды · Амстердам",
         status=STATUS_ACTIVE,
         expires_at=datetime(2026, 11, 22, 12, 0, tzinfo=UTC),
+    )
+    # Ещё две подписки того же аккаунта: без них новый главный экран нечем
+    # проверить — «История» без истёкшей не рисуется, а порядок на одной
+    # строке ничего не показывает.
+    api.add_subscription(
+        telegram_only.id,
+        name="Германия · Франкфурт",
+        status=STATUS_ACTIVE,
+        expires_at=datetime(2027, 3, 1, 12, 0, tzinfo=UTC),
+    )
+    api.add_subscription(
+        telegram_only.id,
+        name="Финляндия · Хельсинки",
+        status=STATUS_EXPIRED,
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
     )
 
     # Серверы для шага 4 покупки. Имена — отображаемые (их видит человек), коды —
