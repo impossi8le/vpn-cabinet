@@ -9,7 +9,9 @@ body {
   background: var(--void);
   color: var(--bone);
   font-family: Inter, "Segoe UI", -apple-system, system-ui, sans-serif;
-  font-size: 15px;
+  /* Крупнее базовой 15px: экран читают и на телефоне, и человек, которому
+     мелкий текст — главная причина «не разобрался». */
+  font-size: 16px;
   -webkit-font-smoothing: antialiased;
   min-height: 100vh;
   display: flex;
@@ -27,7 +29,7 @@ body {
   justify-content: space-between;
   padding: 2px 0 18px;
 }
-.nav .t { font-size: 16.5px; font-weight: 590; letter-spacing: -0.015em; }
+.nav .t { font-size: 17px; font-weight: 590; letter-spacing: -0.015em; }
 /* `.back` — возврат, `.link` — переход вперёд: вид у них один, и это один
    смысл «ссылка в шапке», поэтому правило общее. Разные имена — чтобы в
    разметке было видно, куда ссылка ведёт. */
@@ -49,8 +51,8 @@ body {
 }
 .mark svg { width: 25px; height: 25px; }
 
-h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.022em; line-height: 1.18; margin-bottom: 11px; }
-.lead { color: var(--text-secondary); font-size: 14px; line-height: 1.6; margin-bottom: 20px; }
+h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.022em; line-height: 1.18; margin-bottom: 11px; }
+.lead { color: var(--text-secondary); font-size: 15px; line-height: 1.62; margin-bottom: 20px; }
 
 /* Нумерованные шаги. Номер — в кружке с границей Edge, текст Mist:
    граница заметная, но не акцентная — это пояснение, а не статус. */
@@ -98,9 +100,10 @@ a.btn { text-decoration: none; }
 }
 
 .btn {
-  height: 50px; border-radius: var(--radius-button);
+  /* 54px — палец на телефоне попадает без прицеливания, а не «в почти». */
+  height: 54px; border-radius: var(--radius-button);
   display: flex; align-items: center; justify-content: center; gap: 8px;
-  font-size: 16.5px; font-weight: 590; letter-spacing: -0.01em;
+  font-size: 17px; font-weight: 590; letter-spacing: -0.01em;
   cursor: pointer; border: none; width: 100%; font-family: inherit;
 }
 /* Главная кнопка белая: своего брендового цвета у продукта нет (§7). */
@@ -111,7 +114,7 @@ a.btn { text-decoration: none; }
 /* Первая кнопка внутри любого блока отступа сверху не требует — блок сам даёт
    воздух; а вот следующая за текстом требует, иначе она к тексту прилипает. */
 .btn:first-child { margin-top: 0; }
-.btn-sm { height: 46px; font-size: 15px; }
+.btn-sm { height: 50px; font-size: 16px; }
 .btn + .btn { margin-top: 9px; }
 /* Кнопка не должна прилипать к тексту над ней. `.btn + .btn` разводит только
    пару кнопок, а после абзаца кнопка вставала вплотную — на итоговой карточке
@@ -126,9 +129,9 @@ p + .btn { margin-top: 12px; }
 
 /* Поле кода. Цвета заданы явно — без этого браузер рисует ввод почти чёрным
    на тёмном, и код не виден. */
-.field-label { display: block; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 7px; }
+.field-label { display: block; font-size: 13.5px; color: var(--text-secondary); margin-bottom: 7px; }
 .field {
-  width: 100%; height: 50px; font-size: 22px; letter-spacing: 0.35em;
+  width: 100%; height: 54px; font-size: 22px; letter-spacing: 0.35em;
   font-family: "JetBrains Mono", Consolas, ui-monospace, monospace;
   background: var(--obsidian); color: var(--bone);
   border: 0.5px solid var(--edge); border-radius: var(--radius-button);
@@ -283,7 +286,7 @@ p + .btn { margin-top: 12px; }
    Выбранный обведён Ice: это выделение выбора («сюда смотреть»), а не статус.
    Зелёного здесь нет намеренно — цена и скидка о защите не говорят (§7). */
 .group { margin-bottom: 18px; }
-.group-t { color: var(--text-secondary); font-size: 12.5px; margin-bottom: 8px; }
+.group-t { color: var(--text-secondary); font-size: 13.5px; line-height: 1.5; margin-bottom: 14px; }
 .options { display: flex; flex-direction: column; gap: 8px; }
 .opt {
   display: block; text-decoration: none; color: inherit;
