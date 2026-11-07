@@ -34,6 +34,7 @@ from cabinet.app import (
     UNLINK_LAST_METHOD_ERROR,
     build_app,
 )
+from cabinet.configs import OVPN_CONTENT_TYPE
 from cabinet.mail_sender import MailSender
 from tests.fakes import FakeApi, FakeMailSender
 
@@ -317,22 +318,32 @@ def test_downloading_by_expired_subscription_refuses_on_the_card(
     assert "# fake .ovpn" not in response.text
 
 
-def test_downloading_unknown_subscription_still_explains_the_refusal(
+def test_downloading_unknown_subscription_answers_404_not_a_saved_page(
     client: TestClient, sender: FakeMailSender
 ) -> None:
-    """Подписки с таким id нет — отказ всё равно виден, а не проглочен.
+    """Подписки с таким id нет — 404, а не 200 с HTML под именем `.ovpn`.
 
-    Адрес назвал подписку, которой у аккаунта нет: карточки для неё на экране
-    нет, и отказ, положенный «на карточку», не показался бы нигде — человек
-    увидел бы обычный список и не понял, почему скачивание не началось. Поэтому
-    здесь отказ уходит в общий текст экрана.
+    Живой дефект: страница подписок была открыта раньше, ключ к тому времени
+    перевыпущен (смена региона отзывает старый), и адрес назвал подписку,
+    которой у аккаунта больше нет. Кабинет отвечал `200` и HTML-страницей —
+    браузер сохранял её как `.ovpn`, и файл не работал. Код `404` не даёт
+    браузеру принять разметку за файл.
+
+    Тело при этом не пустое: человек уже смотрит на скачанный мусор, и ему
+    нужно объяснение — прежний ключ мог быть отозван, актуальный лежит в
+    списке. Это тот же текст, что и на экране, а не «конфиг не найден».
     """
     _sign_in(client, sender)
 
     response = client.get("/subscriptions/424242/config", follow_redirects=False)
 
-    assert response.status_code == 200
+    assert response.status_code == 404
     assert SUBSCRIPTIONS_UNKNOWN_CONFIG in response.text
+    # Причина названа: ключ мог быть перевыпущен, а не «что-то сломалось».
+    assert "перевыпуск" in response.text
+    assert "региона" in response.text
+    # И это страница, а не профиль: иначе браузер снова сохранил бы её как файл.
+    assert not response.headers["content-type"].startswith(OVPN_CONTENT_TYPE)
 
 
 def test_downloading_config_without_session_redirects_to_login(client: TestClient) -> None:
