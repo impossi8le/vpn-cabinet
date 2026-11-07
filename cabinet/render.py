@@ -1633,9 +1633,16 @@ def render_region(
     # мы не прочитали: пустой словарь честнее падения на `get`.
     limits = data.get("limits")
     limits = limits if isinstance(limits, dict) else {}
+    profiles = data.get("profiles") or []
     return _ENV.get_template("region.html").render(
         **_base_context(),
-        profiles=data.get("profiles") or [],
+        profiles=profiles,
+        # Активный ключ — первый в списке бота: отдельного признака «активен»
+        # в ответе нет, а список приходит в порядке платформы, где действующий
+        # профиль идёт первым (UX-модель §5 п. 6: «активные сверху»). Кабинет
+        # показывает его сразу, остальные прячет в `<details>`: у активного
+        # клиента профилей десятки, и список из них читается как свалка.
+        active_profile=profiles[0] if profiles else None,
         targets=data.get("targets") or [],
         limits=limits,
         reset_date=format_reset_date(limits.get("reset_at")),

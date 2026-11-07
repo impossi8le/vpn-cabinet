@@ -75,16 +75,31 @@
   <div class="empty-s">Сейчас переехать некуда — доступных направлений нет.</div>
 </div>
 {% else %}
+{# Активный ключ — сразу и без раскрытия: отдельного признака в ответе нет,
+   поэтому это первый профиль списка (активные приходят сверху). У активного
+   клиента профилей десятки, и общий список из них читается как свалка,
+   поэтому остальные спрятаны ниже. #}
+{% if active_profile %}
+<p class="group-t">Активный ключ</p>
+<p class="key-current mono">{{ active_profile.filename }}</p>
+{% endif %}
+
 {# Одна форма с двумя списками, а не карточка на каждое направление: так выбор
    ключа не дублируется, а экран работает без JavaScript. #}
 <form method="post" action="/region">
   {% if profiles|length > 1 %}
-  <label class="field-label" for="profile_id">Какой ключ менять</label>
-  <select class="field field-mail" id="profile_id" name="profile_id">
-    {% for p in profiles %}
-    <option value="{{ p.id }}">{{ p.filename }}</option>
-    {% endfor %}
-  </select>
+  {# Прогрессивное раскрытие штатным `<details>`: остальные ключи есть, но не
+     занимают экран. Выбор остаётся в той же форме и уходит на сервер, даже
+     когда раскрытие закрыто, — JavaScript для этого не нужен. #}
+  <details class="more-keys">
+    <summary>Показать все ({{ profiles|length }})</summary>
+    <label class="field-label" for="profile_id">Какой ключ менять</label>
+    <select class="field field-mail" id="profile_id" name="profile_id">
+      {% for p in profiles %}
+      <option value="{{ p.id }}">{{ p.filename }}</option>
+      {% endfor %}
+    </select>
+  </details>
   {% elif profiles %}
   <input type="hidden" name="profile_id" value="{{ profiles[0].id }}">
   {% endif %}
