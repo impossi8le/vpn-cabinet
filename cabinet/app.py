@@ -738,7 +738,12 @@ def build_app(
             # экран входа, который обязан оставаться формой (Review Focus).
             return response
         if view is not None:
-            _set_session_cookie(response, view.token, max_age=sessions.max_age(view))
+            _set_session_cookie(
+                response,
+                view.token,
+                max_age=sessions.max_age(view),
+                secure=_cookie_secure(request),
+            )
         return response
 
     _add_login_routes(
@@ -854,7 +859,13 @@ def _add_login_routes(
             )
         )
         response.delete_cookie(LOGIN_NOTICE_COOKIE, path="/")
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.post("/login")
     def login_request(request: Request, mail: str = Form(default="")) -> Response:
@@ -867,11 +878,12 @@ def _add_login_routes(
         """
         address = mail.strip().lower()
         if not address:
-            return _login_refusal(LOGIN_MAIL_REQUIRED, mail=mail)
+            return _login_refusal(request, LOGIN_MAIL_REQUIRED, mail=mail)
         try:
             signin.request_mail_code(address)
         except RateLimited as exc:
             return _login_refusal(
+                request,
                 RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
                 mail=address,
                 retry_after=exc.retry_after_seconds,
@@ -879,7 +891,7 @@ def _add_login_routes(
         except (SignInError, AuthMailError):
             # Один текст на «адрес пуст», «письмо не ушло» и прочие отказы: не
             # выдаём, кто зарегистрирован (§3.3).
-            return _login_refusal(LOGIN_MAIL_ERROR, mail=address)
+            return _login_refusal(request, LOGIN_MAIL_ERROR, mail=address)
         # Шаг воронки — только на успехе: письмо ушло (issue #64). Отказ сюда не
         # пишется, иначе «запросил код» считался бы и у тех, кому код не ушёл.
         visitor, is_new = _visitor_of(request)
@@ -888,7 +900,13 @@ def _add_login_routes(
         # хранить его между запросами незачем. Отказ так не делается: там
         # ссылка обязана остаться голой (issue #55).
         response = RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.get("/login/waiting", response_class=HTMLResponse)
     def login_waiting(
@@ -931,18 +949,18 @@ def _add_login_routes(
         try:
             result = signin.sign_in_with_mail(mail, code)
         except MailSignInError:
-            return _waiting_refusal(CODE_ERROR, mail=mail)
+            return _waiting_refusal(request, CODE_ERROR, mail=mail)
         except SignInError:
             # Не отказ кода, а расхождение состояния — тот же экран, но текст
             # про сбой, а не про цифры.
-            return _waiting_refusal(LOGIN_MAIL_ERROR, mail=mail)
+            return _waiting_refusal(request, LOGIN_MAIL_ERROR, mail=mail)
         except BotUnreachable:
             # Код верен, а аккаунт прочитать не у кого: `sign_in_with_mail` ищет
             # его у бота (`find_by_mail`) и там же заводит. Недоступность бота —
             # не «код не подошёл» и не сбой сервера (#49). На форму входа, а не
             # на экран кода: код уже погашен проверкой, и держать поле ввода
             # значило бы предложить ввести то, что не примут (`LOGIN_BOT_UNREACHABLE`).
-            return _login_refusal(LOGIN_BOT_UNREACHABLE, mail=mail)
+            return _login_refusal(request, LOGIN_BOT_UNREACHABLE, mail=mail)
 
         # Шаг воронки: успешный вход. Здесь уже есть `account_id` — по нему бот
         # и сшивает анонимные шаги с человеком (issue #64).
@@ -950,9 +968,18 @@ def _add_login_routes(
         _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
         response = RedirectResponse("/subscriptions", status_code=303)
         _set_session_cookie(
-            response, result.session.token, max_age=sessions.max_age(result.session)
+            response,
+            result.session.token,
+            max_age=sessions.max_age(result.session),
+            secure=_cookie_secure(request),
         )
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.post("/login/verify")
     def login_verify_alias(
@@ -970,7 +997,7 @@ def _add_login_routes(
         return login_verify(request, mail=mail, code=code)
 
     @app.post("/login/resend")
-    def login_resend(mail: str = Form(default="")) -> RedirectResponse:
+    def login_resend(request: Request, mail: str = Form(default="")) -> RedirectResponse:
         """Повторно отправить код на адрес с экрана ожидания.
 
         Тот же путь, что у первого запроса, и та же защита: отказ сводится к
@@ -980,17 +1007,18 @@ def _add_login_routes(
         """
         address = mail.strip().lower()
         if not address:
-            return _waiting_refusal(LOGIN_MAIL_REQUIRED, mail=mail)
+            return _waiting_refusal(request, LOGIN_MAIL_REQUIRED, mail=mail)
         try:
             signin.request_mail_code(address)
         except RateLimited as exc:
             return _waiting_refusal(
+                request,
                 RATE_LIMIT_ERROR.format(seconds=exc.retry_after_seconds),
                 mail=address,
                 retry_after=exc.retry_after_seconds,
             )
         except (SignInError, AuthMailError):
-            return _waiting_refusal(LOGIN_MAIL_ERROR, mail=address)
+            return _waiting_refusal(request, LOGIN_MAIL_ERROR, mail=address)
         return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
 
     @app.get("/login/telegram", response_class=HTMLResponse)
@@ -1220,12 +1248,19 @@ def _telegram_finish(
     visitor, is_new = _visitor_of(request)
     _record_event(store, visitor=visitor, step="signed_in", account_id=result.account.id)
     response = RedirectResponse("/subscriptions", status_code=303)
-    _set_session_cookie(response, result.session.token, max_age=sessions.max_age(result.session))
-    return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+    _set_session_cookie(
+        response,
+        result.session.token,
+        max_age=sessions.max_age(result.session),
+        secure=_cookie_secure(request),
+    )
+    return _set_visitor_cookie(
+        response, visitor, is_new=is_new, max_age=sessions.ttl, secure=_cookie_secure(request)
+    )
 
 
 def _login_refusal(
-    message: str, *, mail: str = "", retry_after: int | None = None
+    request: Request, message: str, *, mail: str = "", retry_after: int | None = None
 ) -> RedirectResponse:
     """Увести на форму входа с отказом — адрес остаётся голым `/login`.
 
@@ -1235,12 +1270,18 @@ def _login_refusal(
     заново; он гасится тем же GET, что показывает отказ.
     """
     response = RedirectResponse("/login", status_code=303)
-    _set_login_notice(response, error=message, mail=mail, retry_after=retry_after)
+    _set_login_notice(
+        response,
+        error=message,
+        mail=mail,
+        retry_after=retry_after,
+        secure=_cookie_secure(request),
+    )
     return response
 
 
 def _waiting_refusal(
-    message: str, *, mail: str = "", retry_after: int | None = None
+    request: Request, message: str, *, mail: str = "", retry_after: int | None = None
 ) -> RedirectResponse:
     """Увести на экран кода с отказом — тем же одноразовым способом.
 
@@ -1249,7 +1290,13 @@ def _waiting_refusal(
     чтобы поле и шаг не терялись между переходами.
     """
     response = RedirectResponse("/login/waiting", status_code=303)
-    _set_login_notice(response, error=message, mail=mail, retry_after=retry_after)
+    _set_login_notice(
+        response,
+        error=message,
+        mail=mail,
+        retry_after=retry_after,
+        secure=_cookie_secure(request),
+    )
     return response
 
 
@@ -1259,6 +1306,7 @@ def _set_login_notice(
     error: str,
     mail: str = "",
     retry_after: int | None = None,
+    secure: bool,
 ) -> None:
     """Положить отказ экрана входа в одноразовую cookie.
 
@@ -1275,6 +1323,7 @@ def _set_login_notice(
         httponly=True,
         samesite="lax",
         path="/",
+        secure=secure,
     )
 
 
@@ -1328,7 +1377,20 @@ def _telegram_retry(challenge: Challenge, public_code: str, message: str) -> HTM
     )
 
 
-def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -> None:
+def _cookie_secure(request: Request) -> bool:
+    """Пришёл ли запрос по https — решает флаг `Secure` у cookie.
+
+    За прокси схему ставит nginx заголовком `X-Forwarded-Proto`, и uvicorn
+    подставляет её в `scope["scheme"]`; `request.url.scheme` читает уже её.
+    Локальный запуск по `http://127.0.0.1` даёт `http`, и cookie без `Secure`
+    доходит до браузера — иначе вход на стенде не работал бы вовсе.
+    """
+    return request.url.scheme == "https"
+
+
+def _set_session_cookie(
+    response: Response, token: str, *, max_age: timedelta, secure: bool
+) -> None:
     """Положить токен сессии в cookie так, чтобы JS до него не дотянулся.
 
     `httponly` — токен не читается из разметки; `samesite="lax"` — переход по
@@ -1341,10 +1403,9 @@ def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -
     сессии**, а не «полный TTL»: у живого хранилища его задаёт бот, и cookie не
     должна переживать запись.
 
-    `secure` здесь **не** ставится: кабинет на этой волне запускается по
-    `http://127.0.0.1`, и `Secure`-cookie браузер по http не отправил бы вовсе.
-    Боевой кабинет стоит за nginx с TLS, и там флаг выставляется — но это
-    параметр развёртывания (W6.7), а не умолчание, ломающее локальный запуск.
+    `secure` приходит из схемы запроса (`_cookie_secure`): по https браузер
+    обязан не отдавать токен в открытом канале, а по http стенда флаг сломал бы
+    вход. Поэтому это не константа и не настройка развёртывания.
     """
     response.set_cookie(
         COOKIE_NAME,
@@ -1353,6 +1414,7 @@ def _set_session_cookie(response: Response, token: str, *, max_age: timedelta) -
         httponly=True,
         samesite="lax",
         path="/",
+        secure=secure,
     )
 
 
@@ -1407,15 +1469,15 @@ def _record_event(
 
 
 def _set_visitor_cookie(
-    response: Response, visitor: str, *, is_new: bool, max_age: timedelta
+    response: Response, visitor: str, *, is_new: bool, max_age: timedelta, secure: bool
 ) -> Response:
     """Поставить cookie посещения, если оно новое, и вернуть ответ.
 
     `HttpOnly` и `SameSite=Lax` — те же, что у сессии, и по тем же причинам:
     значение не секрет, но разметке в нём делать нечего, а переход по внешней
-    ссылке обязан донести его до кабинета. `Secure` не ставится ради локального
-    `http://127.0.0.1` (как у `_set_session_cookie`). Уже известное посещение
-    cookie не переписывает: иначе каждое событие заводило бы нового человека.
+    ссылке обязан донести его до кабинета. `Secure` — из схемы запроса, как у
+    `_set_session_cookie`. Уже известное посещение cookie не переписывает: иначе
+    каждое событие заводило бы нового человека.
     """
     if is_new:
         response.set_cookie(
@@ -1425,6 +1487,7 @@ def _set_visitor_cookie(
             httponly=True,
             samesite="lax",
             path="/",
+            secure=secure,
         )
     return response
 
@@ -1525,7 +1588,13 @@ def _add_subscription_routes(
                 devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
             )
         )
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.get("/buy/confirm", response_class=HTMLResponse)
     def buy_confirm_page(
@@ -1569,7 +1638,13 @@ def _add_subscription_routes(
                 free=free,
             )
         )
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.get("/buy/servers", response_class=HTMLResponse)
     def buy_servers_page(
@@ -1802,7 +1877,13 @@ def _add_subscription_routes(
         if not payment.confirmation_url:
             return _pay_screen("payment_failed", chosen_days, chosen_devices, picks)
         response = RedirectResponse(payment.confirmation_url, status_code=303)
-        return _set_visitor_cookie(response, visitor, is_new=is_new, max_age=sessions.ttl)
+        return _set_visitor_cookie(
+            response,
+            visitor,
+            is_new=is_new,
+            max_age=sessions.ttl,
+            secure=_cookie_secure(request),
+        )
 
     @app.get("/region", response_class=HTMLResponse)
     def region_page(request: Request, request_id: str = Query(default="")) -> Response:
