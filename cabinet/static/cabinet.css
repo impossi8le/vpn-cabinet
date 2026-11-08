@@ -116,6 +116,21 @@ a.btn { text-decoration: none; }
 .btn:first-child { margin-top: 0; }
 .btn-sm { height: 50px; font-size: 16px; }
 .btn + .btn { margin-top: 9px; }
+/* Кнопки, разделённые обёрткой. `.btn + .btn` разводит только соседей, а на
+   экранах входа и привязки каждая кнопка живёт в своём `<form>`, и между ними
+   стоял ноль: «Проверить вход» упиралась в «Открыть Telegram», а та — в «Войти
+   заново». Те же 9px, что у пары кнопок: это один и тот же ряд действий. */
+.btn + form,
+form + .btn,
+form + form,
+.card + .btn,
+.card + form,
+.rows + form,
+.sub-note + form,
+p + form { margin-top: 9px; }
+/* Поле перед кнопкой. На экране смены региона нет абзаца-ошибки между ними,
+   поэтому `p + .btn` не срабатывал и кнопка упиралась в выпадающий список. */
+.field + .btn { margin-top: 12px; }
 /* Кнопка не должна прилипать к тексту над ней. `.btn + .btn` разводит только
    пару кнопок, а после абзаца кнопка вставала вплотную — на итоговой карточке
    шага серверов надпись «Готово: выбрано ровно столько…» упиралась в кнопку
@@ -232,6 +247,10 @@ p + .btn { margin-top: 12px; }
 .quiet { margin-top: 18px; text-align: center; }
 .quiet-note { color: var(--ash); font-size: 12px; line-height: 1.55; margin-bottom: 6px; }
 .quiet a { color: var(--text-secondary); font-size: 12.5px; text-decoration: none; }
+/* Поднятая к действиям смена региона — одной строкой и по левому краю: это
+   приписка к кнопкам, а не отдельный блок внизу экрана. */
+.quiet-under-actions { margin-top: 10px; text-align: left; }
+.quiet-under-actions .quiet-note { margin-bottom: 0; }
 .quiet a:hover { color: var(--ice); }
 
 /* Раскрытие списка ключей. Штатный `<details>`: работает без JavaScript, а
