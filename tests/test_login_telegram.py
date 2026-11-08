@@ -106,6 +106,15 @@ def test_reopen_button_opens_the_bot_again(telegram_html: str) -> None:
     assert BOT_LINK in telegram_html
 
 
+def test_bot_link_comes_before_the_code_field(telegram_html: str) -> None:
+    """Сначала дорога в бота, потом поле кода — в порядке, как это делают.
+
+    Код берётся только из чата: человек не может ввести его, не открыв
+    Telegram. Кнопка ниже поля предлагала шаг, который ещё не сделан.
+    """
+    assert telegram_html.index("Открыть Telegram") < telegram_html.index("Код из бота")
+
+
 def test_reopen_link_is_a_link_not_a_form(telegram_html: str) -> None:
     """«Открыть Telegram» — ссылка: адрес открывается переходом, не POST.
 
