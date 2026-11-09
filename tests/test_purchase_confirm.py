@@ -26,6 +26,7 @@ from cabinet.bot_client import BotUnreachable
 from cabinet.mail_sender import MailSender
 from cabinet.render import (
     TRIAL_AVAILABLE_NOTE,
+    TRIAL_DAYS,
     TRIAL_REASON_TEXTS,
     TRIAL_UNKNOWN_REASON_NOTE,
     TRIAL_UNREACHABLE_NOTE,
@@ -127,6 +128,7 @@ def test_trial_available_is_shown_as_a_fact() -> None:
     html = _client_for(api, account.id).get("/buy/confirm").text
 
     assert TRIAL_AVAILABLE_NOTE in html
+    assert f"{TRIAL_DAYS} дней" in TRIAL_AVAILABLE_NOTE
 
 
 def test_trial_refusal_shows_a_russian_reason_not_the_code() -> None:

@@ -98,6 +98,8 @@ from cabinet.render import (
     REGION_UNREACHABLE,
     STATIC_DIR,
     TELEGRAM_CHECK_LABEL,
+    TRIAL_DAYS,
+    TRIAL_DEVICES,
     region_error_text,
     render_buy,
     render_buy_confirm,
@@ -369,6 +371,21 @@ def _purchase_query(days: int, devices: int, picks: list[str], *, free: bool = F
     if free:
         parts.append("free=1")
     return "&".join(parts)
+
+
+def _purchase_pair(days: int | None, devices: int | None, *, free: bool) -> tuple[int, int]:
+    """Пара заказа: бесплатный путь всегда `TRIAL_DAYS` на `TRIAL_DEVICES`.
+
+    `free=1` приходит из адреса, а адрес набирается руками, поэтому пара
+    берётся из констант. Платный путь — срок из `PRICES` и число из
+    `PURCHASE_DEVICES`; всё остальное падает на дефолты экрана.
+    """
+    if free:
+        return TRIAL_DAYS, TRIAL_DEVICES
+    return (
+        days if days in PRICES else DEFAULT_BUY_DAYS,
+        devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
+    )
 
 
 # Бот недоступен на **входе**, и текст здесь свой — не по недосмотру. Код к этому
@@ -1625,17 +1642,24 @@ def _add_subscription_routes(
         visitor, is_new = _visitor_of(request)
         _record_event(store, visitor=visitor, step="confirm_shown", account_id=view.account_id)
         trial, trial_unreachable = _trial_eligibility(store, view.account_id)
+        chosen_days, chosen_devices = _purchase_pair(days, devices, free=free)
+        render_free = free
+        if free and not trial_unreachable and not (trial is not None and trial.eligible):
+            # У 7-дневного триала нет платного двойника: на отказе показываем
+            # платный тариф по умолчанию, а не бесплатную пару без цены.
+            chosen_days, chosen_devices = DEFAULT_BUY_DAYS, DEFAULT_BUY_DEVICES
+            render_free = False
         response = HTMLResponse(
             render_buy_confirm(
-                days=days if days in PRICES else DEFAULT_BUY_DAYS,
-                devices=devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES,
+                days=chosen_days,
+                devices=chosen_devices,
                 trial=trial,
                 trial_unreachable=trial_unreachable,
                 # Признак бесплатного пути экран не проверяет, а **несёт дальше**:
                 # проверка права стоит на шаге оплаты, там же, где выдаётся
                 # конфиг. Здесь он нужен только чтобы кнопка и адрес не потеряли
                 # бесплатную пару по дороге.
-                free=free,
+                free=render_free,
             )
         )
         return _set_visitor_cookie(
@@ -1669,7 +1693,7 @@ def _add_subscription_routes(
         """
         if sessions.resolve(request.cookies.get(COOKIE_NAME)) is None:
             return RedirectResponse("/login", status_code=303)
-        chosen = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
+        chosen_days, chosen = _purchase_pair(days, devices, free=free)
         try:
             servers = store.list_servers()
             error: str | None = None
@@ -1684,7 +1708,7 @@ def _add_subscription_routes(
         picks = [code for code in (pick or []) if code in known][:chosen]
         return HTMLResponse(
             render_buy_servers(
-                days=days if days in PRICES else DEFAULT_BUY_DAYS,
+                days=chosen_days,
                 devices=chosen,
                 servers=servers,
                 picked=picks,
@@ -1738,7 +1762,7 @@ def _add_subscription_routes(
         уже подменёнными на бесплатные): `free=1&days=360&devices=3` иначе выдал
         бы год на три устройства даром.
 
-        Сумма заказа — **ноль**, а не цена тридцати дней: бесплатность здесь не
+        Сумма заказа — **ноль**, а не цена платного срока: бесплатность здесь не
         скидка, а право на пробный период, и платёж по такому заказу не
         создаётся вовсе.
         """
@@ -1797,7 +1821,7 @@ def _add_subscription_routes(
         купить за рубль — это первый пункт Review Focus плана.
 
         `free=True` — бесплатный путь, и тогда пара **не из адреса**, а
-        бесплатная (30 дней, одно устройство): право на триал проверяется здесь
+        бесплатная (7 дней, одно устройство): право на триал проверяется здесь
         же, и без подмены пары `free=1` в ссылке давал бы что угодно даром.
 
         Состояния разведены и не смешиваются: нет сессии — на вход; у аккаунта
@@ -1810,11 +1834,7 @@ def _add_subscription_routes(
         view = sessions.resolve(request.cookies.get(COOKIE_NAME))
         if view is None:
             return RedirectResponse("/login", status_code=303)
-        if free:
-            chosen_days, chosen_devices = DEFAULT_BUY_DAYS, DEFAULT_BUY_DEVICES
-        else:
-            chosen_days = days if days in PRICES else DEFAULT_BUY_DAYS
-            chosen_devices = devices if devices in PURCHASE_DEVICES else DEFAULT_BUY_DEVICES
+        chosen_days, chosen_devices = _purchase_pair(days, devices, free=free)
 
         try:
             servers = store.list_servers()

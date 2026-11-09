@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from cabinet.app import build_app
 from cabinet.mail_sender import MailSender
 from cabinet.payments import Payment
-from cabinet.render import TRIAL_REASON_TEXTS
+from cabinet.render import TRIAL_DAYS, TRIAL_REASON_TEXTS
 from tests.fakes import FakeApi, FakeMailSender
 from tests.markup import hrefs, link, link_containing
 
@@ -175,18 +175,34 @@ def test_free_access_is_named_apart_from_the_paid_tariffs() -> None:
 
     html = client.get("/buy").text
 
-    assert html.index("30 дней бесплатно") < html.index("90 дней")
+    assert html.index(f"{TRIAL_DAYS} дней бесплатно") < html.index("90 дней")
     assert link(html, FREE_CTA)
 
 
 def test_free_access_leads_into_the_flow_with_the_free_pair() -> None:
-    """Кнопка ведёт в тот же путь, но с бесплатной парой: 30 дней, одно устройство."""
+    """Кнопка ведёт в тот же путь, но с бесплатной парой: 7 дней, одно устройство."""
     client, _sender, _payments = _signed_in(FakeApi())
 
     free = link(client.get("/buy").text, FREE_CTA)
 
-    assert "days=30" in free and "devices=1" in free
+    assert f"days={TRIAL_DAYS}" in free and "devices=1" in free
     assert "free=1" in free, "признак бесплатного пути едет дальше"
+
+
+def test_free_pair_survives_the_flow_when_the_url_carries_another_period() -> None:
+    """`free=1` держит пару триала и на шагах 2–3, даже если в адресе чужой срок.
+
+    `TRIAL_DAYS` нет в `PRICES`, и проверка «срок из PRICES, иначе 30» подменила
+    бы триал первым платным тарифом: человек увидел бы 30 дней, а получил 7.
+    """
+    client, _sender, _payments = _signed_in(FakeApi())
+
+    confirm = client.get("/buy/confirm?days=30&devices=1&free=1").text
+    assert f"{TRIAL_DAYS} дней" in confirm
+    assert f"days={TRIAL_DAYS}" in link(confirm, "Выбрать серверы")
+
+    servers = client.get("/buy/servers?days=30&devices=1&free=1").text
+    assert f"days={TRIAL_DAYS}" in hrefs(servers, "Добавить")[0]
 
 
 def test_free_path_issues_configs_without_payment() -> None:
@@ -202,6 +218,7 @@ def test_free_path_issues_configs_without_payment() -> None:
     order_id = response.headers["location"].split("order_id=")[1]
     order = api.get_order(order_id)
     assert order.status == "completed" and order.amount_rub == 0
+    assert order.days == TRIAL_DAYS, "бесплатный срок — триал, а не первый платный тариф"
     assert sender.sent_to(MAIL), "человек получает конфиг письмом, как после оплаты"
 
 
@@ -242,7 +259,7 @@ def test_free_flag_cannot_buy_other_than_the_free_pair() -> None:
     assert response.status_code == 303
     order_id = response.headers["location"].split("order_id=")[1]
     order = api.get_order(order_id)
-    assert (order.days, order.devices, order.amount_rub) == (30, 1, 0)
+    assert (order.days, order.devices, order.amount_rub) == (TRIAL_DAYS, 1, 0)
     assert order.servers == ("nl-1",)
     assert payments.created == []
 
@@ -258,8 +275,11 @@ def test_free_path_is_walkable_by_links() -> None:
     client, sender, payments = _signed_in(api, eligible=True)
 
     free = link(client.get("/buy").text, FREE_CTA)
+    assert f"days={TRIAL_DAYS}" in free
     confirm = client.get(free).text
+    assert f"{TRIAL_DAYS} дней" in confirm
     assert "free=1" in link(confirm, "Выбрать серверы")
+    assert f"days={TRIAL_DAYS}" in link(confirm, "Выбрать серверы")
 
     servers = client.get(link(confirm, "Выбрать серверы")).text
     servers = client.get(hrefs(servers, "Добавить")[0]).text

@@ -31,6 +31,7 @@ from cabinet.render import (
     PAY_DONE_PAID_NOTE,
     PAY_DONE_PENDING_NOTE,
     PAY_DONE_UNREACHABLE_NOTE,
+    TRIAL_DAYS,
 )
 from cabinet.theme import COLORS
 from tests.fakes import FakeApi, FakeMailSender
@@ -208,7 +209,7 @@ def test_free_order_is_not_called_paid() -> None:
     api = FakeApi()
     account = api.create_account(mail=MAIL, mail_verified_at=NOW, chat_id=CHAT_ID)
     order = api.create_order(
-        account_id=account.id, days=30, devices=1, servers=["nl-1"], amount_rub=0
+        account_id=account.id, days=TRIAL_DAYS, devices=1, servers=["nl-1"], amount_rub=0
     )
     api.mark_order_paid(order.order_id, amount_rub=0)
     client = _client(api, account.id)
