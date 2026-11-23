@@ -9,6 +9,7 @@
 ![CI](https://github.com/impossi8le/vpn-cabinet/actions/workflows/ci.yml/badge.svg)
 ![Live](https://img.shields.io/badge/live-utilio.cc-2ea44f)
 
+![License MIT](https://img.shields.io/badge/license-MIT-green)
 </div>
 
 > **Коротко.** У VPN-сервиса аккаунт жил только в Telegram: «аккаунт» — это `chat_id`.
@@ -197,8 +198,7 @@ pytest
 - **Хранилище кодов — в памяти процесса.** Это осознанный выбор: коды живут
   минуты и переживать перезапуск не обязаны. Перезапуск кабинета сбрасывает
   выданные, но ещё не использованные коды.
-- **Лицензия не определена.** Открытый вопрос вынесен в `vpn-app-design`
-  (`docs/README.md`), файла `LICENSE` в репозитории нет.
+- **Лицензия — MIT** (`LICENSE`).
 - **Публичной документации API нет.** Контракт с ботом описан в
   `docs/2026-10-17-backend-contract.md` для внутреннего использования.
 
