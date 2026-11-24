@@ -35,6 +35,18 @@ body {
    разметке было видно, куда ссылка ведёт. */
 .nav .back, .nav .link { color: var(--ice); font-size: 14.5px; text-decoration: none; }
 .nav .side { width: 48px; }
+.nav-right { display: flex; align-items: center; gap: 14px; }
+/* Выход в шапке — кнопка, а не ссылка: под ней POST. Вид тот же, что у
+   `.link`, поэтому сброс оформления кнопки живёт здесь, а не в разметке. */
+.nav .exit {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 14.5px;
+  color: var(--ice);
+  cursor: pointer;
+}
 
 .mid {
   display: flex;

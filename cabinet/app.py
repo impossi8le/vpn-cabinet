@@ -1039,6 +1039,36 @@ def _add_login_routes(
             return _waiting_refusal(request, LOGIN_MAIL_ERROR, mail=address)
         return RedirectResponse(f"/login/waiting?mail={quote(address)}", status_code=303)
 
+    @app.post("/logout")
+    def logout(request: Request) -> Response:
+        """Выйти: погасить серверную сессию и cookie.
+
+        POST, а не GET: выход меняет состояние, и переход по ссылке (превью
+        сообщения, предзагрузка браузера) не должен выбрасывать человека из
+        кабинета. Это тот же класс ошибки, что нашёлся у ссылки возврата
+        Telegram: изменяющее действие не живёт в GET.
+
+        Сессию гасим у хранилища — у бота это `POST /internal/sessions/revoke`,
+        и токен перестаёт работать на обеих дверях. Если бот не ответил, cookie
+        всё равно гасим: человек выразил намерение выйти, и оставлять ему
+        предъявительский токен в браузере — худший из двух исходов. Причина
+        уходит в журнал: серверная запись могла остаться живой.
+
+        Без cookie выход — не ошибка, а уже выполненное действие. Человек,
+        нажавший «Выйти» дважды, не должен видеть отказ.
+        """
+        token = request.cookies.get(COOKIE_NAME)
+        try:
+            sessions.sign_out(token)
+        except (BotError, BotUnreachable) as exc:
+            logger.warning("выход: сессию отозвать не удалось: %r", exc)
+        response = RedirectResponse("/login", status_code=303)
+        # `delete_cookie` ставит `cabinet_session=` с нулевым сроком; middleware
+        # продления такой ответ не трогает (`_answers_with_session_cookie`),
+        # поэтому удаление не отменяется тут же.
+        response.delete_cookie(COOKIE_NAME, path="/")
+        return response
+
     @app.get("/login/telegram", response_class=HTMLResponse)
     def login_telegram() -> Response:
         """Начать вход через Telegram и показать ссылку бота.
