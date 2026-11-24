@@ -700,8 +700,29 @@ def test_start_sends_no_return_address_without_a_public_base() -> None:
     assert "return_base" not in bot.link_calls[0]
 
 
+def _return_link(public_code: str, nonce: str = "123456") -> str:
+    """Адрес возврата, какой его собирает бот (§5.2)."""
+    return f"/login/telegram/return?public_code={public_code}&nonce={nonce}"
+
+
+def _confirm_return(client: TestClient, public_code: str, nonce: str = "123456") -> Any:
+    """Открыть ссылку возврата и нажать «Продолжить вход».
+
+    Возврат — двухшаговый намеренно: GET только показывает страницу с кнопкой,
+    вход выполняет POST. Иначе ссылку расходует превью-бот Telegram.
+    """
+    page = client.get(_return_link(public_code, nonce), follow_redirects=False)
+    assert page.status_code == 200
+    assert COOKIE_NAME not in page.cookies
+    return client.post(
+        render.TELEGRAM_VERIFY_ACTION,
+        data={"public_code": public_code, "code": nonce},
+        follow_redirects=False,
+    )
+
+
 def test_return_link_signs_in_the_account_the_bot_named() -> None:
-    """Переход по ссылке приводит в кабинет уже вошедшим.
+    """Переход по ссылке и нажатие кнопки приводят в кабинет уже вошедшим.
 
     Главное свойство задачи: `nonce` из адреса уходит боту вместо кода, который
     человек ввёл бы руками, и на экране подписок видно подписку **того** аккаунта,
@@ -716,10 +737,7 @@ def test_return_link_signs_in_the_account_the_bot_named() -> None:
     start = client.get("/login/telegram")
     public_code = _public_code_from(start.text)
 
-    returned = client.get(
-        f"/login/telegram/return?public_code={public_code}&nonce=123456",
-        follow_redirects=False,
-    )
+    returned = _confirm_return(client, public_code)
 
     assert returned.status_code == 303
     assert returned.headers["location"] == "/subscriptions"
@@ -731,6 +749,40 @@ def test_return_link_signs_in_the_account_the_bot_named() -> None:
 
     subscriptions = client.get("/subscriptions")
     assert SUB_NAME in subscriptions.text
+
+
+def test_preview_fetch_of_the_return_link_does_not_spend_the_code() -> None:
+    """Превью ссылки в Telegram не расходует одноразовый код.
+
+    Telegram (и любой превью-бот) открывает ссылку из сообщения, чтобы показать
+    карточку. До этой правки такой GET завершал вход и гасил челлендж: человек
+    получал код, но ввод его уже ни к чему не приводил. GET обязан быть
+    безопасным — ни опроса бота, ни сессии.
+    """
+    api = FakeApi()
+    account_id = _account_with_subscription(api)
+    bot = FakePublicBot(api)
+    bot.poll_script = [{"status": "confirmed", "account_id": account_id}]
+    client = _client(bot, api, public_base="https://cabinet.example")
+
+    start = client.get("/login/telegram")
+    public_code = _public_code_from(start.text)
+
+    preview = client.get(_return_link(public_code), follow_redirects=False)
+    assert preview.status_code == 200
+    assert COOKIE_NAME not in preview.cookies
+    assert bot.poll_calls == []
+
+    # Человек вводит тот же код вручную в своей вкладке — и вход проходит.
+    entered = client.post(
+        render.TELEGRAM_VERIFY_ACTION,
+        data={"public_code": public_code, "code": "123456"},
+        follow_redirects=False,
+    )
+    assert entered.status_code == 303
+    assert (
+        client.app.state.sessions.resolve(entered.cookies.get(COOKIE_NAME)).account_id == account_id
+    )  # type: ignore[attr-defined]
 
 
 def test_return_link_keeps_the_nonce_out_of_referrer_and_cache() -> None:
@@ -794,8 +846,10 @@ def test_return_link_denied_in_telegram_does_not_sign_in() -> None:
     start = client.get("/login/telegram")
     public_code = _public_code_from(start.text)
 
-    response = client.get(
-        f"/login/telegram/return?public_code={public_code}&nonce=123456",
+    assert client.get(_return_link(public_code)).status_code == 200
+    response = client.post(
+        render.TELEGRAM_VERIFY_ACTION,
+        data={"public_code": public_code, "code": "123456"},
         follow_redirects=False,
     )
 
@@ -818,8 +872,10 @@ def test_return_link_with_a_wrong_nonce_is_refused() -> None:
     start = client.get("/login/telegram")
     public_code = _public_code_from(start.text)
 
-    response = client.get(
-        f"/login/telegram/return?public_code={public_code}&nonce=000000",
+    assert client.get(_return_link(public_code, "000000")).status_code == 200
+    response = client.post(
+        render.TELEGRAM_VERIFY_ACTION,
+        data={"public_code": public_code, "code": "000000"},
         follow_redirects=False,
     )
 
@@ -843,9 +899,9 @@ def test_return_link_works_once() -> None:
 
     start = client.get("/login/telegram")
     public_code = _public_code_from(start.text)
-    link = f"/login/telegram/return?public_code={public_code}&nonce=123456"
+    link = _return_link(public_code)
 
-    first = client.get(link, follow_redirects=False)
+    first = _confirm_return(client, public_code)
     assert first.status_code == 303
 
     client.cookies.clear()

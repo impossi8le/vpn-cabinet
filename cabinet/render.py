@@ -93,6 +93,7 @@ __all__ = [
     "render_login",
     "render_login_telegram",
     "render_login_waiting",
+    "render_telegram_return",
     "render_buy",
     "trial_refusal_note",
     "render_buy_confirm",
@@ -322,6 +323,34 @@ def render_login_telegram(
         form_action=form_action,
         restart_url=restart_url,
         check_label=check_label,
+    )
+
+
+def render_telegram_return(
+    *,
+    public_code: str,
+    nonce: str,
+    form_action: str = TELEGRAM_VERIFY_ACTION,
+    restart_url: str = TELEGRAM_RESTART_URL,
+) -> str:
+    """Страница возврата по ссылке из Telegram: кнопка, а не вход на GET.
+
+    Ссылку из сообщения бота открывает не только человек: Telegram строит по
+    ней превью и заходит сам. Пока возврат выполнял вход прямо в GET, это
+    превью расходовало одноразовый челлендж — человек получал код, а ввод его
+    уже ни к чему не приводил (`operation_not_found`). Поэтому GET только
+    показывает эту страницу, а вход выполняет POST по нажатию.
+
+    `nonce` — тот же код, что бот прислал в чат. Он живёт в скрытом поле и
+    уходит телом POST, а не повторно в адресе.
+    """
+    template = _ENV.get_template("login_telegram_return.html")
+    return template.render(
+        **_base_context(),
+        public_code=public_code,
+        nonce=nonce,
+        form_action=form_action,
+        restart_url=restart_url,
     )
 
 

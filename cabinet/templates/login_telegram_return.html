@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Продолжить вход{% endblock %}
+{% block content %}
+<div class="mid">
+  {# Янтарный щит: вход ещё не завершён, ждём действия человека. #}
+  <div class="mark">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3l7 4v5c0 4.2-2.9 7.6-7 8.6-4.1-1-7-4.4-7-8.6V7l7-4z"
+            stroke="{{ colors.amber }}" stroke-width="1.7" stroke-linejoin="round"/>
+    </svg>
+  </div>
+
+  <h1>Продолжить вход</h1>
+  <p class="lead">Вы пришли по ссылке из Telegram. Нажмите кнопку, чтобы войти в кабинет.</p>
+
+  {# Вход — POST, а не GET. Ссылку из сообщения открывает и превью Telegram:
+     GET, выполняющий вход, расходовал одноразовый код до человека. #}
+  <form method="post" action="{{ form_action }}">
+    <input type="hidden" name="public_code" value="{{ public_code }}">
+    <input type="hidden" name="code" value="{{ nonce }}">
+    <button class="btn btn-p" type="submit">Войти</button>
+  </form>
+
+  <div class="disc">
+    <p>Ссылка одноразовая. Если она уже не действует — начните вход заново.</p>
+  </div>
+
+  <form method="post" action="{{ restart_url }}">
+    <button class="btn btn-g btn-sm" type="submit">Войти заново</button>
+  </form>
+</div>
+{% endblock %}

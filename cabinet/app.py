@@ -113,6 +113,7 @@ from cabinet.render import (
     render_login_waiting,
     render_region,
     render_subscriptions,
+    render_telegram_return,
     trial_refusal_note,
 )
 from cabinet.sessions import SessionService, SessionStore, SessionView, SingleSessionStore
@@ -1131,31 +1132,35 @@ def _add_login_routes(
 
     @app.get("/login/telegram/return", response_class=HTMLResponse)
     def login_telegram_return(
-        request: Request,
         public_code: str = Query(default=""),
         nonce: str = Query(default=""),
     ) -> Response:
-        """Завершить вход по ссылке из сообщения бота (§5.2, issue #52).
+        """Показать кнопку входа по ссылке из сообщения бота (§5.2, issue #52).
 
-        Человек нажал ссылку в Telegram и вернулся в кабинет уже с кодом в
-        адресе: вводить его руками тут не нужно. Опрос бота и выдача сессии —
-        **тот же** путь, что у кнопки «Проверить вход» (`_telegram_finish`);
-        этот роут добавляет к нему только заголовки.
+        Раньше этот GET сам завершал вход. Это ломало ручной ввод кода: ссылку
+        из сообщения открывает не только человек — **превью Telegram заходит по
+        ней со своих адресов**, — и одноразовый челлендж сгорал до того, как
+        человек успевал ввести код. На боевом кабинете это выглядело так:
+        код из бота приходит, но ввод отвечает «код не подошёл».
+
+        Поэтому GET теперь безопасен: он только показывает страницу с кнопкой,
+        а вход выполняет POST на тот же `/login/telegram/verify`, что и ручной
+        ввод. Челлендж гасится ровно один раз — тем нажатием.
 
         **Чего здесь быть не должно.** Никакой личности из адреса: `public_code`
         и `nonce` — это код человека и его секрет, а не `chat_id` и не
         `account_id`. Владельца сессии по-прежнему называет бот.
         """
-        response = _telegram_finish(
-            request=request,
-            public_code=public_code,
-            device_nonce=nonce,
-            telegram_login=telegram_login,
-            telegram_auth=telegram_auth,
-            signin=signin,
-            sessions=sessions,
-            store=store,
-        )
+        if telegram_login.get(public_code) is None or not nonce.strip():
+            # Челленджа нет: не начинали, он протух, кабинет перезапускался или
+            # ссылку открыли без nonce. Это обычное состояние, а не сбой.
+            response: Response = HTMLResponse(
+                render_login_telegram(error=LOGIN_TELEGRAM_NOT_STARTED)
+            )
+        else:
+            response = HTMLResponse(
+                render_telegram_return(public_code=public_code, nonce=nonce.strip())
+            )
         # `nonce` в адресе — предъявительский токен: кто прочитал сообщение, тот
         # и войдёт. `Referer` отдал бы адрес целиком следующему сайту, а кеш
         # сохранил бы его на диске. Успех и отказ закрыты одинаково: адрес
