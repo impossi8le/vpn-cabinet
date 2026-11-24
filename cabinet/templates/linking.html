@@ -203,5 +203,10 @@
     </form>
     {%- endif %}
   {% endif %}
+  {# Выход тем же POST, что и на главном экране: ссылка не должна
+     выкидывать из кабинета ни превью, ни предзагрузкой. #}
+  <form method="post" action="/logout">
+    <button class="btn btn-g btn-sm" type="submit">Выйти</button>
+  </form>
 </div>
 {% endblock %}
