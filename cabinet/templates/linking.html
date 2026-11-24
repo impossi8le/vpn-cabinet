@@ -4,7 +4,11 @@
 <div class="nav">
   <a class="back" href="/">‹ Назад</a>
   <span class="t">Способы входа</span>
-  <span class="side"></span>
+  {# Выход — POST: ссылка не должна выкидывать из кабинета ни превью,
+     ни предзагрузкой. В шапке, потому что внизу страницы его не видно. #}
+  <form method="post" action="/logout">
+    <button class="link exit" type="submit">Выйти</button>
+  </form>
 </div>
 
 <h1>Вход в аккаунт</h1>
@@ -203,10 +207,5 @@
     </form>
     {%- endif %}
   {% endif %}
-  {# Выход тем же POST, что и на главном экране: ссылка не должна
-     выкидывать из кабинета ни превью, ни предзагрузкой. #}
-  <form method="post" action="/logout">
-    <button class="btn btn-g btn-sm" type="submit">Выйти</button>
-  </form>
 </div>
 {% endblock %}

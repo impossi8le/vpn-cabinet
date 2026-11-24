@@ -125,24 +125,33 @@ def test_logout_clears_the_cookie_even_if_the_bot_is_unreachable() -> None:
     assert client.app_state.sessions.resolve(token) is not None  # type: ignore[attr-defined]
 
 
-def test_subscriptions_screen_has_a_logout_button() -> None:
-    """Кнопка выхода есть на главном экране, а не только по известному адресу."""
-    client, sender = _build()
-    _sign_in(client, sender)
+def test_account_screen_has_a_logout_button_in_the_header() -> None:
+    """Кнопка выхода — в шапке экрана способов входа, на виду.
 
-    html = client.get("/subscriptions").text
-
-    assert 'action="/logout"' in html
-    assert "Выйти" in html
-    assert 'method="post"' in html
-
-
-def test_account_screen_has_a_logout_button() -> None:
-    """Экран способов входа тоже даёт выйти."""
+    Внизу страницы её не находили: экран способов входа длинный, и выход
+    оказывался за пределами первого экрана. Поэтому проверяется ещё и место —
+    форма обязана стоять выше первой карточки.
+    """
     client, sender = _build()
     _sign_in(client, sender)
 
     html = client.get("/account").text
 
-    assert 'action="/logout"' in html
+    assert html.count('action="/logout"') == 1
     assert "Выйти" in html
+    assert 'method="post"' in html
+    assert html.index('action="/logout"') < html.index('class="card"')
+
+
+def test_subscriptions_screen_has_no_logout_button() -> None:
+    """Выход живёт на экране способов входа, а не на главном.
+
+    Два места для одного действия разъехались бы: на главном выход стоял в
+    шапке рядом со ссылкой на способы входа и спорил с ней за место.
+    """
+    client, sender = _build()
+    _sign_in(client, sender)
+
+    html = client.get("/subscriptions").text
+
+    assert 'action="/logout"' not in html
