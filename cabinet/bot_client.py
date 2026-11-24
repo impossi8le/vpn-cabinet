@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -486,6 +487,28 @@ ORDERS_PATH = f"{BOT_PATH}/cabinet-orders"
 EVENTS_PATH = f"{BOT_PATH}/cabinet-events"
 
 
+# Префикс ссылки Happ. Домен — настройка развёртывания, а не свойство кода:
+# репозиторий публичный, и домена раздачи в нём быть не должно. Пусто —
+# ссылок Happ не показываем вовсе (безопасное умолчание).
+HAPP_SUBSCRIPTION_PREFIX_ENV = "HAPP_SUBSCRIPTION_PREFIX"
+
+
+def _happ_subscription_url(raw: Any) -> str:
+    """Ссылка подписки Happ, только если она с ожидаемого префикса.
+
+    Префикс приходит из окружения: код домена не знает. Проверка нужна не
+    ради красоты — ответ бота внешний, и показывать человеку ссылку с
+    произвольного хоста нельзя.
+    """
+    prefix = os.getenv(HAPP_SUBSCRIPTION_PREFIX_ENV, "").strip().rstrip("/")
+    if not prefix:
+        return ""
+    url = str(raw or "")
+    if not re.fullmatch(re.escape(prefix) + r"/sub/[A-Za-z0-9_-]+", url):
+        return ""
+    return url
+
+
 @dataclass(frozen=True)
 class OrderConfig:
     """Конфиг, выданный по заказу: `{"id", "name"}`.
@@ -498,9 +521,15 @@ class OrderConfig:
     id: str
     name: str
 
+    subscription_url: str = ""
+
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> OrderConfig:
-        return cls(id=str(raw.get("id", "")), name=str(raw.get("name", "")))
+        return cls(
+            id=str(raw.get("id", "")),
+            name=str(raw.get("name", "")),
+            subscription_url=_happ_subscription_url(raw.get("subscription_url")),
+        )
 
 
 @dataclass(frozen=True)

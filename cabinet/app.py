@@ -603,7 +603,13 @@ def _fulfil_paid_order(
         return
 
     attachments: list[tuple[str, bytes, str]] = []
+    happ_urls = set()
     for config in issued.configs:
+        if config.subscription_url:
+            if config.subscription_url not in happ_urls:
+                attachments.append(("Happ.txt", config.subscription_url.encode("utf-8"), "text/plain"))
+                happ_urls.add(config.subscription_url)
+            continue
         try:
             content = store.get_ovpn(order.account_id, config.id)
         except (BotError, BotUnreachable) as exc:

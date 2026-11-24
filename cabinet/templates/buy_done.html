@@ -14,6 +14,9 @@
    письма нет, и обещать его там нечем. #}
 <h1>{{ title }}</h1>
 <p class="lead">{{ note }}</p>
+{% for url in happ_links %}
+<label>Ссылка для Happ <input type="text" readonly value="{{ url }}" onclick="this.select()"></label>
+{% endfor %}
 
 {% if total %}
 {# Сводка заказа: сумма — из заказа, того же числа, что ушло в платёж. Тон

@@ -1352,7 +1352,11 @@ def render_buy_done(
         title, note, tone = "Заказ отменён", PAY_DONE_CANCELLED_NOTE, "refused"
     else:
         title, note, tone = "Оплата не подтверждена", PAY_DONE_PENDING_NOTE, "pending"
+    happ_links = tuple(dict.fromkeys(c.subscription_url for c in order.configs if c.subscription_url)) if order and tone == "paid" else ()
+    if happ_links:
+        note = "Скопируйте ссылку и добавьте её в Happ."
     return _ENV.get_template("buy_done.html").render(
+        happ_links=happ_links,
         **_base_context(),
         state=tone,
         title=title,
