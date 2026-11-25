@@ -264,8 +264,9 @@ p + .btn { margin-top: 12px; }
 .quiet { margin-top: 18px; text-align: center; }
 .quiet-note { color: var(--ash); font-size: 12px; line-height: 1.55; margin-bottom: 6px; }
 /* Поднятая к действиям смена региона — по левому краю: это продолжение ряда
-   действий, а не отдельный блок внизу экрана. */
-.quiet-under-actions { margin-top: 10px; text-align: left; }
+   действий, а не отдельный блок внизу экрана. Нижний отступ обязателен: у
+   `.panel` своего верхнего нет, и кнопка упиралась в его рамку. */
+.quiet-under-actions { margin: 10px 0 12px; text-align: left; }
 .quiet-under-actions .quiet-note { margin-bottom: 0; }
 
 /* Раскрытие списка ключей. Штатный `<details>`: работает без JavaScript, а
